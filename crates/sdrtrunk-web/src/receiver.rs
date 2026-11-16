@@ -181,6 +181,21 @@ pub fn pick_tuner(want: &str, present: &[String], claimed: &HashSet<String>, res
         .ok_or_else(|| "no free SDR: every connected SDR is in use or pinned to another system".into())
 }
 
+/// System `s`'s main tuner by `pick_tuner`'s rules, among the connected SDRs (`present`) in Live mode; a pinned tuner in
+/// Setup mode or switched off is an error.
+fn main_tuner(s: &System, present: &[String], pool: &Pool, claimed: &HashSet<String>) -> Result<String, String> {
+    if let Some(pin) = sdrtrunk_source::normalize_tuner(&s.tuner) {
+        let label = sdrtrunk_source::tuner_label(&pin);
+        match pool.config(&pin).mode {
+            TunerMode::Live => {}
+            TunerMode::Setup => return Err(format!("{label} is in Setup mode on the Tuners page")),
+            TunerMode::Disabled => return Err(format!("{label} is switched off on the Tuners page")),
+        }
+    }
+    let live: Vec<String> = present.iter().filter(|t| pool.config(t).mode == TunerMode::Live).cloned().collect();
+    pick_tuner(&s.tuner, &live, claimed, &pool.reserved(s.id))
+}
+
 /// True when `failover_ms` of samples passed since the later of the last valid TSBK and the last retune.
 pub fn failover_due(last_valid_sample: Option<u64>, since_tune_sample: u64, now_sample: u64, rate_hz: u32, failover_ms: u32) -> bool {
     let window = rate_hz as u64 * failover_ms as u64 / 1000;
@@ -216,6 +231,10 @@ pub struct Receiver {
     pub known: Arc<Mutex<BTreeSet<u64>>>,
     /// The spectrum display of each helper tuner now open (tuner id, view), for `Receivers::tuner_view`.
     helper_views: HelperViews,
+    /// Helper tuners `Receivers` asks the decoder to give up.
+    release: Arc<Release>,
+    /// The main tuner `Receivers` handed it at start (None: it got none).
+    main: Option<String>,
     run: Run,
 }
 
@@ -232,12 +251,19 @@ struct Shared {
     known: Arc<Mutex<BTreeSet<u64>>>,
     helper_views: HelperViews,
     streams: Arc<Streams>,
+    release: Arc<Release>,
 }
+
+/// Tuners a decoder is asked to give up as helpers (an owner's save): `asked` is read every pass, `ids` only when set.
+#[derive(Default)]
+struct Release { asked: AtomicBool, ids: Mutex<Vec<String>> }
 
 impl Receiver {
     #[allow(clippy::too_many_arguments)]
     fn start(system: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed,
-             calls: broadcast::Sender<CallEvent>, policy: RecordPolicy, known: Vec<u64>, streams: Arc<Streams>) -> Receiver {
+             calls: broadcast::Sender<CallEvent>, policy: RecordPolicy, known: Vec<u64>, streams: Arc<Streams>,
+             pick: Result<String, String>) -> Receiver {
+        let main = pick.as_ref().ok().cloned();
         let shared = Shared {
             status: Arc::new(Mutex::new(Status {
                 state: "starting".into(), control_hz: system.control_hz.first().copied(), started_ms: now_ms(), ..Status::default()
@@ -249,13 +275,14 @@ impl Receiver {
             known: Arc::new(Mutex::new(known.into_iter().collect())),
             helper_views: Arc::default(),
             streams,
+            release: Arc::default(),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (s, sh, flag) = (system.clone(), shared.clone(), stop.clone());
         let handle = std::thread::Builder::new().name(format!("decoder-{}", system.id))
-            .spawn(move || decode(s, dir, pool, sdrs, claimed, flag, sh)).expect("spawn decoder");
-        let Shared { status, policy, spectrum, quality, known, helper_views, .. } = shared;
-        Receiver { system, status, policy, spectrum, quality, known, helper_views, run: Mutex::new(Some((stop, handle))) }
+            .spawn(move || decode(s, dir, pool, sdrs, claimed, flag, sh, pick)).expect("spawn decoder");
+        let Shared { status, policy, spectrum, quality, known, helper_views, release, .. } = shared;
+        Receiver { system, status, policy, spectrum, quality, known, helper_views, release, main, run: Mutex::new(Some((stop, handle))) }
     }
 
     /// Stops and joins the decoder thread; its tuner is closed and free again when this returns.
@@ -298,6 +325,16 @@ impl Pool {
     /// Tuners pinned to enabled systems other than `me`.
     fn reserved(&self, me: i64) -> Vec<String> { self.pins.iter().filter(|(s, _)| *s != me).map(|(_, t)| t.clone()).collect() }
 
+    /// Claims tuner `serial` as a helper of system `me`, checking under the pool lock that it is still Live and not
+    /// pinned to another enabled system: a save may have changed either since `free` listed it.
+    fn claim_helper(&self, claimed: &Claimed, me: i64, serial: &str) -> Result<Claim, String> {
+        let label = sdrtrunk_source::tuner_label(serial);
+        if self.config(serial).mode != TunerMode::Live { return Err(format!("{label} is not in Live mode")); }
+        if self.reserved(me).iter().any(|t| t == serial) { return Err(format!("{label} is pinned to another system")); }
+        if !claimed.lock().unwrap_or_else(|p| p.into_inner()).insert(serial.to_string()) { return Err(format!("{label} is in use")); }
+        Ok(Claim(claimed.clone(), serial.to_string()))
+    }
+
     /// Tuners system `me` may take as helpers now (no USB work: the list is the last scan's).
     fn free(&self, claimed: &Claimed, me: i64) -> Vec<String> {
         free_tuners(self.seen.clone(), &|t| self.config(t), &claimed.lock().unwrap_or_else(|p| p.into_inner()), &self.reserved(me))
@@ -337,9 +374,59 @@ impl Receivers {
         }
     }
 
-    fn start(&self, db: &Db, s: &System) -> Arc<Receiver> {
-        Arc::new(Receiver::start(s.clone(), db.settings().recording_dir, self.pool.clone(), self.sdrs.clone(), self.claimed.clone(),
-            self.calls.clone(), policy_for(db, s.list_name()), db.voice_freqs(s.id), self.streams.clone()))
+    /// Starts `systems`. Their main tuners are handed out here, in id order under the `claimed` lock, so when several
+    /// want the same SDR the lowest-numbered system gets it (helpers stay first come, first served).
+    fn start_many<'a>(&self, db: &Db, systems: impl Iterator<Item = &'a System>, run: &mut BTreeMap<i64, Arc<Receiver>>) {
+        let mut systems: Vec<&System> = systems.collect();
+        if systems.is_empty() { return; }
+        systems.sort_by_key(|s| s.id);
+        let present = (self.sdrs.list)();
+        let picks: Vec<Result<String, String>> = {
+            let pool = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            let mut claimed = self.claimed.lock().unwrap_or_else(|p| p.into_inner());
+            systems.iter().map(|s| {
+                let pick = main_tuner(s, &present, &pool, &claimed);
+                if let Ok(t) = &pick { claimed.insert(t.clone()); }
+                pick
+            }).collect()
+        };
+        for (s, pick) in systems.into_iter().zip(picks) {
+            run.insert(s.id, Arc::new(Receiver::start(s.clone(), db.settings().recording_dir, self.pool.clone(), self.sdrs.clone(),
+                self.claimed.clone(), self.calls.clone(), policy_for(db, s.list_name()), db.voice_freqs(s.id), self.streams.clone(), pick)));
+        }
+    }
+
+    /// Asks every running system holding one of `tuners` as a helper to give it up (its calls on it end; the system
+    /// keeps running) and waits up to 2 s, without holding `running`, until every decoder asked has done so and the
+    /// tuners no decoder may take again (not Live, or pinned) are free. A Live, unpinned one may be taken again at
+    /// once by a decoder following a call, with its new settings. Tuners held otherwise (the main tuner of a system
+    /// not in error, a Setup run) are left alone. Every decoder not in error is asked, not just those whose status
+    /// lists the tuner: one may be opening it right now. Failed decoders have no thread left to ask.
+    fn release_helpers(&self, tuners: &[String]) {
+        let live: Vec<Arc<Receiver>> = self.running.lock().unwrap_or_else(|p| p.into_inner()).values()
+            .filter(|r| r.state() != "error").cloned().collect();
+        let held: Vec<String> = {
+            let setups = self.setups.lock().unwrap_or_else(|p| p.into_inner());
+            let claimed = self.claimed.lock().unwrap_or_else(|p| p.into_inner());
+            tuners.iter().filter(|t| claimed.contains(*t) && !setups.contains_key(*t) && !live.iter().any(|r| r.main.as_ref() == Some(*t)))
+                .cloned().collect()
+        };
+        if held.is_empty() { return; }
+        let must_free: Vec<String> = {
+            let p = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            held.iter().filter(|t| p.config(t).mode != TunerMode::Live || p.pins.iter().any(|(_, pin)| pin == *t)).cloned().collect()
+        };
+        for r in &live {
+            r.release.ids.lock().unwrap_or_else(|p| p.into_inner()).extend(held.iter().cloned());
+            r.release.asked.store(true, AtomicOrdering::Release);
+        }
+        let since = Instant::now();
+        while since.elapsed() < Duration::from_secs(2) {
+            let handled = live.iter().all(|r| !r.release.asked.load(AtomicOrdering::Acquire) || matches!(r.state().as_str(), "error" | "stopped"));
+            if handled && !must_free.iter().any(|t| self.claimed.lock().unwrap_or_else(|p| p.into_inner()).contains(t)) { return; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("receivers: helper tuners {held:?} not released within 2 s");
     }
 
     /// Reloads the tuner settings and pins every decoder reads.
@@ -367,7 +454,7 @@ impl Receivers {
         for (_, r) in std::mem::take(&mut *self.setups.lock().unwrap_or_else(|p| p.into_inner())) { r.stop(); }
         let all = db.systems();
         self.refresh(db, &all);
-        for s in all.iter().filter(|s| s.enabled) { run.insert(s.id, self.start(db, s)); }
+        self.start_many(db, all.iter().filter(|s| s.enabled), &mut run);
         drop(run);
         for (id, _) in db.tuners().into_iter().filter(|(_, c)| c.mode == TunerMode::Setup) { self.apply_setup(db, &id); }
     }
@@ -377,31 +464,34 @@ impl Receivers {
     pub fn apply(&self, db: &Db, id: i64) { self.restart(db, &[id]); }
 
     /// Restarts systems `ids` as stored (stops those deleted or disabled) together with every system that failed (a
-    /// tuner may have come free) and every system holding as a helper a tuner now pinned to another system (the pinned
-    /// system gets it). All of them stop before any starts, so freed tuners are free for the starts.
+    /// tuner may have come free). A tuner now pinned to a system is first given up by any system holding it as a
+    /// helper (that system keeps running; the pinned system gets it). All restarted systems stop before any starts,
+    /// so freed tuners are free for the starts.
     fn restart(&self, db: &Db, ids: &[i64]) {
         let all = db.systems();
         self.refresh(db, &all);
         let pinned: Vec<String> = all.iter().filter(|s| s.enabled).filter_map(|s| sdrtrunk_source::normalize_tuner(&s.tuner)).collect();
+        self.release_helpers(&pinned);
         let mut run = self.running.lock().unwrap_or_else(|p| p.into_inner());
         let mut again: Vec<i64> = ids.to_vec();
-        again.extend(run.iter().filter(|(sys, r)| !ids.contains(sys) && {
-            let st = r.status.lock().unwrap_or_else(|p| p.into_inner());
-            st.state == "error" || st.helpers.iter().any(|(t, _)| pinned.contains(t))
-        }).map(|(&sys, _)| sys));
+        again.extend(run.iter().filter(|(sys, r)| !ids.contains(sys) && r.state() == "error").map(|(&sys, _)| sys));
         for sys in &again { if let Some(r) = run.remove(sys) { r.stop(); } }
-        for s in all.iter().filter(|s| s.enabled && again.contains(&s.id)) { run.insert(s.id, self.start(db, s)); }
+        self.start_many(db, all.iter().filter(|s| s.enabled && again.contains(&s.id)), &mut run);
     }
 
-    /// After tuner `id`'s settings changed: stops its Setup run, restarts the systems using it as main tuner or
-    /// helper (they pick up the new settings, or another tuner if it left Live mode), retries systems that failed (it
-    /// may be Live again), then starts its Setup run if it is in Setup mode.
+    /// After tuner `id`'s settings changed: stops its Setup run, releases it if a system holds it as a helper (that
+    /// system keeps running), restarts the system using it as main tuner (it picks up the new settings, or another
+    /// tuner if it left Live mode), retries systems that failed (it may be Live again), then starts its Setup run if it
+    /// is in Setup mode.
     pub fn apply_tuner(&self, db: &Db, id: &str) {
         if let Some(r) = self.setups.lock().unwrap_or_else(|p| p.into_inner()).remove(id) { r.stop(); }
-        let using: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
-            .filter(|(_, r)| { let st = r.status.lock().unwrap_or_else(|p| p.into_inner()); st.tuner.as_deref() == Some(id) || st.helpers.iter().any(|(t, _)| t == id) })
-            .map(|(&sys, _)| sys).collect();
-        self.restart(db, &using);
+        // Before anything else: from here no decoder takes it as a helper under its old mode.
+        self.refresh(db, &db.systems());
+        self.release_helpers(&[id.to_string()]);
+        // A failed system's `main` is stale (its claim is gone); `restart` retries it anyway.
+        let main: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|(_, r)| r.main.as_deref() == Some(id) && r.state() != "error").map(|(&sys, _)| sys).collect();
+        self.restart(db, &main);
         self.apply_setup(db, id);
     }
 
@@ -558,32 +648,18 @@ impl Drop for Claim {
     fn drop(&mut self) { self.0.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.1); }
 }
 
+/// Runs system `s` on main tuner `pick` (already claimed by `Receivers::start_many`, or why it got none).
 #[allow(clippy::too_many_arguments)]
-fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed, stop: Arc<AtomicBool>, sh: Shared) {
-    let Shared { status, calls, policy, spectrum, quality, known, helper_views, streams } = sh;
+fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed, stop: Arc<AtomicBool>, sh: Shared, pick: Result<String, String>) {
+    // First, so the claim is released however this ends.
+    let pick = pick.map(|sn| Claim(claimed.clone(), sn));
+    let Shared { status, calls, policy, spectrum, quality, known, helper_views, streams, release } = sh;
     let _guard = PanicGuard(status.clone());
     let _helpers_guard = HelperGuard(status.clone(), helper_views.clone());
-    // The main tuner's settings as at start (a change restarts the system); helpers are chosen from the pool as it is then.
-    let (tuners, reserved) = { let p = pool.lock().unwrap_or_else(|p| p.into_inner()); (p.tuners.clone(), p.reserved(s.id)) };
-    let config = |id: &str| tuners.iter().find(|(t, _)| t == id).map(|(_, c)| c.clone()).unwrap_or_default();
-    if let Some(pin) = sdrtrunk_source::normalize_tuner(&s.tuner) {
-        let label = sdrtrunk_source::tuner_label(&pin);
-        match config(&pin).mode {
-            TunerMode::Live => {}
-            TunerMode::Setup => return fail(&status, format!("{label} is in Setup mode on the Tuners page")),
-            TunerMode::Disabled => return fail(&status, format!("{label} is switched off on the Tuners page")),
-        }
-    }
-    let present: Vec<String> = (sdrs.list)().into_iter().filter(|t| config(t).mode == TunerMode::Live).collect();
-    let serial = {
-        let mut c = claimed.lock().unwrap_or_else(|p| p.into_inner());
-        match pick_tuner(&s.tuner, &present, &c, &reserved) {
-            Ok(sn) => { c.insert(sn.clone()); sn }
-            Err(e) => return fail(&status, e),
-        }
-    };
-    let _claim = Claim(claimed.clone(), serial.clone());
-    let tuner = config(&serial);
+    let _claim = match pick { Ok(c) => c, Err(e) => return fail(&status, e) };
+    let serial = _claim.1.clone();
+    // The main tuner's settings as at start (a change restarts the system).
+    let tuner = pool.lock().unwrap_or_else(|p| p.into_inner()).config(&serial);
     let mut idx = 0;
     let freq = |i: usize| s.control_hz[i] as i64;
     let modulation = Modulation::parse(&s.modulation).unwrap_or_default();
@@ -621,7 +697,8 @@ fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed
     let free = || pool.lock().unwrap_or_else(|p| p.into_inner()).free(&claimed, s.id);
     let mut opener = |serial: &str, required: &[i64], known: &[i64], id_base: u32| {
         let cfg = pool.lock().unwrap_or_else(|p| p.into_inner()).config(serial);
-        open_helper(serial, &cfg, &sdrs.open, &claimed, required, known, modulation, id_base)
+        let claim = || pool.lock().unwrap_or_else(|p| p.into_inner()).claim_helper(&claimed, s.id, serial);
+        open_helper(serial, &cfg, &sdrs.open, &claim, required, known, modulation, id_base)
     };
 
     // Known voice frequencies the main window leaves out: one helper, placed to cover as many as it can (more come on demand).
@@ -644,6 +721,13 @@ fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed
         let Some(block) = src.next_block(wait) else { return fail(&status, "SDR stopped delivering samples (unplugged?)".into()) };
         cc.process(&block, &mut |e| events.push(e));
         let helper_data = read_helpers(&mut helpers, &mut events, &mut lost);
+        if release.asked.load(AtomicOrdering::Acquire) {
+            // `asked` is cleared only once the helpers are gone, holding `ids` so no new request slips in between.
+            let mut ids = release.ids.lock().unwrap_or_else(|p| p.into_inner());
+            drop_helpers(&mut helpers, &ids, &mut lost);
+            ids.clear();
+            release.asked.store(false, AtomicOrdering::Release);
+        }
         // Before this pass's grants, so one on a lost channel's frequency opens a fresh channel.
         for id in lost.drain(..) { rec.drop_channel(id); }
         if wait.is_zero() && block.is_empty() && !helper_data { std::thread::sleep(Duration::from_millis(5)); }
@@ -807,11 +891,12 @@ fn free_tuners(present: Vec<String>, config: &dyn Fn(&str) -> TunerConfig, claim
     present.into_iter().filter(|t| config(t).mode == TunerMode::Live && !claimed.contains(t) && !reserved.contains(t)).collect()
 }
 
-/// Claims tuner `serial` and opens it as a helper whose window covers every `required` channel (and as many `known`
-/// as it can), or at its locked centre if that covers them. Uses the tuner's saved PPM (no control channel to measure).
+/// Claims tuner `serial` (with `claim`) and opens it as a helper whose window covers every `required` channel (and as
+/// many `known` as it can), or at its locked centre if that covers them. Uses the tuner's saved PPM (no control channel
+/// to measure).
 #[allow(clippy::too_many_arguments)]
-fn open_helper(serial: &str, cfg: &TunerConfig, open: &SourceFactory, claimed: &Claimed, required: &[i64], known: &[i64],
-               modulation: Modulation, id_base: u32) -> Result<Helper, String> {
+fn open_helper(serial: &str, cfg: &TunerConfig, open: &SourceFactory, claim: &dyn Fn() -> Result<Claim, String>, required: &[i64],
+               known: &[i64], modulation: Modulation, id_base: u32) -> Result<Helper, String> {
     let label = sdrtrunk_source::tuner_label(serial);
     // Checked before opening (an open is slow USB work on the decode thread).
     if !required.iter().all(|&hz| tuning::Window::for_tuner(serial, 0, 0, cfg.min_hz, cfg.max_hz).allowed(hz)) {
@@ -821,8 +906,7 @@ fn open_helper(serial: &str, cfg: &TunerConfig, open: &SourceFactory, claimed: &
         let locked = tuning::Window::for_tuner(serial, expected_rate(serial, cfg), c as i64, cfg.min_hz, cfg.max_hz);
         if !required.iter().all(|&hz| locked.covers(hz)) { return Err(format!("{label}: its window cannot cover it")); }
     }
-    if !claimed.lock().unwrap_or_else(|p| p.into_inner()).insert(serial.to_string()) { return Err(format!("{label} is in use")); }
-    let claim = Claim(claimed.clone(), serial.to_string());
+    let claim = claim()?;
     // With nothing required (start-up), the window is placed over whichever `known` channels fit this tuner's limits.
     let limits = tuning::Window::for_tuner(serial, 0, 0, cfg.min_hz, cfg.max_hz);
     let Some(&first) = required.first().or_else(|| known.iter().find(|&&hz| limits.allowed(hz))) else {
@@ -882,6 +966,16 @@ fn read_helpers(helpers: &mut Vec<Helper>, events: &mut Vec<ControlEvent>, lost:
         }
     });
     got
+}
+
+/// Drops the helpers on tuners `ids` (an owner's save asked for them) as if their SDRs were lost: their tuners are
+/// released and their channel ids go to `lost`, for the recorder to finish and forget.
+fn drop_helpers(helpers: &mut Vec<Helper>, ids: &[String], lost: &mut Vec<u32>) {
+    helpers.retain(|h| {
+        let keep = !ids.contains(&h.serial);
+        if !keep { lost.extend(h.bank.voice_ids()); }
+        keep
+    });
 }
 
 /// Draws a spectrum frame for each watched helper from its newest block, marking the calls (`following`, asked only
@@ -1100,7 +1194,7 @@ mod tests {
         assert!(wait_for(Duration::from_secs(2), || state(&rx, auto) == "running" && state(&rx, pinned) == "running"));
         assert_eq!(rx.status(pinned).unwrap().tuner.as_deref(), Some(A));
         assert_eq!(rx.status(auto).unwrap().tuner.as_deref(), Some(B), "automatic never takes a pinned tuner");
-        // Added once the others run: decoder threads started together claim tuners in any order.
+        // Added once the others run, so it is the one left without a tuner.
         let third = db.save_system(&sys("Extra", "")).unwrap();
         rx.apply(&db, third);
         assert!(wait_for(Duration::from_secs(1), || state(&rx, third) == "error"));
@@ -1129,7 +1223,7 @@ mod tests {
         let rx = Receivers::new(sdrs);
         rx.restart_all(&db);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running"));
-        // Added once the first runs: decoder threads started together claim tuners in any order.
+        // Added once the first runs, so it is the one left without a tuner.
         let second = db.save_system(&sys("Extra", "")).unwrap();
         rx.apply(&db, second);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running" && state(&rx, second) == "error"));
@@ -1158,7 +1252,7 @@ mod tests {
         let rx = Receivers::new(sdrs);
         rx.restart_all(&db);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running"));
-        // Added once the first runs: decoder threads started together claim tuners in any order.
+        // Added once the first runs, so it is the one left without a tuner.
         let second = db.save_system(&sys("Extra", A)).unwrap();
         rx.apply(&db, second);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running" && state(&rx, second) == "error"));
@@ -1375,8 +1469,10 @@ mod tests {
         fn follow<R>(&mut self, act: impl FnOnce(&mut Follow) -> R) -> R {
             let (claimed, reserved, factory, present, cfg) = (&self.claimed, &self.reserved, &self.factory, &self.present, &self.cfg);
             let free = || free_tuners(present.clone(), &|_| cfg.clone(), &claimed.lock().unwrap(), reserved);
-            let mut opener = |serial: &str, required: &[i64], known: &[i64], id_base: u32|
-                open_helper(serial, cfg, factory, claimed, required, known, Modulation::C4fm, id_base);
+            let mut opener = |serial: &str, required: &[i64], known: &[i64], id_base: u32| {
+                let claim = || if claimed.lock().unwrap().insert(serial.to_string()) { Ok(Claim(claimed.clone(), serial.to_string())) } else { Err("in use".to_string()) };
+                open_helper(serial, cfg, factory, &claim, required, known, Modulation::C4fm, id_base)
+            };
             act(&mut Follow { cc: &mut self.cc, src: &mut self.src, win: &mut self.win, locked: false, control: KSICS, known: &self.known,
                 status: &self.status, helpers: &mut self.helpers, free: &free, opener: &mut opener })
         }
@@ -1718,15 +1814,33 @@ mod tests {
     #[test]
     fn helper_switched_to_setup_is_released() {
         let db = Db::open_in_memory().unwrap();
-        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let (sdrs, probe) = fakes(&[RTL1, RTL2], &[]);
         let rx = Receivers::new(sdrs);
         let id = with_helper(&db, &rx);
+        let before = rx.get(id).unwrap();
         db.save_tuner(RTL2, &TunerConfig { mode: TunerMode::Setup, center_hz: Some(863_000_000), ..TunerConfig::default() }).unwrap();
         rx.apply_tuner(&db, RTL2);
         assert!(wait_for(Duration::from_secs(2), || rx.setup_status(RTL2).is_some_and(|s| s.state == "running")), "{:?}", rx.setup_status(RTL2));
-        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        assert!(Arc::ptr_eq(&before, &rx.get(id).unwrap()) && state(&rx, id) == "running", "the system kept running, not restarted");
+        assert_eq!(probe.open.load(Ordering::SeqCst), 2, "main tuner still open, plus the Setup run");
         std::thread::sleep(Duration::from_millis(200));
         assert!(rx.status(id).unwrap().helpers.is_empty(), "a Setup tuner is never a helper");
+        assert!(rx.tuner_view(RTL2).is_some_and(|v| Arc::ptr_eq(&v, &rx.setups.lock().unwrap()[RTL2].spectrum)), "the spectrum is the Setup run's");
+    }
+
+    #[test]
+    fn helper_saved_live_is_released_not_its_system() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, probe) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        let before = rx.get(id).unwrap();
+        db.save_tuner(RTL2, &TunerConfig { rtl_gain_db: Some(20.0), ..TunerConfig::default() }).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(!rx.claimed.lock().unwrap().contains(RTL2), "released before the save returns");
+        assert!(Arc::ptr_eq(&before, &rx.get(id).unwrap()) && state(&rx, id) == "running", "not restarted");
+        assert!(wait_for(Duration::from_secs(1), || rx.status(id).unwrap().helpers.is_empty()));
+        assert_eq!(probe.open.load(Ordering::SeqCst), 1, "only the main tuner open");
     }
 
     #[test]
@@ -1735,13 +1849,164 @@ mod tests {
         let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
         let rx = Receivers::new(sdrs);
         let a = with_helper(&db, &rx);
+        let before = rx.get(a).unwrap();
         let b = db.save_system(&sys("KSICS", RTL2)).unwrap();
         rx.apply(&db, b);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, b) == "running"), "{:?}", rx.status(b));
         assert_eq!(rx.status(b).unwrap().tuner.as_deref(), Some(RTL2));
-        assert!(wait_for(Duration::from_secs(2), || state(&rx, a) == "running"));
+        assert!(Arc::ptr_eq(&before, &rx.get(a).unwrap()) && state(&rx, a) == "running", "the holder kept running, not restarted");
         std::thread::sleep(Duration::from_millis(200));
         assert!(rx.status(a).unwrap().helpers.is_empty(), "a pinned tuner is never a helper");
+    }
+
+    #[test]
+    fn released_helper_calls_end_and_main_calls_stay() {
+        let mut rig = Rig::new(&[], false);
+        rig.present.push("rtl:00000003".into());
+        let names = Names { system: "KSICS".into(), site: "Site".into(), channel: "Control".into() };
+        let mut rec = Recorder::new(&std::env::temp_dir().join("sdrtrunk-helper-released"), names, Arc::default());
+        let grant = |hz: u64| ControlEvent::Call(sdrtrunk_p25::trunk::CallGrant { group: 1, source: 0, hz, encrypted: false,
+            emergency: false, channel: sdrtrunk_p25::tsbk_msg::Channel { band: 0, number: 1 } });
+        rig.follow(|f| for hz in [851_600_000, 853_950_000, 857_000_000] { rec.handle(&grant(hz), 0, f) });
+        assert_eq!((rec.following().len(), rig.helpers.len()), (3, 2));
+        let mut lost = Vec::new();
+        drop_helpers(&mut rig.helpers, &[RTL2.to_string()], &mut lost);
+        assert_eq!(lost, vec![1 << 24], "RTL-SDR 2's call");
+        assert!(!rig.claims(RTL2) && rig.claims("rtl:00000003"), "only RTL-SDR 2 released");
+        for id in lost { rec.drop_channel(id); }
+        let mut following: Vec<u64> = rec.following().iter().map(|f| f.0).collect();
+        following.sort();
+        assert_eq!(following, vec![851_600_000, 857_000_000], "the main tuner's and the other helper's calls go on");
+    }
+
+    #[test]
+    fn tuner_being_opened_as_a_helper_is_released_on_save() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        // RTL-SDR 2 opens slowly: the save arrives while it is claimed as the start-up helper but not yet in the status.
+        let open = sdrs.open.clone();
+        let sdrs = Sdrs { list: sdrs.list, open: Arc::new(move |c: &TunerConfig, hz, id: &str| {
+            if id == RTL2 { std::thread::sleep(Duration::from_millis(300)); }
+            open(c, hz, id)
+        }) };
+        let rx = Receivers::new(sdrs);
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        db.add_voice_freqs(id, &[859_000_000, 862_500_000, 863_000_000]).unwrap();
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || rx.claimed.lock().unwrap().contains(RTL2)));
+        assert!(rx.status(id).unwrap().helpers.is_empty(), "not listed yet");
+        let before = rx.get(id).unwrap();
+        db.save_tuner(RTL2, &TunerConfig { mode: TunerMode::Setup, center_hz: Some(863_000_000), ..TunerConfig::default() }).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(wait_for(Duration::from_secs(2), || rx.setup_status(RTL2).is_some_and(|s| s.state == "running")), "{:?}", rx.setup_status(RTL2));
+        assert!(Arc::ptr_eq(&before, &rx.get(id).unwrap()), "not restarted");
+    }
+
+    #[test]
+    fn failed_systems_tuner_held_as_a_helper_is_released_on_save() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let (open, rtl2_opens) = (sdrs.open.clone(), Arc::new(AtomicUsize::new(0)));
+        let n = rtl2_opens.clone();
+        let sdrs = Sdrs { list: sdrs.list, open: Arc::new(move |c: &TunerConfig, hz, id: &str| {
+            // RTL-SDR 2 fails its first open (as the failed system's main tuner) and opens fine as a helper.
+            if id == RTL2 && n.fetch_add(1, Ordering::SeqCst) == 0 { return Err("RTL-SDR 00000002: usb_claim_interface error -6".into()); }
+            // RTL-SDR 1 opens slowly, so the second system looks for a helper only after the first one's open failed.
+            if id == RTL1 { std::thread::sleep(Duration::from_millis(200)); }
+            open(c, hz, id)
+        }) };
+        let rx = Receivers::new(sdrs);
+        // Automatic, lowest id: handed RTL-SDR 2 (RTL-SDR 1 is pinned to the other system).
+        let a = db.save_system(&sys("SGCo", "")).unwrap();
+        let b = db.save_system(&sys("KSICS", RTL1)).unwrap();
+        db.add_voice_freqs(b, &[859_000_000, 862_500_000, 863_000_000]).unwrap();
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(3), || state(&rx, a) == "error" && rx.status(b).is_some_and(|s| s.helpers.iter().any(|h| h.0 == RTL2))),
+            "a {:?} b {:?}", rx.status(a), rx.status(b));
+        assert_eq!(rx.get(a).unwrap().main.as_deref(), Some(RTL2), "the failed system still names it as its main tuner");
+        db.save_tuner(RTL2, &TunerConfig { mode: TunerMode::Setup, center_hz: Some(863_000_000), ..TunerConfig::default() }).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(wait_for(Duration::from_secs(2), || rx.setup_status(RTL2).is_some_and(|s| s.state == "running")), "{:?}", rx.setup_status(RTL2));
+        assert!(rx.status(b).unwrap().helpers.is_empty());
+    }
+
+    #[test]
+    fn live_save_returns_promptly_when_the_helper_is_taken_again() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        // Stands in for the decoder following a grant right after the release: the Live tuner is claimed again at once.
+        let claimed = rx.claimed.clone();
+        let retake = std::thread::spawn(move || {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(3) {
+                let mut c = claimed.lock().unwrap();
+                if !c.contains(RTL2) { c.insert(RTL2.into()); return true; }
+            }
+            false
+        });
+        db.save_tuner(RTL2, &TunerConfig { rtl_gain_db: Some(20.0), ..TunerConfig::default() }).unwrap();
+        let t = Instant::now();
+        rx.apply_tuner(&db, RTL2);
+        assert!(t.elapsed() < Duration::from_secs(1), "the save waited {:?}", t.elapsed());
+        assert!(retake.join().unwrap(), "the helper was released");
+        assert_eq!(state(&rx, id), "running");
+        rx.claimed.lock().unwrap().remove(RTL2);
+    }
+
+    #[test]
+    fn failed_systems_get_no_release_requests() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        let failed = db.save_system(&sys("Extra", RTL1)).unwrap();
+        rx.apply(&db, failed);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, failed) == "error"));
+        let f = rx.get(failed).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(f.release.ids.lock().unwrap().is_empty(), "its thread is gone: nothing to pile up");
+        assert_eq!(state(&rx, id), "running");
+    }
+
+    #[test]
+    fn helper_claim_checks_mode_and_pins_under_the_pool_lock() {
+        let claimed: Claimed = Arc::default();
+        let pool = Pool { seen: vec![RTL1.into(), RTL2.into()],
+            tuners: vec![(RTL1.into(), TunerConfig { mode: TunerMode::Setup, ..TunerConfig::default() })], pins: vec![(7, RTL2.into())] };
+        assert!(pool.claim_helper(&claimed, 1, RTL1).is_err(), "Setup mode");
+        assert!(pool.claim_helper(&claimed, 1, RTL2).is_err(), "pinned to system 7");
+        assert!(claimed.lock().unwrap().is_empty(), "nothing claimed");
+        let c = pool.claim_helper(&claimed, 7, RTL2).expect("its own pin is no obstacle");
+        assert!(pool.claim_helper(&claimed, 7, RTL2).err().is_some_and(|e| e.contains("in use")));
+        drop(c);
+        assert!(claimed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lowest_numbered_system_wins_a_contested_sdr() {
+        for (pin, why) in [("", "no free SDR"), (RTL1, "used by another system")] {
+            for _ in 0..20 {
+                let db = Db::open_in_memory().unwrap();
+                let low = db.save_system(&sys("Low", pin)).unwrap();
+                let high = db.save_system(&sys("High", pin)).unwrap();
+                let (sdrs, _) = fakes(&[RTL1], &[]);
+                // The lower system's decoder thread is slow to list SDRs: whoever claims first in the threads would lose it.
+                let slow = format!("decoder-{low}");
+                let sdrs = Sdrs { list: Arc::new(move || {
+                    if std::thread::current().name() == Some(slow.as_str()) { std::thread::sleep(Duration::from_millis(50)); }
+                    vec![RTL1.into()]
+                }), open: sdrs.open };
+                let rx = Receivers::new(sdrs);
+                rx.restart_all(&db);
+                assert!(wait_for(Duration::from_secs(2), || state(&rx, low) == "running" && state(&rx, high) == "error"),
+                    "pin {pin:?}: low {:?} high {:?}", rx.status(low), rx.status(high));
+                assert_eq!(rx.status(low).unwrap().tuner.as_deref(), Some(RTL1));
+                assert!(rx.status(high).unwrap().error.unwrap().contains(why));
+                rx.stop_all();
+            }
+        }
     }
 
     #[test]

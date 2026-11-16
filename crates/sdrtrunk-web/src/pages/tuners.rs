@@ -75,7 +75,7 @@ fn gain_text(id: &str, c: &TunerConfig) -> String {
 
 pub async fn list(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Query<Saved>) -> Markup {
     layout("Tuners", Some(&s.user), &s.csrf, html! {
-        (notice(None, q.saved.is_some().then_some("Saved. The system using that tuner restarted.")))
+        (notice(None, q.saved.is_some().then_some("Saved.")))
         p.muted { "Each SDR keeps its own frequency correction, gain and sample rate. Systems choose an SDR on the "
             a href="/systems" { "Systems" } " page, or take any free one (Automatic)." }
         div data-live="/tuners/events" { (tuners_table(&st)) }
@@ -237,7 +237,7 @@ fn form_view(st: &AppState, s: &Session, id: &str, f: &TunerForm, errors: &[Fiel
                 }
                 (field_error(errors, "rate_hz"))
             }
-            div.form-actions { button { "Save and restart the system using it" } a.button.quiet href="/tuners" { "Cancel" } }
+            div.form-actions { button { "Save" } a.button.quiet href="/tuners" { "Cancel" } }
         }
     })
 }
@@ -257,7 +257,8 @@ pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Pa
     if let Err(e) = st.db.save_tuner(&id, &c) {
         return form_view(&st, &s, &id, &f, &[FieldError { field: "form", message: format!("Could not save: {e}") }]).into_response();
     }
-    // ponytail: restarts join decoder threads (up to ~200 ms each) on this request; fine for a settings form.
+    // ponytail: restarts join decoder threads (up to ~200 ms each) and releasing a helper waits up to 2 s, on this
+    // request; fine for a settings form.
     st.receivers.apply_tuner(&st.db, &id);
     st.db.audit(now_ms(), &s.user.username, &format!("changed tuner {}", tuner_label(&id)));
     Redirect::to("/tuners?saved=1").into_response()
