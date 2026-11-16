@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/sdrtrunk-edac", "crates/sdrtrunk-dsp", "crates/sdrtrunk-p25", "crates/sdrtrunk-source", "crates/sdrtrunk-cli", "crates/sdrtrunk-web", "crates/sdrtrunk-audio"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+version = "0.0.1"

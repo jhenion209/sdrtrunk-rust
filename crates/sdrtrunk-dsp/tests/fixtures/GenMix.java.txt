@@ -1,0 +1,39 @@
+import io.github.dsheirer.dsp.mixer.ScalarComplexMixer;
+import io.github.dsheirer.dsp.oscillator.ScalarComplexOscillator;
+import io.github.dsheirer.sample.complex.ComplexSamples;
+import java.io.*;
+import java.util.*;
+
+/** Generates oscillator and mixer vectors for the Rust port. Usage: java GenMix out.txt */
+public class GenMix {
+    static Random rnd = new Random(91L);
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+    static float[] noise(int n) { float[] a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float) (rnd.nextGaussian() * 0.5); return a; }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+        // Oscillator: block sizes crossing the 100-sample gain-correction boundary, phase tracked across calls.
+        double[][] osc = {{-250000.0, 10000000.0}, {123456.789, 10000000.0}, {2500.0, 25000.0}, {-3.8e-6 * 852112500.0, 10000000.0}};
+        for (double[] p : osc) {
+            ScalarComplexOscillator o = new ScalarComplexOscillator(p[0], p[1]);
+            for (int blk : new int[]{64, 100, 99, 250, 1000, 7}) {
+                ComplexSamples s = o.generateComplexSamples(blk, 0L);
+                out.println("OSC|" + p[0] + "," + p[1] + "," + blk + "|" + hex(s.i()) + ";" + hex(s.q()));
+            }
+        }
+        // Mixer: frequency change mid-stream, sample rate 10 MHz.
+        ScalarComplexMixer m = new ScalarComplexMixer(-250000.0, 10000000.0, true);
+        int step = 0;
+        for (int blk : new int[]{128, 300, 77, 512}) {
+            if (step++ == 2) m.setFrequency(412345.0);
+            float[] i = noise(blk), q = noise(blk);
+            ComplexSamples r = m.mix(i, q, 0L);
+            out.println("MIX|" + hex(i) + ";" + hex(q) + "|" + hex(r.i()) + ";" + hex(r.q()));
+        }
+        out.close();
+    }
+}

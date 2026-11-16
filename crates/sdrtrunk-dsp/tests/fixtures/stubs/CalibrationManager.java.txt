@@ -1,0 +1,9 @@
+package io.github.dsheirer.vector.calibrate;
+
+/** Test stub: always selects the scalar implementation so the Java oracle is deterministic. */
+public class CalibrationManager {
+    private static final CalibrationManager INSTANCE = new CalibrationManager();
+    public static CalibrationManager getInstance() { return INSTANCE; }
+    public Implementation getImplementation(CalibrationType type) { return Implementation.SCALAR; }
+    public Implementation getUncalibrated() { return Implementation.SCALAR; }
+}

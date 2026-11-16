@@ -1,0 +1,16 @@
+[package]
+name = "sdrtrunk-audio"
+description = "P25 IMBE voice decoding via bundled mbelib (ISC), WAV output"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+sdrtrunk-p25 = { path = "../sdrtrunk-p25" }
+sdrtrunk-dsp = { path = "../sdrtrunk-dsp" }
+
+[dependencies]
+mp3lame-encoder = "0.3"

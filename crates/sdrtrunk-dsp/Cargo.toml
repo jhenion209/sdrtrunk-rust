@@ -1,0 +1,9 @@
+[package]
+name = "sdrtrunk-dsp"
+description = "DSP building blocks for the P25 C4FM path (port of sdrtrunk dsp package)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rustfft = "6.2"

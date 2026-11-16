@@ -1,0 +1,17 @@
+[package]
+name = "sdrtrunk-cli"
+description = "SDRTrunk-Rust command line: live P25 control channel monitor"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "sdrtrunk-rust"
+path = "src/main.rs"
+
+[dependencies]
+sdrtrunk-dsp = { path = "../sdrtrunk-dsp" }
+sdrtrunk-p25 = { path = "../sdrtrunk-p25" }
+sdrtrunk-source = { path = "../sdrtrunk-source" }
+sdrtrunk-web = { path = "../sdrtrunk-web" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

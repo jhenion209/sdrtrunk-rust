@@ -1,0 +1,71 @@
+import io.github.dsheirer.dsp.filter.FilterFactory;
+import io.github.dsheirer.dsp.filter.decimate.DecimationFilterFactory;
+import io.github.dsheirer.dsp.filter.decimate.IRealDecimationFilter;
+import io.github.dsheirer.dsp.filter.fir.FIRFilterSpecification;
+import io.github.dsheirer.dsp.filter.fir.real.IRealFilter;
+import io.github.dsheirer.dsp.psk.demod.DifferentialDemodulatorFactory;
+import io.github.dsheirer.dsp.psk.demod.DifferentialDemodulatorFloat;
+import io.github.dsheirer.dsp.window.WindowType;
+import java.io.*;
+import java.util.*;
+
+/**
+ * Vectors for the half-band decimator and the C4FM decoder front end. The FRONT record repeats the exact call
+ * sequence of P25P1DecoderC4FM.setSampleRate()/receive() for a 50 kHz channel.
+ * Usage: java GenFront out.txt
+ */
+public class GenFront {
+    static Random rnd = new Random(4242L);
+
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+
+    static float[] noise(int n) {
+        float[] a = new float[n];
+        for (int i = 0; i < n; i++) a[i] = (float) (rnd.nextGaussian() * 0.5);
+        return a;
+    }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+
+        out.println("HBTAPS|63|" + hex(FilterFactory.getHalfBand(63, WindowType.HAMMING)));
+
+        IRealDecimationFilter dec = DecimationFilterFactory.getRealDecimationFilter(2);
+        for (int blk : new int[]{128, 256, 100, 64, 2, 512, 130}) {
+            float[] in = noise(blk);
+            out.println("DEC|" + hex(in) + "|" + hex(dec.decimateReal(in)));
+        }
+
+        // Front end for the 50 kHz polyphase channel: same sequence as P25P1DecoderC4FM.
+        float sampleRate = 50000f;
+        int decimation = 1;
+        while ((sampleRate / decimation) >= 38400) decimation *= 2;
+        IRealDecimationFilter di = DecimationFilterFactory.getRealDecimationFilter(decimation);
+        IRealDecimationFilter dq = DecimationFilterFactory.getRealDecimationFilter(decimation);
+        float decimated = sampleRate / decimation;
+        float[] rrc = FilterFactory.getRootRaisedCosine(decimated / 4800, 16, 0.2f);
+        IRealFilter psI = FilterFactory.getPulseShapingFilter(rrc);
+        IRealFilter psQ = FilterFactory.getPulseShapingFilter(rrc);
+        FIRFilterSpecification spec = FIRFilterSpecification.lowPassBuilder().sampleRate(decimated)
+            .passBandCutoff(5200).passBandAmplitude(1.0).passBandRipple(0.01)
+            .stopBandAmplitude(0.0).stopBandStart(6500).stopBandRipple(0.01).build();
+        float[] bb = FilterFactory.getTaps(spec);
+        IRealFilter bbI = FilterFactory.getRealFilter(bb);
+        IRealFilter bbQ = FilterFactory.getRealFilter(bb);
+        DifferentialDemodulatorFloat demod = DifferentialDemodulatorFactory.getFloatDemodulator(decimated, 4800);
+        out.println("FRONTINFO|" + decimated + "," + demod.getSamplesPerSymbol() + "," + rrc.length + "," + bb.length);
+        for (int blk : new int[]{200, 400, 120, 1000, 250, 2048}) {
+            float[] i = noise(blk), q = noise(blk);
+            float[] ii = bbI.filter(di.decimateReal(i));
+            float[] qq = bbQ.filter(dq.decimateReal(q));
+            ii = psI.filter(ii);
+            qq = psQ.filter(qq);
+            out.println("FRONT|" + hex(i) + ";" + hex(q) + "|" + hex(demod.demodulate(ii, qq)));
+        }
+        out.close();
+    }
+}

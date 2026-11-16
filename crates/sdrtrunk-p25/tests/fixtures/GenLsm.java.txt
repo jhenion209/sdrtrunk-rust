@@ -1,0 +1,105 @@
+package io.github.dsheirer.module.decode.p25.phase1;
+
+import io.github.dsheirer.dsp.filter.FilterFactory;
+import io.github.dsheirer.dsp.filter.decimate.DecimationFilterFactory;
+import io.github.dsheirer.dsp.filter.decimate.IRealDecimationFilter;
+import io.github.dsheirer.dsp.filter.fir.FIRFilterSpecification;
+import io.github.dsheirer.dsp.filter.fir.real.IRealFilter;
+import io.github.dsheirer.dsp.symbol.Dibit;
+import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.decode.FeedbackDecoder;
+import java.io.*;
+import java.util.*;
+
+/**
+ * Oracle for the LSM (CQPSK) chain: the exact filter chain of P25P1DecoderLSM.receive() at a 50 kHz channel rate,
+ * feeding the real P25P1DemodulatorLSM with a stub framer that records every symbol.
+ * Input: synthetic pi/4-DQPSK at 4800 baud, 50 kHz, with carrier offset and noise.
+ *
+ * Lines:
+ *   TAPS|baseband|hex...      TAPS|rrc|hex...
+ *   BLOCK|i hex|q hex|symbols  (symbols: soft hex,dibit value;...)
+ */
+public class GenLsm {
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+
+    static class StubFramer extends P25P1MessageFramer {
+        final StringBuilder log = new StringBuilder();
+        @Override public boolean processWithSoftSyncDetect(float soft, Dibit d) {
+            log.append(Integer.toHexString(Float.floatToRawIntBits(soft))).append(",").append(d.getValue()).append(";");
+            return false;
+        }
+    }
+
+    static FeedbackDecoder stubDecoder() {
+        return new FeedbackDecoder() {
+            @Override public String getProtocolDescription() { return "stub"; }
+            @Override public DecoderType getDecoderType() { return DecoderType.P25_PHASE1; }
+            @Override public void reset() { }
+            @Override public void start() { }
+            @Override public void stop() { }
+            @Override public void dispose() { }
+            @Override public void setMessageListener(io.github.dsheirer.sample.Listener<io.github.dsheirer.message.IMessage> l) { }
+            @Override public void removeMessageListener() { }
+        };
+    }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+        double rate = 50000;
+        Random rnd = new Random(4242L);
+
+        // Synthetic pi/4-DQPSK: phase steps +pi/4 (+1), +3pi/4 (+3), -pi/4 (-1), -3pi/4 (-3), linear phase ramp
+        // across each symbol, 230 Hz carrier offset, amplitude 0.25, gaussian noise.
+        int n = 24000;
+        int symbols = (int) (n / rate * 4800) + 2;
+        double[] phaseAt = new double[symbols + 1];
+        double[] steps = {Math.PI / 4, 3 * Math.PI / 4, -Math.PI / 4, -3 * Math.PI / 4};
+        for (int s = 1; s <= symbols; s++) phaseAt[s] = phaseAt[s - 1] + steps[rnd.nextInt(4)];
+        float[] si = new float[n], sq = new float[n];
+        for (int k = 0; k < n; k++) {
+            double t = k / rate * 4800;
+            int s = (int) Math.floor(t);
+            double frac = t - s;
+            double ph = phaseAt[s] + (phaseAt[s + 1] - phaseAt[s]) * frac + 2 * Math.PI * 230 * k / rate;
+            si[k] = (float) (0.25 * Math.cos(ph) + rnd.nextGaussian() * 0.02);
+            sq[k] = (float) (0.25 * Math.sin(ph) + rnd.nextGaussian() * 0.02);
+        }
+
+        // P25P1DecoderLSM.setSampleRate(50000): decimation 2 -> 25 kHz.
+        IRealDecimationFilter di = DecimationFilterFactory.getRealDecimationFilter(2);
+        IRealDecimationFilter dq = DecimationFilterFactory.getRealDecimationFilter(2);
+        float decimated = (float) rate / 2;
+        float[] rrc = FilterFactory.getRootRaisedCosine(decimated / 4800.0, 16, 0.2f);
+        FIRFilterSpecification spec = FIRFilterSpecification.lowPassBuilder().sampleRate(decimated)
+            .passBandCutoff(7250).passBandAmplitude(1.0).passBandRipple(0.01)
+            .stopBandAmplitude(0.0).stopBandStart(8000).stopBandRipple(0.01).build();
+        float[] bb = FilterFactory.getTaps(spec);
+        out.println("TAPS|baseband|" + hex(bb));
+        out.println("TAPS|rrc|" + hex(rrc));
+        IRealFilter psi = FilterFactory.getPulseShapingFilter(rrc), psq = FilterFactory.getPulseShapingFilter(rrc);
+        IRealFilter bbi = FilterFactory.getRealFilter(bb), bbq = FilterFactory.getRealFilter(bb);
+
+        StubFramer framer = new StubFramer();
+        P25P1DemodulatorLSM demod = new P25P1DemodulatorLSM(framer, stubDecoder());
+        demod.setSamplesPerSymbol(decimated / 4800);
+
+        int[] blocks = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
+        int pos = 0;
+        for (int blk : blocks) {
+            float[] i = Arrays.copyOfRange(si, pos, pos + blk), q = Arrays.copyOfRange(sq, pos, pos + blk);
+            pos += blk;
+            float[] fi = di.decimateReal(i), fq = dq.decimateReal(q);
+            fi = bbi.filter(fi); fq = bbq.filter(fq);
+            fi = psi.filter(fi); fq = psq.filter(fq);
+            framer.log.setLength(0);
+            demod.process(fi, fq);
+            out.println("BLOCK|" + hex(i) + "|" + hex(q) + "|" + framer.log);
+        }
+        out.close();
+    }
+}

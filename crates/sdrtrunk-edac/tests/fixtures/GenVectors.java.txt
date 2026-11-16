@@ -1,0 +1,145 @@
+import io.github.dsheirer.bits.*;
+import io.github.dsheirer.edac.*;
+import io.github.dsheirer.edac.bch.*;
+import java.io.*;
+import java.lang.reflect.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class Gen {
+    static Random rnd = new Random(20261113L);
+    static PrintWriter out;
+
+    static CorrectedBinaryMessage msg(String bits) {
+        CorrectedBinaryMessage m = new CorrectedBinaryMessage(bits.length());
+        for (int i = 0; i < bits.length(); i++) if (bits.charAt(i) == '1') m.set(i);
+        return m;
+    }
+    static String str(BinaryMessage m, int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) sb.append(m.get(i) ? '1' : '0');
+        return sb.toString();
+    }
+    static String randBits(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) sb.append(rnd.nextBoolean() ? '1' : '0');
+        return sb.toString();
+    }
+    static String flips(String bits, int k) {
+        char[] c = bits.toCharArray();
+        for (int j = 0; j < k; j++) { int i = rnd.nextInt(c.length); c[i] = c[i] == '1' ? '0' : '1'; }
+        return new String(c);
+    }
+    static void emit(String kind, String in, Object rc, String o) { out.println(kind + "|" + in + "|" + rc + "|" + o); }
+
+    static long crc(Object[] a) throws Exception {
+        Method m = CRCP25.class.getDeclaredMethod("calculateCRC", BinaryMessage.class, int.class, int.class, int.class, long.class, long.class);
+        m.setAccessible(true);
+        return (Long) m.invoke(null, a);
+    }
+    static void put(StringBuilder sb, long v, int bits) { for (int i = bits - 1; i >= 0; i--) sb.append((v >> i & 1) == 1 ? '1' : '0'); }
+
+    public static void main(String[] args) throws Exception {
+        out = new PrintWriter(new FileWriter(args[0]));
+        // Golay24 / Golay23 / Golay18 / Hamming on random words (high density of correctable cases).
+        for (int i = 0; i < 400; i++) {
+            String w = randBits(24); CorrectedBinaryMessage m = msg(w);
+            int rc = Golay24.checkAndCorrect(m, 0); emit("GOLAY24", w, rc, str(m, 24));
+        }
+        for (int i = 0; i < 400; i++) {
+            String w = randBits(23); CorrectedBinaryMessage m = msg(w);
+            int rc = Golay23.checkAndCorrect(m, 0); emit("GOLAY23", w, rc, str(m, 23));
+        }
+        for (int i = 0; i < 400; i++) {
+            String w = randBits(18); CorrectedBinaryMessage m = msg(w);
+            Golay18.checkAndCorrect(m, 0); emit("GOLAY18", w, m.getCorrectedBitCount(), str(m, 18));
+        }
+        for (int i = 0; i < 300; i++) {
+            String w = randBits(10); CorrectedBinaryMessage m = msg(w);
+            int rc = Hamming10.checkAndCorrect(m, 0); emit("HAM10", w, rc, str(m, 10));
+        }
+        for (int i = 0; i < 300; i++) {
+            String w = randBits(16); CorrectedBinaryMessage m = msg(w);
+            int rc = Hamming16.checkAndCorrect(m, 0); emit("HAM16C", w, rc, str(m, 16));
+            emit("HAM16I", w, new Hamming16().getErrorIndex(msg(w), 0), "");
+        }
+        for (int i = 0; i < 300; i++) {
+            String w = randBits(17); emit("HAM17I", w, new Hamming17().getErrorIndex(msg(w), 0), "");
+            String w13 = randBits(13); emit("HAM13I", w13, Hamming13.getErrorIndex(msg(w13), 0), "");
+            String w15 = randBits(15); emit("HAM15I", w15, Hamming15.getErrorIndex(msg(w15), 0), "");
+        }
+        // BCH from seeds.
+        BCH_63_16_23_P25 bch = new BCH_63_16_23_P25();
+        List<String> seeds = Files.readAllLines(Paths.get(args[1]));
+        for (String line : seeds) {
+            String[] p = line.split(" ");
+            if (p[0].equals("BCH")) {
+                for (int k = 0; k <= 14; k++) {
+                    String w = flips(p[1], k); CorrectedBinaryMessage m = msg(w);
+                    bch.decode(m); emit("BCH", w, m.getCorrectedBitCount(), str(m, 63));
+                }
+            } else {
+                int n = 63;
+                int kk = p[0].equals("RS63_47") ? 47 : 35;
+                ReedSolomon_63_P25 rs = p[0].equals("RS63_47") ? new ReedSolomon_63_47_17_P25() : new ReedSolomon_63_35_29_P25();
+                int t = (n - kk) / 2;
+                String[] sy = p[1].split(",");
+                for (int e = 0; e <= t + 2; e++) {
+                    int[] in = new int[n];
+                    for (int i = 0; i < n; i++) in[i] = Integer.parseInt(sy[i]);
+                    for (int j = 0; j < e; j++) in[rnd.nextInt(n)] ^= 1 + rnd.nextInt(63);
+                    int[] o = new int[n];
+                    boolean bad = rs.decode(in.clone(), o);
+                    StringBuilder si = new StringBuilder(), so = new StringBuilder();
+                    for (int i = 0; i < n; i++) { si.append(i > 0 ? "," : "").append(in[i]); so.append(i > 0 ? "," : "").append(o[i]); }
+                    emit(p[0], si.toString(), bad ? 1 : 0, bad ? "" : so.toString());
+                }
+            }
+        }
+        // CRC-CCITT-80 on valid frames with 0..3 flips.
+        for (int i = 0; i < 300; i++) {
+            String data = randBits(80);
+            long c = crc(new Object[]{msg(data + "0".repeat(16)), 0, 80, 16, 0x1021L, 0xFFFFL});
+            StringBuilder f = new StringBuilder(data); put(f, c, 16);
+            String w = flips(f.toString(), i % 4); CorrectedBinaryMessage m = msg(w);
+            int rc = CRCP25.correctCCITT80(m, 0, 80); emit("CCITT80", w, rc, str(m, 96));
+        }
+        // CRC-9 (144 bit blocks): valid + corrupted.
+        for (int i = 0; i < 100; i++) {
+            String w = randBits(144);
+            CorrectedBinaryMessage m0 = msg(w);
+            long r = crc(new Object[]{m0, 0, 7, 9, 0x59L, 0L});
+            Method up = CRCP25.class.getDeclaredMethod("updateCRC", long.class, BinaryMessage.class, int.class, int.class, int.class, long.class);
+            up.setAccessible(true);
+            r = (Long) up.invoke(null, r, m0, 16, 144, 9, 0x59L);
+            StringBuilder f = new StringBuilder(w.substring(0, 7)); put(f, r ^ 0x1FFL, 9); f.append(w.substring(16));
+            String v = i % 2 == 0 ? f.toString() : flips(f.toString(), 1);
+            emit("CRC9", v, CRCP25.checkCRC9(msg(v), 0).name(), "");
+        }
+        // CRC-32.
+        for (int i = 0; i < 100; i++) {
+            String data = randBits(96);
+            long c = crc(new Object[]{msg(data + "0".repeat(32)), 0, 96, 32, 0x04C11DB7L, 0xFFFFFFFFL});
+            StringBuilder f = new StringBuilder(data); put(f, c, 32);
+            String v = i % 2 == 0 ? f.toString() : flips(f.toString(), 1);
+            emit("CRC32", v, CRCP25.checkCRC32(msg(v), 0, 96).name(), "");
+        }
+        // Table CRCs: valid frames built from the Java tables via reflection, plus corrupted.
+        String[][] tcs = {{"CRC_12_FACCH", "144", "4095", "12", "F"}, {"CRC_12_SACCH", "168", "4095", "12", "S"}, {"CRC_16_LCCH", "164", "65535", "16", "L"}};
+        for (String[] tc : tcs) {
+            Field fld = CRCP25.class.getDeclaredField(tc[0]); fld.setAccessible(true);
+            int[] table = (int[]) fld.get(null);
+            int data = Integer.parseInt(tc[1]), init = Integer.parseInt(tc[2]), w = Integer.parseInt(tc[3]);
+            for (int i = 0; i < 100; i++) {
+                String d = randBits(data); int c = init;
+                for (int b = 0; b < data; b++) if (d.charAt(b) == '1') c ^= table[b];
+                StringBuilder f = new StringBuilder(d); put(f, c, w);
+                String v = i % 2 == 0 ? f.toString() : flips(f.toString(), 1);
+                CorrectedBinaryMessage m = msg(v);
+                boolean ok = tc[4].equals("F") ? CRCP25.crc12Facch(m) : tc[4].equals("S") ? CRCP25.crc12Sacch(m) : CRCP25.crc16Lcch(m);
+                emit(tc[0], v, ok ? 1 : 0, "");
+            }
+        }
+        out.close();
+    }
+}

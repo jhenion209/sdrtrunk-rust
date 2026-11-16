@@ -1,0 +1,50 @@
+import io.github.dsheirer.dsp.filter.FilterFactory;
+import io.github.dsheirer.dsp.filter.fir.FIRFilterSpecification;
+import io.github.dsheirer.dsp.filter.fir.real.RealFIRFilter;
+import io.github.dsheirer.dsp.psk.demod.DifferentialDemodulatorFloatScalar;
+import java.io.*;
+import java.util.*;
+
+public class GenDsp {
+    static Random rnd = new Random(77L);
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+    static float[] noise(int n) { float[] a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float) (rnd.nextGaussian() * 0.5); return a; }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+        // RRC taps: (samplesPerSymbol, symbols, alpha)
+        double[][] rrc = {{25000.0 / 4800, 16, 0.2}, {38400.0 / 4800, 16, 0.2}, {19200.0 / 4800, 16, 0.2}, {50000.0 / 4800, 16, 0.2}, {8, 10, 0.35}};
+        for (double[] p : rrc) {
+            float[] t = FilterFactory.getRootRaisedCosine(p[0], (int) p[1], (float) p[2]);
+            out.println("RRC|" + p[0] + "," + (int) p[1] + "," + (float) p[2] + "|" + hex(t));
+        }
+        // Streaming FIR with varying block sizes.
+        float[] taps = FilterFactory.getRootRaisedCosine(25000.0 / 4800, 16, 0.2f);
+        RealFIRFilter fir = new RealFIRFilter(taps.clone());
+        for (int blk : new int[]{64, 64, 100, 37, 64, 256}) {
+            float[] in = noise(blk);
+            out.println("FIR|" + hex(taps) + ";" + hex(in) + "|" + hex(fir.filter(in)));
+        }
+        // Differential demodulator, 25 kHz and 38.4 kHz, streaming blocks.
+        for (double sr : new double[]{25000, 38400, 19200}) {
+            DifferentialDemodulatorFloatScalar d = new DifferentialDemodulatorFloatScalar(sr, 4800);
+            for (int blk : new int[]{50, 50, 80, 31, 200}) {
+                float[] i = noise(blk), q = noise(blk);
+                out.println("DEMOD|" + sr + ";" + hex(i) + ";" + hex(q) + "|" + hex(d.demodulate(i, q)));
+            }
+        }
+        // Baseband low-pass design (Remez) used by the C4FM decoder, per decimated sample rate.
+        for (double sr : new double[]{25000, 38400, 19200, 24000, 48000}) {
+            FIRFilterSpecification spec = FIRFilterSpecification.lowPassBuilder().sampleRate(sr)
+                .passBandCutoff(5200).passBandAmplitude(1.0).passBandRipple(0.01)
+                .stopBandAmplitude(0.0).stopBandStart(6500).stopBandRipple(0.01).build();
+            float[] t = FilterFactory.getTaps(spec);
+            out.println("BASEBAND|" + sr + "|" + hex(t));
+        }
+        out.close();
+    }
+}

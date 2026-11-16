@@ -1,0 +1,16 @@
+[Unit]
+Description=SDRTrunk-Rust P25 receiver and web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sdrtrunk-rust serve
+User=jordan
+SupplementaryGroups=plugdev
+# Creates /var/lib/sdrtrunk-rust owned by the service user; the database lives there.
+StateDirectory=sdrtrunk-rust
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

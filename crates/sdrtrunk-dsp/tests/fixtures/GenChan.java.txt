@@ -1,0 +1,151 @@
+package io.github.dsheirer.dsp.filter.channelizer;
+
+import io.github.dsheirer.dsp.filter.FilterFactory;
+import io.github.dsheirer.dsp.filter.channelizer.output.OneChannelOutputProcessor;
+import io.github.dsheirer.sample.complex.ComplexSamples;
+import io.github.dsheirer.sample.complex.InterleavedComplexSamples;
+import java.io.*;
+import java.lang.reflect.Field;
+import java.util.*;
+import org.jtransforms.fft.FloatFFT_1D;
+
+/**
+ * Generates channelizer vectors for the Rust port. Lives in the channelizer package for access to package-private
+ * members. Usage: java --add-modules jdk.incubator.vector io.github.dsheirer.dsp.filter.channelizer.GenChan out.txt
+ *
+ * Lines:
+ *   TAPS|channels,tapsPerChannel|hex                       designed prototype filter (bandwidth 25 kHz)
+ *   CHAN|channels,hops|taps hex|input hex|results hex      filter bank output after the scaled IFFT, all hops
+ *   EXTRACT|rate,index,gain|offsetPlan|input|buffers...    OneChannelOutputProcessor with mixer and gain
+ */
+public class GenChan {
+    static Random rnd = new Random(2024L);
+
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+
+    static float[] noise(int n) {
+        float[] a = new float[n];
+        for (int i = 0; i < n; i++) a[i] = (float) (rnd.nextGaussian() * 0.5);
+        return a;
+    }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+
+        for (int channels : new int[]{8, 16, 400}) {
+            float[] taps = FilterFactory.getSincM2Channelizer(25000.0, channels, 9, false);
+            out.println("TAPS|" + channels + ",9|" + hex(taps));
+        }
+
+        int[][] configs = {{8, 200}, {16, 90}, {400, 40}};
+        for (int[] cfg : configs) {
+            int channels = cfg[0], hops = cfg[1];
+            float[] taps = FilterFactory.getSincM2Channelizer(25000.0, channels, 9, false);
+            ComplexPolyphaseChannelizerM2 c = new ComplexPolyphaseChannelizerM2(taps, 25000 * channels, channels);
+            float[] input = noise(hops * channels);
+
+            // Feed in uneven (even-length) blocks so partial-hop buffering is exercised.
+            int pos = 0, step = 0;
+            int[] sizes = {channels + 2, 3 * channels / 2, 2, channels * 5 - 2, channels, 6};
+            while (pos < input.length) {
+                int n = Math.min(sizes[step++ % sizes.length], input.length - pos);
+                c.receive(new InterleavedComplexSamples(Arrays.copyOfRange(input, pos, pos + n), 0L));
+                pos += n;
+            }
+
+            Field f = ComplexPolyphaseChannelizerM2.class.getDeclaredField("mProcessedChannelResultsBuffer");
+            f.setAccessible(true);
+            ComplexPolyphaseChannelizerM2.ChannelResultsBuffer buffer = (ComplexPolyphaseChannelizerM2.ChannelResultsBuffer) f.get(c);
+            FloatFFT_1D fft = new FloatFFT_1D(channels);
+            StringBuilder results = new StringBuilder();
+            for (int i = 0; i < buffer.size(); i++) {
+                float[] r = buffer.get(i).clone();
+                fft.complexInverse(r, true);
+                results.append(i > 0 ? "," : "").append(hex(r));
+            }
+            out.println("CHAN|" + channels + "," + buffer.size() + "|" + hex(taps) + "|" + hex(input) + "|" + results);
+        }
+
+        // Single channel extraction: mixer, gain and 2048-sample assembly.
+        int channels = 8, index = 3, total1 = 4500, total2 = 2000;
+        List<ComplexSamples> emitted = new ArrayList<>();
+        OneChannelOutputProcessor p = new OneChannelOutputProcessor(50000.0, List.of(index), channels, null, "gen");
+        p.setListener(emitted::add);
+        StringBuilder inPairs = new StringBuilder();
+        p.setFrequencyOffset(-7345L);
+        for (int batch = 0; batch < 2; batch++) {
+            int count = batch == 0 ? total1 : total2;
+            ComplexPolyphaseChannelizerM2.ChannelResultsBuffer rb =
+                new ComplexPolyphaseChannelizerM2.ChannelResultsBuffer(count, 2 * channels, b -> {});
+            for (int i = 0; i < count; i++) {
+                float[] r = rb.nextResult();
+                float[] n = noise(2 * channels);
+                System.arraycopy(n, 0, r, 0, r.length);
+                inPairs.append(inPairs.length() > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(r[2 * index])))
+                    .append(",").append(Integer.toHexString(Float.floatToRawIntBits(r[2 * index + 1])));
+            }
+            p.process(rb);
+            if (batch == 0) p.setFrequencyOffset(1234L);
+        }
+        StringBuilder bufs = new StringBuilder();
+        for (ComplexSamples s : emitted) bufs.append("|").append(hex(s.i())).append(";").append(hex(s.q()));
+        out.println("EXTRACT|50000.0," + index + "," + channels + "|-7345@0,1234@" + total1 + "|" + inPairs + bufs);
+
+        // Synthesis filter and two-channel extraction (bins 3 and 4).
+        float[] syn = FilterFactory.getSincM2Synthesizer(50000.0, 25000.0, 2, 9);
+        out.println("SYN|50000.0,25000.0,2,9|" + hex(syn));
+        List<ComplexSamples> emitted2 = new ArrayList<>();
+        io.github.dsheirer.dsp.filter.channelizer.output.TwoChannelOutputProcessor p2 =
+            new io.github.dsheirer.dsp.filter.channelizer.output.TwoChannelOutputProcessor(50000.0, List.of(3, 4), syn, channels, null, "gen2");
+        p2.setListener(emitted2::add);
+        StringBuilder in2 = new StringBuilder();
+        p2.setFrequencyOffset(-7345L);
+        for (int batch = 0; batch < 2; batch++) {
+            int count = batch == 0 ? total1 : total2;
+            ComplexPolyphaseChannelizerM2.ChannelResultsBuffer rb =
+                new ComplexPolyphaseChannelizerM2.ChannelResultsBuffer(count, 2 * channels, b -> {});
+            for (int i = 0; i < count; i++) {
+                float[] r = rb.nextResult();
+                float[] n = noise(2 * channels);
+                System.arraycopy(n, 0, r, 0, r.length);
+                for (int k = 6; k < 10; k++) in2.append(in2.length() > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(r[k])));
+            }
+            p2.process(rb);
+            if (batch == 0) p2.setFrequencyOffset(1234L);
+        }
+        StringBuilder bufs2 = new StringBuilder();
+        for (ComplexSamples s : emitted2) bufs2.append("|").append(hex(s.i())).append(";").append(hex(s.q()));
+        out.println("EXTRACT2|50000.0,3,4," + channels + "|-7345@0,1234@" + total1 + "|" + in2 + bufs2);
+
+        // Channel calculator: indexes and bin-center frequency for frequencies on, near and across bin edges.
+        double[][] calcs = {{10000000.0, 400, 853000000.0}, {2500000.0, 100, 852500000.0}, {2000000.0, 80, 770000000.0}};
+        for (double[] cc : calcs) {
+            ChannelCalculator calc = new ChannelCalculator(cc[0], (int) cc[1], cc[2], 2.0);
+            double spacing = cc[0] / cc[1];
+            int span = (int) (cc[1] / 2);
+            for (int k = -span - 1; k <= span + 1; k += 3) {
+                for (double halfBins : new double[]{0.0, 0.5}) {
+                    for (long off : new long[]{-12500, -6250, -1, 0, 1, 6250, 12500}) {
+                        for (int bw : new int[]{12500, 25000, 7500, 6250}) {
+                            long freq = (long) (cc[2] + (k + halfBins) * spacing) + off;
+                            StringBuilder line = new StringBuilder("CALC|" + cc[0] + "," + (int) cc[1] + "," + cc[2] + "|" + freq + "," + bw + "|");
+                            try {
+                                List<Integer> idx = calc.getChannelIndexes(new io.github.dsheirer.source.tuner.channel.TunerChannel(freq, bw));
+                                for (int i = 0; i < idx.size(); i++) line.append(i > 0 ? " " : "").append(idx.get(i));
+                                line.append("|").append(calc.getCenterFrequencyForIndexes(idx));
+                            } catch (IllegalArgumentException e) {
+                                line.append("ERR");
+                            }
+                            out.println(line);
+                        }
+                    }
+                }
+            }
+        }
+        out.close();
+    }
+}

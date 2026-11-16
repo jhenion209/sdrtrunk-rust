@@ -1,0 +1,10 @@
+/target/
+.DS_Store
+
+# Local working notes and tool state (not part of the project)
+/PORT-PLAN.md
+/docs/
+/.superpowers/
+/.impeccable/
+/.remember/
+/.claude-flow/

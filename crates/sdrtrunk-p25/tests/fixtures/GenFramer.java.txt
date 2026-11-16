@@ -1,0 +1,122 @@
+package io.github.dsheirer.module.decode.p25.phase1;
+
+import io.github.dsheirer.dsp.symbol.Dibit;
+import io.github.dsheirer.message.DroppedSamplesMessage;
+import io.github.dsheirer.message.IMessage;
+import io.github.dsheirer.message.SyncLossMessage;
+import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.decode.FeedbackDecoder;
+import io.github.dsheirer.module.decode.p25.phase1.message.P25P1Message;
+import io.github.dsheirer.module.decode.p25.phase1.message.tsbk.TSBKMessage;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+/**
+ * Runs the real P25P1DemodulatorC4FM and the real P25P1MessageFramer over synthetic dibit streams (from the Rust
+ * stream generator, fixtures/p25_streams.txt) and records every message the framer broadcasts.
+ * Usage: java ...GenFramer p25_streams.txt out.txt
+ *
+ * Output line: FRAMER|stream|mode|events   events separated by ';' (see record())
+ */
+public class GenFramer {
+    static final float SPS = 25000f / 4800f;
+    static final long REFERENCE_TIME = 1_000_000L;
+
+    static FeedbackDecoder stubDecoder() {
+        return new FeedbackDecoder() {
+            @Override public String getProtocolDescription() { return "stub"; }
+            @Override public DecoderType getDecoderType() { return DecoderType.P25_PHASE1; }
+            @Override public void reset() { }
+            @Override public void start() { }
+            @Override public void stop() { }
+            @Override public void dispose() { }
+            @Override public void setMessageListener(io.github.dsheirer.sample.Listener<IMessage> l) { }
+            @Override public void removeMessageListener() { }
+        };
+    }
+
+    static String bits(io.github.dsheirer.bits.BinaryMessage m) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < m.size(); i++) sb.append(m.get(i) ? '1' : '0');
+        return sb.toString();
+    }
+
+    static String record(IMessage m) {
+        if (m instanceof TSBKMessage t) {
+            return "T," + t.getDUID().name() + "," + ((io.github.dsheirer.module.decode.p25.identifier.APCO25Nac) t.getNAC()).getValue()
+                + "," + t.getTimestamp() + "," + (t.isValid() ? 1 : 0) + "," + (t.isLastBlock() ? 1 : 0) + ","
+                + t.getMessage().getCorrectedBitCount() + "," + bits(t.getMessage());
+        }
+        if (m instanceof P25P1Message p) {
+            return "U," + p.getDUID().name() + "," + ((io.github.dsheirer.module.decode.p25.identifier.APCO25Nac) p.getNAC()).getValue()
+                + "," + p.getTimestamp() + "," + p.getMessage().getCorrectedBitCount() + "," + bits(p.getMessage());
+        }
+        if (m instanceof SyncLossMessage s) return "L," + s.getTimestamp() + "," + s.getBitsProcessed();
+        if (m instanceof DroppedSamplesMessage d) return "D," + d.getTimestamp() + "," + d.getBitsDropped();
+        return "?," + m.getClass().getSimpleName();
+    }
+
+    static float[] render(int[] symbols, Random r, double gain, double pll, double noise, double start) {
+        double sps = 25000.0 / 4800.0;
+        int n = (int) ((symbols.length - 2 - start) * sps);
+        float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            double x = i / sps + start;
+            int k = (int) Math.floor(x);
+            double f = x - k, w = (1 - Math.cos(Math.PI * f)) / 2;
+            double p0 = Dibit.fromValue(symbols[k]).getIdealPhase(), p1 = Dibit.fromValue(symbols[k + 1]).getIdealPhase();
+            out[i] = (float) ((p0 * (1 - w) + p1 * w) * gain + pll + r.nextGaussian() * noise);
+        }
+        return out;
+    }
+
+    static void run(PrintWriter out, String name, String mode, float[] samples) {
+        P25P1MessageFramer framer = new P25P1MessageFramer();
+        List<String> events = new ArrayList<>();
+        framer.setListener(m -> events.add(record(m)));
+        if (mode.startsWith("expected:")) framer.setExpectedNAC(Integer.parseInt(mode.substring(9), 16));
+        if (mode.equals("strict")) framer.setRequireValidNID(true);
+        framer.setTimestamp(REFERENCE_TIME);
+        framer.start();
+        P25P1DemodulatorC4FM demod = new P25P1DemodulatorC4FM(framer, stubDecoder());
+        demod.setSamplesPerSymbol(SPS);
+        if (mode.startsWith("expected:")) demod.setExpectedNAC(Integer.parseInt(mode.substring(9), 16));
+        if (mode.equals("strict")) demod.setRequireValidNID(true);
+        int[] sizes = {1000, 513, 2048, 77, 300, 1024, 999};
+        int pos = 0, step = 0;
+        while (pos < samples.length) {
+            int n = Math.min(sizes[step++ % sizes.length], samples.length - pos);
+            demod.process(Arrays.copyOfRange(samples, pos, pos + n));
+            pos += n;
+        }
+        out.println("FRAMER|" + name + "|" + mode + "|" + String.join(";", events));
+    }
+
+    static void signal(PrintWriter out, String id, float[] samples) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < samples.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(samples[i])));
+        out.println("SIGNAL|" + id + "|" + sb);
+    }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[1]));
+        long seed = 100;
+        for (String line : Files.readAllLines(Paths.get(args[0]))) {
+            String[] f = line.split("\\|");
+            int[] symbols = new int[f[2].length()];
+            for (int i = 0; i < symbols.length; i++) symbols[i] = f[2].charAt(i) - '0';
+            float[] clean = render(symbols, new Random(seed++), 0.83, 0.07, 0.03, 0.3);
+            signal(out, f[1] + "-clean", clean);
+            run(out, f[1] + "-clean", "plain", clean);
+            run(out, f[1] + "-clean", "strict", clean);
+            run(out, f[1] + "-clean", "expected:293", clean);
+            run(out, f[1] + "-clean", "expected:1F1", clean);
+            float[] noisy = render(symbols, new Random(seed++), 0.9, 0.2, 0.09, 0.71);
+            signal(out, f[1] + "-noisy", noisy);
+            run(out, f[1] + "-noisy", "plain", noisy);
+            run(out, f[1] + "-noisy", "strict", noisy);
+        }
+        out.close();
+    }
+}

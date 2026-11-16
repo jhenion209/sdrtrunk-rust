@@ -1,0 +1,155 @@
+package io.github.dsheirer.module.decode.p25.phase1;
+
+import io.github.dsheirer.dsp.symbol.Dibit;
+import io.github.dsheirer.module.decode.FeedbackDecoder;
+import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.decode.p25.phase1.sync.P25P1SyncDetector;
+import java.io.*;
+import java.util.*;
+
+/**
+ * Drives the real P25P1DemodulatorC4FM with synthetic demodulated-phase signals and records every symbol decision.
+ * The message framer is replaced by a small deterministic stub (assembles for ASSEMBLE symbols after each sync) so
+ * that fine and coarse sync modes both occur. Usage: java ...GenDemod out.txt
+ *
+ * Line: DEMOD|mode|blockSizes|samples hex|events
+ *   mode   plain | expected:<nac> | strict
+ *   events p,<soft hex>,<dibit value> per symbol and s for each sync notification, separated by ';'
+ */
+public class GenDemod {
+    static final int ASSEMBLE = 130;
+    static final float SPS = 25000f / 4800f;
+    // NID codewords built by the Rust BCH encoder (vce-p25 tests/nid_codewords.rs): {nac, duid, 64-bit word}
+    static final long NID_293_LDU1 = 0x293555EF2C653437L;
+    static final long NID_293_TSBK = 0x2937F88514ABAECCL;
+    static final long NID_293_TDU = 0x29333977728CED6EL;
+    static final long NID_1F1_LDU2 = 0x1F1AE9CA5FC99445L;
+
+    static class StubFramer extends P25P1MessageFramer {
+        boolean assembling = false, complete = false;
+        int remaining = 0;
+        final StringBuilder log = new StringBuilder();
+
+        @Override public boolean process(float soft, Dibit d) {
+            log.append("p,").append(Integer.toHexString(Float.floatToRawIntBits(soft))).append(",").append(d.getValue()).append(";");
+            if (assembling && --remaining <= 0) { assembling = false; complete = true; }
+            return false;
+        }
+        @Override public void syncDetected() { log.append("s;"); assembling = true; complete = false; remaining = ASSEMBLE; }
+        @Override public boolean isComplete() { return complete; }
+        @Override public boolean isAssembling() { return assembling; }
+    }
+
+    static FeedbackDecoder stubDecoder() {
+        return new FeedbackDecoder() {
+            @Override public String getProtocolDescription() { return "stub"; }
+            @Override public DecoderType getDecoderType() { return DecoderType.P25_PHASE1; }
+            @Override public void reset() { }
+            @Override public void start() { }
+            @Override public void stop() { }
+            @Override public void dispose() { }
+            @Override public void setMessageListener(io.github.dsheirer.sample.Listener<io.github.dsheirer.message.IMessage> l) { }
+            @Override public void removeMessageListener() { }
+        };
+    }
+
+    static String hex(float[] a) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < a.length; i++) sb.append(i > 0 ? "," : "").append(Integer.toHexString(Float.floatToRawIntBits(a[i])));
+        return sb.toString();
+    }
+
+    static void idle(List<Integer> s, Random r, int n) { for (int i = 0; i < n; i++) s.add(r.nextInt(4)); }
+
+    /** sync + NID (status symbol after NID dibit 10) + payload. flips = NID bit positions to invert. */
+    static void frame(List<Integer> s, Random r, long nid, int[] flips, int payload) {
+        for (Dibit d : P25P1SyncDetector.syncPatternToDibits()) s.add(d.getValue());
+        long word = nid;
+        for (int f : flips) word ^= 1L << (63 - f);
+        for (int k = 0; k < 32; k++) {
+            if (k == 11) s.add(r.nextInt(4)); // status symbol
+            s.add((int) ((word >>> (62 - 2 * k)) & 3));
+        }
+        idle(s, r, payload);
+    }
+
+    static float[] render(List<Integer> symbols, Random r, double gain, double pll, double noise, double start) {
+        double sps = 25000.0 / 4800.0;
+        int n = (int) ((symbols.size() - 2 - start) * sps);
+        float[] out = new float[n];
+        for (int i = 0; i < n; i++) {
+            double x = i / sps + start;
+            int k = (int) Math.floor(x);
+            double f = x - k, w = (1 - Math.cos(Math.PI * f)) / 2;
+            double p0 = Dibit.fromValue(symbols.get(k)).getIdealPhase(), p1 = Dibit.fromValue(symbols.get(k + 1)).getIdealPhase();
+            out[i] = (float) ((p0 * (1 - w) + p1 * w) * gain + pll + r.nextGaussian() * noise);
+        }
+        return out;
+    }
+
+    static void run(PrintWriter out, String mode, float[] samples) {
+        StubFramer framer = new StubFramer();
+        P25P1DemodulatorC4FM demod = new P25P1DemodulatorC4FM(framer, stubDecoder());
+        demod.setSamplesPerSymbol(SPS);
+        if (mode.startsWith("expected:")) demod.setExpectedNAC(Integer.parseInt(mode.substring(9), 16));
+        if (mode.equals("strict")) demod.setRequireValidNID(true);
+        int[] sizes = {1000, 513, 2048, 77, 300, 1024, 999};
+        StringBuilder sizeList = new StringBuilder();
+        int pos = 0, step = 0;
+        while (pos < samples.length) {
+            int n = Math.min(sizes[step++ % sizes.length], samples.length - pos);
+            demod.process(Arrays.copyOfRange(samples, pos, pos + n));
+            sizeList.append(sizeList.length() > 0 ? "," : "").append(n);
+            pos += n;
+        }
+        out.println("DEMOD|" + mode + "|" + sizeList + "|" + hex(samples) + "|" + framer.log);
+    }
+
+    public static void main(String[] args) throws Exception {
+        PrintWriter out = new PrintWriter(new FileWriter(args[0]));
+
+        // Run 1: several frames, clean and with NID bit errors, moderate gain/PLL error.
+        Random r = new Random(11L);
+        List<Integer> s = new ArrayList<>();
+        idle(s, r, 150);
+        frame(s, r, NID_293_LDU1, new int[]{}, 120);
+        idle(s, r, 60);
+        frame(s, r, NID_293_LDU1, new int[]{5, 22}, 120);
+        idle(s, r, 45);
+        frame(s, r, NID_293_TSBK, new int[]{9, 30, 50}, 100);
+        idle(s, r, 80);
+        frame(s, r, NID_293_LDU1, new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}, 120); // tracked-NAC rescue
+        idle(s, r, 40);
+        frame(s, r, NID_293_TDU, new int[]{}, 20);
+        idle(s, r, 200);
+        float[] sig1 = render(s, r, 0.83, 0.07, 0.03, 0.3);
+        run(out, "plain", sig1);
+
+        // Run 2: larger PLL and gain error, more noise, different frame mix.
+        r = new Random(12L);
+        s = new ArrayList<>();
+        idle(s, r, 90);
+        frame(s, r, NID_1F1_LDU2, new int[]{}, 130);
+        idle(s, r, 100);
+        frame(s, r, NID_1F1_LDU2, new int[]{7}, 130);
+        idle(s, r, 33);
+        frame(s, r, NID_293_LDU1, new int[]{}, 130);
+        idle(s, r, 150);
+        float[] sig2 = render(s, r, 0.9, 0.35, 0.08, 0.77);
+        run(out, "plain", sig2);
+
+        // Run 3: noise only, nothing should lock.
+        r = new Random(13L);
+        s = new ArrayList<>();
+        idle(s, r, 600);
+        float[] sig3 = render(s, r, 0.8, 0.0, 0.25, 0.0);
+        run(out, "plain", sig3);
+
+        // Runs 4 and 5: the run 1 signal with a pinned expected NAC (matching) and a wrong one, and strict NID mode.
+        run(out, "expected:293", sig1);
+        run(out, "expected:1F1", sig1);
+        run(out, "strict", sig1);
+        run(out, "strict", sig2);
+        out.close();
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "sdrtrunk-source"
+description = "Tuner frequency control and drivers (port of sdrtrunk source package)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

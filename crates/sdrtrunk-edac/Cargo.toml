@@ -1,0 +1,6 @@
+[package]
+name = "sdrtrunk-edac"
+description = "Error detection/correction codes for P25 (port of sdrtrunk edac package)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
