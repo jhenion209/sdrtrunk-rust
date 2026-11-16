@@ -147,11 +147,25 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, secure_cookies: bool, s
     let (db, receivers) = (state.db.clone(), state.receivers.clone());
     tokio::spawn(async move {
         let mut minute = tokio::time::interval(std::time::Duration::from_secs(60));
+        // A late tick (slow database or scan) waits a whole period again instead of firing a burst to catch up.
+        minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         minute.tick().await;
         loop {
             minute.tick().await;
             let (db, receivers) = (db.clone(), receivers.clone());
             let _ = tokio::task::spawn_blocking(move || receivers.record_minute(&db, now_ms())).await;
+        }
+    });
+    // Every 5 s: notice SDRs plugged in or removed.
+    let (db, receivers) = (state.db.clone(), state.receivers.clone());
+    tokio::spawn(async move {
+        let mut scan = tokio::time::interval(std::time::Duration::from_millis(crate::receiver::Receivers::SCAN_MS));
+        scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        scan.tick().await;
+        loop {
+            scan.tick().await;
+            let (db, receivers) = (db.clone(), receivers.clone());
+            let _ = tokio::task::spawn_blocking(move || receivers.rescan(&db)).await;
         }
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;

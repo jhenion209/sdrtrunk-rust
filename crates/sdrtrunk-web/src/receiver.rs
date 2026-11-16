@@ -12,10 +12,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use crate::quality::{Bucket, Window};
-use sdrtrunk_p25::control::{ControlChannel, ControlEvent, FrameCounts, Modulation};
+use sdrtrunk_p25::control::{ControlChannel, ControlEvent, FrameCounts, Modulation, VoiceBank};
 use sdrtrunk_p25::correction::{Correction, TICK_MS};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -43,6 +43,10 @@ pub struct Status {
     /// MP3 files written since the decoder started, and the last recording problem.
     pub recorded: u64,
     pub recording_error: Option<String>,
+    /// Helper tuners following calls the main window cannot cover: (tuner id, centre Hz).
+    pub helpers: Vec<(String, u64)>,
+    /// (sample rate, usable width in Hz) of each of `helpers`, in the same order: what the Tuners page shows as the window.
+    pub helper_bands: Vec<(u32, u32)>,
 }
 
 /// A grant, with the System name it came from and the alias list its talkgroup names come from.
@@ -84,9 +88,10 @@ const CHANNEL_FFT: usize = 1024;
 pub const CHANNEL_WIDTH: usize = 512;
 
 /// Interleaved int16 IQ blocks. Created on the decoder thread, so it need not be `Send`.
-/// `next_block` returns an empty block when nothing arrived yet (lets the thread notice a stop) and None at the end.
+/// `next_block` waits up to `wait` (zero never blocks); it returns an empty block when nothing arrived in that time
+/// (lets the thread notice a stop) and None at the end.
 pub trait IqSource {
-    fn next_block(&mut self) -> Option<Vec<i16>>;
+    fn next_block(&mut self, wait: Duration) -> Option<Vec<i16>>;
     fn tune(&mut self, center_hz: u32) -> Result<(), String>;
     fn dropped(&self) -> u64;
     /// Samples per second this source delivers (an RTL-SDR always runs at its own rate).
@@ -103,7 +108,7 @@ pub struct Sdrs { pub list: Arc<dyn Fn() -> Vec<String> + Send + Sync>, pub open
 /// The Airspys and RTL-SDRs on this host.
 #[cfg(target_os = "linux")]
 pub fn sdrs() -> Sdrs {
-    use std::sync::mpsc::{Receiver as Rx, RecvTimeoutError};
+    use std::sync::mpsc::{Receiver as Rx, RecvTimeoutError, TryRecvError};
     use std::sync::atomic::AtomicU64;
     use sdrtrunk_source::{airspy::Airspy, rtlsdr::{self, RtlSdr}};
     enum Dev { Airspy(Airspy, u32), Rtl(RtlSdr) }
@@ -114,12 +119,14 @@ pub fn sdrs() -> Sdrs {
         }
     }
     impl IqSource for Live {
-        fn next_block(&mut self) -> Option<Vec<i16>> {
-            match self.parts().0.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(b) => Some(b),
-                Err(RecvTimeoutError::Timeout) => Some(Vec::new()),
-                Err(RecvTimeoutError::Disconnected) => None,
-            }
+        fn next_block(&mut self, wait: Duration) -> Option<Vec<i16>> {
+            let rx = self.parts().0;
+            let got = if wait.is_zero() {
+                rx.try_recv().map_err(|e| match e { TryRecvError::Empty => RecvTimeoutError::Timeout, TryRecvError::Disconnected => RecvTimeoutError::Disconnected })
+            } else {
+                rx.recv_timeout(wait)
+            };
+            block_or_end(got, || match &self.0 { Dev::Airspy(a, _) => a.is_streaming(), Dev::Rtl(_) => true })
         }
         fn tune(&mut self, center_hz: u32) -> Result<(), String> {
             match &self.0 { Dev::Airspy(a, _) => a.set_frequency(center_hz).map_err(|e| e.to_string()), Dev::Rtl(r) => r.set_frequency(center_hz) }
@@ -139,6 +146,19 @@ pub fn sdrs() -> Sdrs {
             };
             Ok(Box::new(Live(dev)) as Box<dyn IqSource>)
         }),
+    }
+}
+
+/// What `next_block` gives for one receive: the block; an empty one when none came in time but the device still
+/// streams; None when the reader ended or the device stopped streaming (an unplugged Airspy keeps its channel open, so
+/// only `streaming` shows it; an RTL-SDR's reader ends).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn block_or_end(got: Result<Vec<i16>, std::sync::mpsc::RecvTimeoutError>, streaming: impl FnOnce() -> bool) -> Option<Vec<i16>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    match got {
+        Ok(b) => Some(b),
+        Err(RecvTimeoutError::Timeout) => streaming().then(Vec::new),
+        Err(RecvTimeoutError::Disconnected) => None,
     }
 }
 
@@ -194,8 +214,12 @@ pub struct Receiver {
     pub quality: Arc<Mutex<Window>>,
     /// Voice frequencies the system's grants used (from the database at start, plus new ones): where the tuner sits.
     pub known: Arc<Mutex<BTreeSet<u64>>>,
+    /// The spectrum display of each helper tuner now open (tuner id, view), for `Receivers::tuner_view`.
+    helper_views: HelperViews,
     run: Run,
 }
+
+type HelperViews = Arc<Mutex<Vec<(String, Arc<Mutex<SpectrumView>>)>>>;
 
 /// What the decoder thread shares with the rest of the program.
 #[derive(Clone)]
@@ -206,12 +230,13 @@ struct Shared {
     spectrum: Arc<Mutex<SpectrumView>>,
     quality: Arc<Mutex<Window>>,
     known: Arc<Mutex<BTreeSet<u64>>>,
+    helper_views: HelperViews,
     streams: Arc<Streams>,
 }
 
 impl Receiver {
     #[allow(clippy::too_many_arguments)]
-    fn start(system: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, TunerConfig)>, sdrs: Sdrs, claimed: Claimed,
+    fn start(system: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed,
              calls: broadcast::Sender<CallEvent>, policy: RecordPolicy, known: Vec<u64>, streams: Arc<Streams>) -> Receiver {
         let shared = Shared {
             status: Arc::new(Mutex::new(Status {
@@ -222,14 +247,15 @@ impl Receiver {
             spectrum: Arc::default(),
             quality: Arc::default(),
             known: Arc::new(Mutex::new(known.into_iter().collect())),
+            helper_views: Arc::default(),
             streams,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let (s, sh, flag) = (system.clone(), shared.clone(), stop.clone());
         let handle = std::thread::Builder::new().name(format!("decoder-{}", system.id))
-            .spawn(move || decode(s, dir, reserved, tuners, sdrs, claimed, flag, sh)).expect("spawn decoder");
-        let Shared { status, policy, spectrum, quality, known, .. } = shared;
-        Receiver { system, status, policy, spectrum, quality, known, run: Mutex::new(Some((stop, handle))) }
+            .spawn(move || decode(s, dir, pool, sdrs, claimed, flag, sh)).expect("spawn decoder");
+        let Shared { status, policy, spectrum, quality, known, helper_views, .. } = shared;
+        Receiver { system, status, policy, spectrum, quality, known, helper_views, run: Mutex::new(Some((stop, handle))) }
     }
 
     /// Stops and joins the decoder thread; its tuner is closed and free again when this returns.
@@ -259,10 +285,32 @@ impl SetupRun {
 
 impl Drop for SetupRun { fn drop(&mut self) { self.stop(); } }
 
+/// What decoders read when they look for a helper, kept current by `Receivers`: the SDRs the last scan saw, the
+/// tuner settings as saved and the tuners pinned by enabled systems (system id, tuner id).
+#[derive(Default)]
+struct Pool { seen: Vec<String>, tuners: Vec<(String, TunerConfig)>, pins: Vec<(i64, String)> }
+
+type SharedPool = Arc<Mutex<Pool>>;
+
+impl Pool {
+    fn config(&self, id: &str) -> TunerConfig { self.tuners.iter().find(|(t, _)| t == id).map(|(_, c)| c.clone()).unwrap_or_default() }
+
+    /// Tuners pinned to enabled systems other than `me`.
+    fn reserved(&self, me: i64) -> Vec<String> { self.pins.iter().filter(|(s, _)| *s != me).map(|(_, t)| t.clone()).collect() }
+
+    /// Tuners system `me` may take as helpers now (no USB work: the list is the last scan's).
+    fn free(&self, claimed: &Claimed, me: i64) -> Vec<String> {
+        free_tuners(self.seen.clone(), &|t| self.config(t), &claimed.lock().unwrap_or_else(|p| p.into_inner()), &self.reserved(me))
+    }
+}
+
 /// The running systems, by system id, and the tuners in Setup mode, by tuner id.
 pub struct Receivers {
     sdrs: Sdrs,
     claimed: Claimed,
+    pool: SharedPool,
+    /// Connected tuners nobody held at the last `rescan` (None before the first).
+    last_free: Mutex<Option<Vec<String>>>,
     /// Grants from every system.
     pub calls: broadcast::Sender<CallEvent>,
     running: Mutex<BTreeMap<i64, Arc<Receiver>>>,
@@ -281,16 +329,24 @@ fn policy_for(db: &Db, system: &str) -> RecordPolicy {
 
 impl Receivers {
     pub fn new(sdrs: Sdrs) -> Receivers {
+        let mut seen = (sdrs.list)();
+        seen.sort();
         Receivers {
-            sdrs, claimed: Arc::default(), calls: broadcast::channel(256).0, running: Mutex::new(BTreeMap::new()),
+            pool: Arc::new(Mutex::new(Pool { seen, ..Pool::default() })), last_free: Mutex::new(None), sdrs, claimed: Arc::default(), calls: broadcast::channel(256).0, running: Mutex::new(BTreeMap::new()),
             setups: Mutex::new(BTreeMap::new()), streams: Arc::new(Streams::new(std::time::Duration::from_secs(30))),
         }
     }
 
-    fn start(&self, db: &Db, all: &[System], s: &System) -> Arc<Receiver> {
-        let reserved = all.iter().filter(|o| o.enabled && o.id != s.id && !o.tuner.is_empty()).map(|o| o.tuner.clone()).collect();
-        Arc::new(Receiver::start(s.clone(), db.settings().recording_dir, reserved, db.tuners(), self.sdrs.clone(), self.claimed.clone(),
+    fn start(&self, db: &Db, s: &System) -> Arc<Receiver> {
+        Arc::new(Receiver::start(s.clone(), db.settings().recording_dir, self.pool.clone(), self.sdrs.clone(), self.claimed.clone(),
             self.calls.clone(), policy_for(db, s.list_name()), db.voice_freqs(s.id), self.streams.clone()))
+    }
+
+    /// Reloads the tuner settings and pins every decoder reads.
+    fn refresh(&self, db: &Db, all: &[System]) {
+        let mut p = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+        p.tuners = db.tuners();
+        p.pins = all.iter().filter(|s| s.enabled).filter_map(|s| sdrtrunk_source::normalize_tuner(&s.tuner).map(|t| (s.id, t))).collect();
     }
 
     /// Stops tuner `id`'s Setup run, and starts one if the tuner is (now) in Setup mode and connected.
@@ -310,36 +366,74 @@ impl Receivers {
         for (_, r) in std::mem::take(&mut *run) { r.stop(); }
         for (_, r) in std::mem::take(&mut *self.setups.lock().unwrap_or_else(|p| p.into_inner())) { r.stop(); }
         let all = db.systems();
-        for s in all.iter().filter(|s| s.enabled) { run.insert(s.id, self.start(db, &all, s)); }
+        self.refresh(db, &all);
+        for s in all.iter().filter(|s| s.enabled) { run.insert(s.id, self.start(db, s)); }
         drop(run);
         for (id, _) in db.tuners().into_iter().filter(|(_, c)| c.mode == TunerMode::Setup) { self.apply_setup(db, &id); }
     }
 
     /// After system `id` was saved or deleted: restarts it as stored (stops it if deleted or disabled), then
     /// retries systems that failed, since a tuner may have come free.
-    pub fn apply(&self, db: &Db, id: i64) {
-        let mut run = self.running.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(r) = run.remove(&id) { r.stop(); }
+    pub fn apply(&self, db: &Db, id: i64) { self.restart(db, &[id]); }
+
+    /// Restarts systems `ids` as stored (stops those deleted or disabled) together with every system that failed (a
+    /// tuner may have come free) and every system holding as a helper a tuner now pinned to another system (the pinned
+    /// system gets it). All of them stop before any starts, so freed tuners are free for the starts.
+    fn restart(&self, db: &Db, ids: &[i64]) {
         let all = db.systems();
-        if let Some(s) = all.iter().find(|s| s.id == id && s.enabled) { run.insert(id, self.start(db, &all, s)); }
-        for s in all.iter().filter(|s| s.enabled && s.id != id) {
-            if run.get(&s.id).is_some_and(|r| r.state() == "error") {
-                if let Some(r) = run.remove(&s.id) { r.stop(); }
-                run.insert(s.id, self.start(db, &all, s));
-            }
-        }
+        self.refresh(db, &all);
+        let pinned: Vec<String> = all.iter().filter(|s| s.enabled).filter_map(|s| sdrtrunk_source::normalize_tuner(&s.tuner)).collect();
+        let mut run = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        let mut again: Vec<i64> = ids.to_vec();
+        again.extend(run.iter().filter(|(sys, r)| !ids.contains(sys) && {
+            let st = r.status.lock().unwrap_or_else(|p| p.into_inner());
+            st.state == "error" || st.helpers.iter().any(|(t, _)| pinned.contains(t))
+        }).map(|(&sys, _)| sys));
+        for sys in &again { if let Some(r) = run.remove(sys) { r.stop(); } }
+        for s in all.iter().filter(|s| s.enabled && again.contains(&s.id)) { run.insert(s.id, self.start(db, s)); }
     }
 
-    /// After tuner `id`'s settings changed: stops its Setup run, restarts the systems using it (they pick up the new
-    /// settings, or another tuner if it left Live mode), retries systems that failed (it may be Live again), then
-    /// starts its Setup run if it is in Setup mode.
+    /// After tuner `id`'s settings changed: stops its Setup run, restarts the systems using it as main tuner or
+    /// helper (they pick up the new settings, or another tuner if it left Live mode), retries systems that failed (it
+    /// may be Live again), then starts its Setup run if it is in Setup mode.
     pub fn apply_tuner(&self, db: &Db, id: &str) {
         if let Some(r) = self.setups.lock().unwrap_or_else(|p| p.into_inner()).remove(id) { r.stop(); }
-        let restart: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
-            .filter(|(_, r)| { let st = r.status.lock().unwrap_or_else(|p| p.into_inner()); st.tuner.as_deref() == Some(id) || st.state == "error" })
+        let using: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|(_, r)| { let st = r.status.lock().unwrap_or_else(|p| p.into_inner()); st.tuner.as_deref() == Some(id) || st.helpers.iter().any(|(t, _)| t == id) })
             .map(|(&sys, _)| sys).collect();
-        for sys in restart { self.apply(db, sys); }
+        self.restart(db, &using);
         self.apply_setup(db, id);
+    }
+
+    /// Device scan interval: how often `rescan` runs, in ms.
+    pub const SCAN_MS: u64 = 5_000;
+
+    /// Compares the connected SDRs, and those nobody holds, with the last scan. When either changed, retries systems
+    /// that failed (an SDR may be free: plugged in, or a helper or a stopped system let it go); newly connected tuners
+    /// in Setup mode get their Setup run. Otherwise does nothing. Running systems read this scan's list when they
+    /// look for a helper.
+    pub fn rescan(&self, db: &Db) {
+        let mut now = (self.sdrs.list)();
+        now.sort();
+        let free: Vec<String> = {
+            let claimed = self.claimed.lock().unwrap_or_else(|p| p.into_inner());
+            now.iter().filter(|t| !claimed.contains(*t)).cloned().collect()
+        };
+        let freed = {
+            let mut last = self.last_free.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = last.as_ref().is_some_and(|l| *l != free);
+            *last = Some(free);
+            changed
+        };
+        let added: Vec<String> = {
+            let mut p = self.pool.lock().unwrap_or_else(|p| p.into_inner());
+            let added = now.iter().filter(|t| !p.seen.contains(t)).cloned().collect();
+            if p.seen == now && !freed { return; }
+            p.seen = now;
+            added
+        };
+        if self.running.lock().unwrap_or_else(|p| p.into_inner()).values().any(|r| r.state() == "error") { self.restart(db, &[]); }
+        for id in added { self.apply_setup(db, &id); }
     }
 
     /// Tuner `id`'s Setup run status, while it is in Setup mode.
@@ -347,9 +441,11 @@ impl Receivers {
         self.setups.lock().unwrap_or_else(|p| p.into_inner()).get(id).map(|r| r.status.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
-    /// The spectrum display of tuner `id`: the system using it, or its Setup run.
+    /// The spectrum display of tuner `id`: the system using it (as main tuner or helper), or its Setup run.
     pub fn tuner_view(&self, id: &str) -> Option<Arc<Mutex<SpectrumView>>> {
         self.on_tuner(id).map(|r| r.spectrum.clone())
+            .or_else(|| self.running.lock().unwrap_or_else(|p| p.into_inner()).values().find_map(|r|
+                r.helper_views.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(t, _)| t == id).map(|(_, v)| v.clone())))
             .or_else(|| self.setups.lock().unwrap_or_else(|p| p.into_inner()).get(id).map(|r| r.spectrum.clone()))
     }
 
@@ -445,6 +541,16 @@ impl Drop for PanicGuard {
     }
 }
 
+/// When the decoder ends however it ends, its status lists no helpers and no helper spectrum is offered.
+struct HelperGuard(Arc<Mutex<Status>>, HelperViews);
+
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        update(&self.0, |st| (st.helpers, st.helper_bands) = (Vec::new(), Vec::new()));
+        self.1.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+}
+
 /// A tuner held by a decoder thread; released when the thread ends, however it ends.
 struct Claim(Claimed, String);
 
@@ -453,10 +559,12 @@ impl Drop for Claim {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, TunerConfig)>, sdrs: Sdrs, claimed: Claimed,
-          stop: Arc<AtomicBool>, sh: Shared) {
-    let Shared { status, calls, policy, spectrum, quality, known, streams } = sh;
+fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed, stop: Arc<AtomicBool>, sh: Shared) {
+    let Shared { status, calls, policy, spectrum, quality, known, helper_views, streams } = sh;
     let _guard = PanicGuard(status.clone());
+    let _helpers_guard = HelperGuard(status.clone(), helper_views.clone());
+    // The main tuner's settings as at start (a change restarts the system); helpers are chosen from the pool as it is then.
+    let (tuners, reserved) = { let p = pool.lock().unwrap_or_else(|p| p.into_inner()); (p.tuners.clone(), p.reserved(s.id)) };
     let config = |id: &str| tuners.iter().find(|(t, _)| t == id).map(|(_, c)| c.clone()).unwrap_or_default();
     if let Some(pin) = sdrtrunk_source::normalize_tuner(&s.tuner) {
         let label = sdrtrunk_source::tuner_label(&pin);
@@ -480,7 +588,6 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
     let freq = |i: usize| s.control_hz[i] as i64;
     let modulation = Modulation::parse(&s.modulation).unwrap_or_default();
     let names = Names { system: s.system_name.clone(), site: s.site_name.clone(), channel: s.channel_name.clone() };
-    let recorder = || Recorder::new(Path::new(&dir), names.clone(), policy.clone()).streaming(streams.clone(), s.list_name().to_string());
     let known_now = || known.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|&hz| hz as i64).collect::<Vec<i64>>();
     let opened_at = tuner.center_hz.unwrap_or(center_for(freq(0)) as u64) as u32;
     let mut src = match (sdrs.open)(&tuner, opened_at, &serial) { Ok(src) => src, Err(e) => return fail(&status, e) };
@@ -498,8 +605,7 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
     });
     let channel = |i: usize, ppm: f64, center: i64| ControlChannel::new(center as f64, rate as f64, freq(i), ppm, now_ms(), modulation);
     let mut cc = match channel(0, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
-    let mut rec = recorder();
-    let mut recorded_before = 0;
+    let mut rec = Recorder::new(Path::new(&dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
     update(&status, |st| st.state = "running".into());
     let (mut tick, mut tick_valid, mut tick_frames) = (Instant::now(), 0u64, FrameCounts::default());
     let mut last_correction_ms = now_ms();
@@ -509,13 +615,38 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
     let (mut last_symbols_ms, mut symbols_seq) = (0i64, 0u64);
     let mut channel_fft = sdrtrunk_dsp::spectrum::Spectrum::new(CHANNEL_FFT, CHANNEL_WIDTH);
     let (mut last_channel_ms, mut channel_seq) = (0i64, 0u64);
+    let mut helpers: Vec<Helper> = Vec::new();
+    let mut shown_helpers: Vec<(String, u64)> = Vec::new();
+    let mut lost = Vec::new();
+    let free = || pool.lock().unwrap_or_else(|p| p.into_inner()).free(&claimed, s.id);
+    let mut opener = |serial: &str, required: &[i64], known: &[i64], id_base: u32| {
+        let cfg = pool.lock().unwrap_or_else(|p| p.into_inner()).config(serial);
+        open_helper(serial, &cfg, &sdrs.open, &claimed, required, known, modulation, id_base)
+    };
+
+    // Known voice frequencies the main window leaves out: one helper, placed to cover as many as it can (more come on demand).
+    // Nothing is required: `choose_center` places the window over as many left-out frequencies as the tuner's limits allow.
+    let known_all = known_now();
+    let left_out: Vec<i64> = known_all.iter().copied().filter(|&hz| !win.covers(hz)).collect();
+    if !left_out.is_empty() {
+        for serial in free() {
+            match opener(&serial, &[], &left_out, free_id_base(&helpers)) {
+                Ok(h) => { helpers.push(h); break; }
+                Err(e) => eprintln!("decoder {}: no helper at start: {e}", s.label()),
+            }
+        }
+    }
 
     while !stop.load(AtomicOrdering::Relaxed) {
-        let Some(block) = src.next_block() else {
-            update(&status, |st| st.state = "stopped".into());
-            return;
-        };
+        // With helpers, no source may hold up the others: read all without waiting, and rest only when none had data.
+        let wait = if helpers.is_empty() { Duration::from_millis(200) } else { Duration::ZERO };
+        // An error, not "stopped": `rescan` retries the system once the SDR is back (or another is free).
+        let Some(block) = src.next_block(wait) else { return fail(&status, "SDR stopped delivering samples (unplugged?)".into()) };
         cc.process(&block, &mut |e| events.push(e));
+        let helper_data = read_helpers(&mut helpers, &mut events, &mut lost);
+        // Before this pass's grants, so one on a lost channel's frequency opens a fresh channel.
+        for id in lost.drain(..) { rec.drop_channel(id); }
+        if wait.is_zero() && block.is_empty() && !helper_data { std::thread::sleep(Duration::from_millis(5)); }
         if let Some(hz) = cc.take_frequency_error() { corr.measure(hz); }
         let now = now_ms();
         if now - last_correction_ms >= TICK_MS {
@@ -525,7 +656,7 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
         }
         {
             let mut follow = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: tuner.center_hz.is_some(), control: freq(idx),
-                known: &known, status: &status };
+                known: &known, status: &status, helpers: &mut helpers, free: &free, opener: &mut opener };
             for e in events.drain(..) {
                 match &e {
                     ControlEvent::Site { nac, wacn, system } => update(&status, |st| st.site = Some((*nac, *wacn, *system))),
@@ -541,6 +672,17 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
             }
             rec.tick(now, &mut follow);
         }
+        release_idle(&mut helpers, now);
+        let shown: Vec<(String, u64)> = helpers.iter().map(|h| (h.serial.clone(), h.win.center as u64)).collect();
+        if shown != shown_helpers {
+            update(&status, |st| {
+                st.helpers = shown.clone();
+                st.helper_bands = helpers.iter().map(|h| (h.src.rate_hz(), h.win.usable as u32)).collect();
+            });
+            *helper_views.lock().unwrap_or_else(|p| p.into_inner()) = helpers.iter().map(|h| (h.serial.clone(), h.view.clone())).collect();
+            shown_helpers = shown;
+        }
+        draw_helpers(&mut helpers, || rec.following(), now);
         let (watched, channel_watched, symbols_watched) = {
             let v = spectrum.lock().unwrap_or_else(|p| p.into_inner());
             (v.watch_until_ms > now, v.channel_until_ms > now, v.symbols_until_ms > now)
@@ -565,9 +707,7 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
         }
         if watched && now - last_frame_ms >= SPECTRUM_MS {
             let mut markers = vec![Marker { hz: s.control_hz[idx], kind: "control", label: "control".into() }];
-            markers.extend(rec.following().into_iter().map(|(hz, tg, name, encrypted)| Marker {
-                hz, kind: if encrypted { "encrypted" } else { "voice" }, label: name.map_or(format!("TG {tg}"), |n| format!("{tg} {n}")),
-            }));
+            markers.extend(rec.following().into_iter().map(voice_marker));
             if let Some(frame) = tuner_frame(&mut fft, &block, seq + 1, &win, rate, markers) {
                 (last_frame_ms, seq) = (now, seq + 1);
                 spectrum.lock().unwrap_or_else(|p| p.into_inner()).frame = Some(frame);
@@ -583,7 +723,7 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
             update(&status, |st| {
                 st.tsbk_per_s = rate;
                 st.dropped = src.dropped();
-                st.recorded = recorded_before + rec.recorded;
+                st.recorded = rec.recorded;
                 st.recording_error = rec.last_error.clone();
             });
             (tick, tick_valid) = (Instant::now(), cc.valid_tsbk());
@@ -593,12 +733,10 @@ fn decode(s: System, dir: String, reserved: Vec<String>, tuners: Vec<(String, Tu
             eprintln!("decoder {}: no control channel for {} ms, trying {} Hz", s.label(), s.failover_ms, freq(idx));
             win = match place(base, tuner.center_hz, freq(idx), &known_now()) { Ok(w) => w, Err(e) => return fail(&status, e) };
             if let Err(e) = src.tune(win.center as u32) { return fail(&status, e); }
-            cc = match channel(idx, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
+            let next = match channel(idx, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
+            switch_control(&mut cc, next, &mut rec);
             corr.reset_channel();
             tick_frames = FrameCounts::default();
-            // The new control channel has no voice channels: start the recorder afresh (open transmissions are lost).
-            recorded_before += rec.recorded;
-            rec = recorder();
             tick_valid = 0;
             update(&status, |st| { st.control_hz = Some(s.control_hz[idx]); st.center_hz = Some(win.center as u64); st.site = None; });
         }
@@ -622,8 +760,158 @@ fn place(base: tuning::Window, locked: Option<u64>, control: i64, known: &[i64])
     }
 }
 
+/// The marker for a followed call: (Hz, talkgroup, name if listed, encrypted).
+fn voice_marker((hz, tg, name, encrypted): (u64, u16, Option<String>, bool)) -> Marker {
+    Marker { hz, kind: if encrypted { "encrypted" } else { "voice" }, label: name.map_or(format!("TG {tg}"), |n| format!("{tg} {n}")) }
+}
+
+/// A helper is released after this long without a voice channel.
+const HELPER_IDLE_MS: i64 = 600_000;
+
+/// A free Live tuner following voice channels the main tuner's window cannot cover. Its ids start at its `id_base`
+/// (`(k + 1) << 24`), so they never clash with the main tuner's or another helper's.
+struct Helper {
+    serial: String,
+    src: Box<dyn IqSource>,
+    bank: VoiceBank,
+    win: tuning::Window,
+    locked: bool,
+    /// Dropped after `src`, so the tuner is closed before another system can take it.
+    _claim: Claim,
+    /// When it was first seen without a voice channel.
+    idle_since_ms: Option<i64>,
+    id_base: u32,
+    /// Its spectrum display, drawn from `last` (the newest block read) only while a page watches.
+    view: Arc<Mutex<SpectrumView>>,
+    fft: sdrtrunk_dsp::spectrum::Spectrum,
+    last: Vec<i16>,
+    last_frame_ms: i64,
+    seq: u64,
+}
+
+/// The lowest helper id base, `(k + 1) << 24`, that no live helper uses (a released helper's base is reused).
+fn free_id_base(helpers: &[Helper]) -> u32 {
+    (1..=255u32).map(|k| k << 24).find(|b| helpers.iter().all(|h| h.id_base != *b)).expect("fewer than 255 helpers")
+}
+
+/// After a control channel failover: the main tuner's voice channels go with the old control channel (the recorder
+/// forgets them); helpers and their calls carry on.
+fn switch_control(cc: &mut ControlChannel, next: ControlChannel, rec: &mut Recorder) {
+    for id in cc.voice_ids() { rec.drop_channel(id); }
+    *cc = next;
+}
+
+/// Tuners a system may take as helpers: connected (`present`), Live, not in use, not pinned to another enabled system.
+fn free_tuners(present: Vec<String>, config: &dyn Fn(&str) -> TunerConfig, claimed: &HashSet<String>, reserved: &[String]) -> Vec<String> {
+    let reserved: Vec<String> = reserved.iter().filter_map(|r| sdrtrunk_source::normalize_tuner(r)).collect();
+    present.into_iter().filter(|t| config(t).mode == TunerMode::Live && !claimed.contains(t) && !reserved.contains(t)).collect()
+}
+
+/// Claims tuner `serial` and opens it as a helper whose window covers every `required` channel (and as many `known`
+/// as it can), or at its locked centre if that covers them. Uses the tuner's saved PPM (no control channel to measure).
+#[allow(clippy::too_many_arguments)]
+fn open_helper(serial: &str, cfg: &TunerConfig, open: &SourceFactory, claimed: &Claimed, required: &[i64], known: &[i64],
+               modulation: Modulation, id_base: u32) -> Result<Helper, String> {
+    let label = sdrtrunk_source::tuner_label(serial);
+    // Checked before opening (an open is slow USB work on the decode thread).
+    if !required.iter().all(|&hz| tuning::Window::for_tuner(serial, 0, 0, cfg.min_hz, cfg.max_hz).allowed(hz)) {
+        return Err(format!("{label}: outside its frequency limits"));
+    }
+    if let Some(c) = cfg.center_hz {
+        let locked = tuning::Window::for_tuner(serial, expected_rate(serial, cfg), c as i64, cfg.min_hz, cfg.max_hz);
+        if !required.iter().all(|&hz| locked.covers(hz)) { return Err(format!("{label}: its window cannot cover it")); }
+    }
+    if !claimed.lock().unwrap_or_else(|p| p.into_inner()).insert(serial.to_string()) { return Err(format!("{label} is in use")); }
+    let claim = Claim(claimed.clone(), serial.to_string());
+    // With nothing required (start-up), the window is placed over whichever `known` channels fit this tuner's limits.
+    let limits = tuning::Window::for_tuner(serial, 0, 0, cfg.min_hz, cfg.max_hz);
+    let Some(&first) = required.first().or_else(|| known.iter().find(|&&hz| limits.allowed(hz))) else {
+        return Err(format!("{label}: nothing within its frequency limits"));
+    };
+    let start = cfg.center_hz.map_or_else(|| center_for(first) as i64, |c| c as i64);
+    // ponytail: opened on the decode thread, so decoding stalls while the SDR opens; open in the background if that
+    // shows up as dropped samples.
+    let mut src = (open)(cfg, start as u32, serial)?;
+    let base = tuning::Window::for_tuner(serial, src.rate_hz(), start, cfg.min_hz, cfg.max_hz);
+    let locked = cfg.center_hz.is_some();
+    let center = if locked { required.iter().all(|&hz| base.covers(hz)).then_some(start) } else { choose_center(required, known, base) }
+        .ok_or_else(|| format!("{label}: its window cannot cover it"))?;
+    if required.is_empty() && !known.iter().any(|&hz| base.at(center).covers(hz)) {
+        return Err(format!("{label}: its window covers none of them"));
+    }
+    if center != start { src.tune(center as u32)?; }
+    let bank = VoiceBank::new(center as f64, src.rate_hz() as f64, cfg.ppm, modulation, now_ms(), id_base)?;
+    Ok(Helper { serial: serial.to_string(), src, bank, win: base.at(center), locked, _claim: claim, idle_since_ms: None, id_base,
+        view: Arc::default(), fft: sdrtrunk_dsp::spectrum::Spectrum::new(SPECTRUM_FFT, SPECTRUM_WIDTH), last: Vec::new(), last_frame_ms: 0, seq: 0 })
+}
+
+/// Samples per second tuner `id` delivers once open: an RTL-SDR always runs at its own rate (`rtlsdr::RATE_HZ`).
+fn expected_rate(id: &str, cfg: &TunerConfig) -> u32 { if id.starts_with("rtl:") { 2_400_000 } else { cfg.rate_hz } }
+
+/// Moves helper `h` so it also covers `hz` with its calls in progress; false when it is locked or they do not fit.
+fn move_helper(h: &mut Helper, hz: i64, known: &[i64]) -> bool {
+    if h.locked { return false; }
+    let mut required = h.bank.voice_freqs();
+    required.push(hz);
+    let Some(center) = choose_center(&required, known, h.win) else { return false };
+    if h.bank.set_center(center as f64).is_err() { return false; }
+    if h.src.tune(center as u32).is_err() {
+        let _ = h.bank.set_center(h.win.center as f64);
+        return false;
+    }
+    h.win = h.win.at(center);
+    true
+}
+
+/// Reads every helper without waiting and decodes its voice channels into `events`. A helper whose source ended is
+/// dropped (its tuner released) and its channel ids go to `lost`, for the recorder to forget. True when any helper
+/// delivered samples.
+fn read_helpers(helpers: &mut Vec<Helper>, events: &mut Vec<ControlEvent>, lost: &mut Vec<u32>) -> bool {
+    let mut got = false;
+    helpers.retain_mut(|h| match h.src.next_block(Duration::ZERO) {
+        Some(block) => {
+            got |= !block.is_empty();
+            h.bank.process(&block, &mut |e| events.push(e));
+            if !block.is_empty() { h.last = block; }
+            true
+        }
+        None => {
+            eprintln!("decoder: helper {} stopped delivering samples; its calls end", sdrtrunk_source::tuner_label(&h.serial));
+            lost.extend(h.bank.voice_ids());
+            false
+        }
+    });
+    got
+}
+
+/// Draws a spectrum frame for each watched helper from its newest block, marking the calls (`following`, asked only
+/// when a frame is drawn) inside its window.
+fn draw_helpers(helpers: &mut [Helper], following: impl Fn() -> Vec<(u64, u16, Option<String>, bool)>, now: i64) {
+    let mut calls = None;
+    for h in helpers {
+        let block = std::mem::take(&mut h.last);
+        let watched = h.view.lock().unwrap_or_else(|p| p.into_inner()).watch_until_ms > now;
+        if !watched || block.is_empty() || now - h.last_frame_ms < SPECTRUM_MS { continue; }
+        let markers = calls.get_or_insert_with(&following).iter().filter(|f| h.win.covers(f.0 as i64)).cloned().map(voice_marker).collect();
+        if let Some(frame) = tuner_frame(&mut h.fft, &block, h.seq + 1, &h.win, h.src.rate_hz(), markers) {
+            (h.last_frame_ms, h.seq) = (now, h.seq + 1);
+            h.view.lock().unwrap_or_else(|p| p.into_inner()).frame = Some(frame);
+        }
+    }
+}
+
+/// Drops helpers that have had no voice channel for `HELPER_IDLE_MS` (their tuners are free again).
+fn release_idle(helpers: &mut Vec<Helper>, now_ms: i64) {
+    helpers.retain_mut(|h| {
+        if h.bank.voice_count() > 0 { h.idle_since_ms = None; return true; }
+        now_ms - *h.idle_since_ms.get_or_insert(now_ms) < HELPER_IDLE_MS
+    });
+}
+
 /// Opens voice channels for the recorder. A call outside the window moves the tuner first, but only when the control
-/// channel and every call in progress stay inside, and never with Lock center (the Java reference's rule).
+/// channel and every call in progress stay inside, and never with Lock center (the Java reference's rule). A helper
+/// already covering a call takes it before any tuner moves; a call no tuner covers moves the main tuner, else a helper,
+/// else goes to a newly claimed free tuner.
 struct Follow<'a> {
     cc: &'a mut ControlChannel,
     src: &'a mut Box<dyn IqSource>,
@@ -632,14 +920,42 @@ struct Follow<'a> {
     control: i64,
     known: &'a Mutex<BTreeSet<u64>>,
     status: &'a Mutex<Status>,
+    helpers: &'a mut Vec<Helper>,
+    /// Tuners that may become helpers now.
+    free: &'a dyn Fn() -> Vec<String>,
+    /// `open_helper` for (tuner, required, known, id base), with the system's settings.
+    opener: &'a mut dyn FnMut(&str, &[i64], &[i64], u32) -> Result<Helper, String>,
 }
 
 impl Tuner for Follow<'_> {
     fn open(&mut self, hz: i64) -> Result<u32, String> {
-        if !self.win.covers(hz) { self.move_to_cover(hz)?; }
-        self.cc.add_voice(hz)
+        if self.win.covers(hz) { return self.cc.add_voice(hz); }
+        // A tuner already covering the call before moving one in use (a retune drops voice in progress). One that
+        // fails leaves the call to the next option.
+        for h in self.helpers.iter_mut().filter(|h| h.win.covers(hz)) {
+            if let Ok(id) = h.bank.add_voice(hz) { return Ok(id); }
+        }
+        let why = match self.move_to_cover(hz) { Ok(()) => return self.cc.add_voice(hz), Err(e) => e };
+        let known: Vec<i64> = self.known.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|&k| k as i64)
+            .filter(|&k| !self.win.covers(k)).collect();
+        for h in self.helpers.iter_mut() {
+            if move_helper(h, hz, &known) { return h.bank.add_voice(hz); }
+        }
+        let mut tried = Vec::new();
+        for serial in (self.free)() {
+            match (self.opener)(&serial, &[hz], &known, free_id_base(self.helpers)) {
+                Ok(h) => { self.helpers.push(h); return self.helpers.last_mut().expect("just pushed").bank.add_voice(hz); }
+                Err(e) => tried.push(e),
+            }
+        }
+        let helpers = if tried.is_empty() { "no free SDR".to_string() } else { tried.join("; ") };
+        Err(format!("no tuner can reach it: {why}; {helpers} (plug in another SDR or set limits)"))
     }
-    fn close(&mut self, id: u32) { self.cc.remove_voice(id) }
+    /// Ids are unique across the main tuner and the helpers, so only the bank holding `id` changes.
+    fn close(&mut self, id: u32) {
+        self.cc.remove_voice(id);
+        for h in self.helpers.iter_mut() { h.bank.remove_voice(id); }
+    }
 }
 
 impl Follow<'_> {
@@ -689,7 +1005,7 @@ fn setup(id: String, cfg: TunerConfig, sdrs: Sdrs, claimed: Claimed, stop: Arc<A
     let mut fft = sdrtrunk_dsp::spectrum::Spectrum::new(SPECTRUM_FFT, SPECTRUM_WIDTH);
     let (mut last_frame_ms, mut seq) = (0i64, 0u64);
     while !stop.load(AtomicOrdering::Relaxed) {
-        let Some(block) = src.next_block() else { return update(&status, |st| st.state = "stopped".into()) };
+        let Some(block) = src.next_block(Duration::from_millis(200)) else { return update(&status, |st| st.state = "stopped".into()) };
         let now = now_ms();
         let watched = spectrum.lock().unwrap_or_else(|p| p.into_inner()).watch_until_ms > now;
         if watched && now - last_frame_ms >= SPECTRUM_MS {
@@ -748,7 +1064,7 @@ mod tests {
 
     struct Zeros { open: Arc<AtomicUsize>, tunes: Arc<Mutex<Vec<u32>>> }
     impl IqSource for Zeros {
-        fn next_block(&mut self) -> Option<Vec<i16>> { Some(vec![0; 2 * 32_768]) }
+        fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> { Some(vec![0; 2 * 32_768]) }
         fn tune(&mut self, center_hz: u32) -> Result<(), String> { self.tunes.lock().unwrap().push(center_hz); Ok(()) }
         fn dropped(&self) -> u64 { 0 }
         fn rate_hz(&self) -> u32 { 3_000_000 }
@@ -779,12 +1095,14 @@ mod tests {
         let (sdrs, open, _) = zeros();
         let auto = db.save_system(&sys("SGCo", "")).unwrap();
         let pinned = db.save_system(&sys("KSICS", A)).unwrap();
-        let third = db.save_system(&sys("Extra", "")).unwrap();
         let rx = Receivers::new(sdrs);
         rx.restart_all(&db);
         assert!(wait_for(Duration::from_secs(2), || state(&rx, auto) == "running" && state(&rx, pinned) == "running"));
         assert_eq!(rx.status(pinned).unwrap().tuner.as_deref(), Some(A));
         assert_eq!(rx.status(auto).unwrap().tuner.as_deref(), Some(B), "automatic never takes a pinned tuner");
+        // Added once the others run: decoder threads started together claim tuners in any order.
+        let third = db.save_system(&sys("Extra", "")).unwrap();
+        rx.apply(&db, third);
         assert!(wait_for(Duration::from_secs(1), || state(&rx, third) == "error"));
         assert!(rx.status(third).unwrap().error.unwrap().starts_with("no free SDR"));
         assert_eq!(open.load(Ordering::SeqCst), 2);
@@ -798,6 +1116,58 @@ mod tests {
         rx.stop_all();
         assert_eq!(open.load(Ordering::SeqCst), 0, "stop closes every source");
         assert!(rx.claimed.lock().unwrap().is_empty(), "every tuner released");
+    }
+
+    #[test]
+    fn plugged_in_sdr_retries_a_waiting_system() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, open, _) = zeros();
+        let present: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![A.into()]));
+        let p = present.clone();
+        let sdrs = Sdrs { list: Arc::new(move || p.lock().unwrap().clone()), open: sdrs.open };
+        let first = db.save_system(&sys("SGCo", "")).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running"));
+        // Added once the first runs: decoder threads started together claim tuners in any order.
+        let second = db.save_system(&sys("Extra", "")).unwrap();
+        rx.apply(&db, second);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running" && state(&rx, second) == "error"));
+        assert!(rx.status(second).unwrap().error.unwrap().starts_with("no free SDR"));
+        rx.rescan(&db);
+        assert_eq!(state(&rx, second), "error", "nothing changed: nothing retried");
+        present.lock().unwrap().push(B.into());
+        rx.rescan(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, second) == "running"));
+        assert_eq!(rx.status(second).unwrap().tuner.as_deref(), Some(B));
+        let opened = open.load(Ordering::SeqCst);
+        rx.rescan(&db);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(open.load(Ordering::SeqCst), opened, "no change restarts nothing");
+        rx.stop_all();
+    }
+
+    #[test]
+    fn unsorted_list_is_no_change() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, open, _) = zeros();
+        let sdrs = Sdrs { list: Arc::new(|| vec![A.into(), B.into()]), open: sdrs.open };
+        // A sorts after B, so this list is unsorted.
+        assert!(A > B);
+        let first = db.save_system(&sys("SGCo", A)).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running"));
+        // Added once the first runs: decoder threads started together claim tuners in any order.
+        let second = db.save_system(&sys("Extra", A)).unwrap();
+        rx.apply(&db, second);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, first) == "running" && state(&rx, second) == "error"));
+        let opened = open.load(Ordering::SeqCst);
+        let before = rx.get(second).unwrap();
+        rx.rescan(&db);
+        assert!(Arc::ptr_eq(&before, &rx.get(second).unwrap()), "the first rescan restarted nothing");
+        assert_eq!(open.load(Ordering::SeqCst), opened);
+        rx.stop_all();
     }
 
     #[test]
@@ -897,7 +1267,7 @@ mod tests {
 
     struct Boom;
     impl IqSource for Boom {
-        fn next_block(&mut self) -> Option<Vec<i16>> { panic!("simulated decoder fault") }
+        fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> { panic!("simulated decoder fault") }
         fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
         fn dropped(&self) -> u64 { 0 }
         fn rate_hz(&self) -> u32 { 3_000_000 }
@@ -915,7 +1285,7 @@ mod tests {
 
     struct Tunes(Arc<Mutex<Vec<u32>>>);
     impl IqSource for Tunes {
-        fn next_block(&mut self) -> Option<Vec<i16>> { Some(Vec::new()) }
+        fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> { Some(Vec::new()) }
         fn tune(&mut self, center_hz: u32) -> Result<(), String> { self.0.lock().unwrap().push(center_hz); Ok(()) }
         fn dropped(&self) -> u64 { 0 }
         fn rate_hz(&self) -> u32 { 2_400_000 }
@@ -932,7 +1302,10 @@ mod tests {
         let mut win = place(base, None, control, &[]).unwrap();
         assert_eq!(win.center, center_for(control) as i64);
         let mut cc = ControlChannel::new(win.center as f64, 2.4e6, control, 0.0, 0, Modulation::C4fm).unwrap();
-        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: false, control, known: &known, status: &status };
+        let (mut helpers, free) = (Vec::new(), Vec::<String>::new);
+        let mut opener = |_: &str, _: &[i64], _: &[i64], _: u32| -> Result<Helper, String> { Err("unused".into()) };
+        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: false, control, known: &known, status: &status,
+            helpers: &mut helpers, free: &free, opener: &mut opener };
         f.open(852_600_000).unwrap();
         assert!(tunes.lock().unwrap().is_empty(), "inside the window: no move");
         f.open(853_900_000).unwrap();
@@ -944,13 +1317,191 @@ mod tests {
         assert_eq!(f.cc.voice_freqs(), vec![852_600_000, 853_900_000], "calls in progress kept");
 
         let mut win = place(base, Some(852_062_500), control, &[]).unwrap();
-        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: true, control, known: &known, status: &status };
+        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: true, control, known: &known, status: &status,
+            helpers: &mut helpers, free: &free, opener: &mut opener };
         assert!(f.open(853_950_000).unwrap_err().contains("locked window"));
         let limited = tuning::Window::for_tuner("rtl:00000001", 2_400_000, 0, None, Some(853_000_000));
         let mut win = place(limited, None, control, &[]).unwrap();
-        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: false, control, known: &known, status: &status };
+        let mut f = Follow { cc: &mut cc, src: &mut src, win: &mut win, locked: false, control, known: &known, status: &status,
+            helpers: &mut helpers, free: &free, opener: &mut opener };
         assert!(f.open(853_475_000).unwrap_err().contains("frequency limits"));
         assert!(place(base, Some(855_000_000), control, &[]).unwrap_err().contains("outside this tuner's locked window"));
+    }
+
+    const RTL1: &str = "rtl:00000001";
+    const RTL2: &str = "rtl:00000002";
+    const KSICS: i64 = 852_112_500;
+
+    /// Never delivers: the helper's SDR was unplugged.
+    struct Gone;
+    impl IqSource for Gone {
+        fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> { None }
+        fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
+        fn dropped(&self) -> u64 { 0 }
+        fn rate_hz(&self) -> u32 { 2_400_000 }
+    }
+
+    /// KSICS on RTL-SDR 1 (claimed, the main tuner) with RTL-SDR 2 connected; `reserved` are pinned elsewhere.
+    struct Rig {
+        cc: ControlChannel, src: Box<dyn IqSource>, win: tuning::Window, known: Mutex<BTreeSet<u64>>, status: Mutex<Status>,
+        helpers: Vec<Helper>, claimed: Claimed, reserved: Vec<String>, factory: SourceFactory, present: Vec<String>,
+        /// Settings of every helper tuner.
+        cfg: TunerConfig,
+        main_tunes: Arc<Mutex<Vec<u32>>>, opens: Arc<Mutex<Vec<(String, u32)>>>, helper_tunes: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Rig {
+        fn new(reserved: &[&str], gone: bool) -> Rig {
+            let (main_tunes, opens, helper_tunes) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+            let (o, t) = (opens.clone(), helper_tunes.clone());
+            let factory: SourceFactory = Arc::new(move |_, center, id| {
+                o.lock().unwrap().push((id.to_string(), center));
+                Ok(if gone { Box::new(Gone) as Box<dyn IqSource> } else { Box::new(Tunes(t.clone())) })
+            });
+            let base = tuning::Window::for_tuner(RTL1, 2_400_000, 0, None, None);
+            let win = place(base, None, KSICS, &[]).unwrap();
+            Rig {
+                cc: ControlChannel::new(win.center as f64, 2.4e6, KSICS, 0.0, 0, Modulation::C4fm).unwrap(),
+                src: Box::new(Tunes(main_tunes.clone())), win, known: Mutex::default(), status: Mutex::default(), helpers: Vec::new(),
+                claimed: Arc::new(Mutex::new([RTL1.to_string()].into())), reserved: reserved.iter().map(|r| r.to_string()).collect(),
+                factory, main_tunes, opens, helper_tunes, present: vec![RTL1.into(), RTL2.into()], cfg: TunerConfig::default(),
+            }
+        }
+
+        fn free(&self) -> Vec<String> {
+            free_tuners(self.present.clone(), &|_| self.cfg.clone(), &self.claimed.lock().unwrap(), &self.reserved)
+        }
+
+        fn follow<R>(&mut self, act: impl FnOnce(&mut Follow) -> R) -> R {
+            let (claimed, reserved, factory, present, cfg) = (&self.claimed, &self.reserved, &self.factory, &self.present, &self.cfg);
+            let free = || free_tuners(present.clone(), &|_| cfg.clone(), &claimed.lock().unwrap(), reserved);
+            let mut opener = |serial: &str, required: &[i64], known: &[i64], id_base: u32|
+                open_helper(serial, cfg, factory, claimed, required, known, Modulation::C4fm, id_base);
+            act(&mut Follow { cc: &mut self.cc, src: &mut self.src, win: &mut self.win, locked: false, control: KSICS, known: &self.known,
+                status: &self.status, helpers: &mut self.helpers, free: &free, opener: &mut opener })
+        }
+
+        fn open(&mut self, hz: i64) -> Result<u32, String> { self.follow(|f| f.open(hz)) }
+        fn close(&mut self, id: u32) { self.follow(|f| f.close(id)) }
+        fn claims(&self, id: &str) -> bool { self.claimed.lock().unwrap().contains(id) }
+    }
+
+    #[test]
+    fn helper_takes_a_call_the_main_window_cannot() {
+        let mut rig = Rig::new(&[], false);
+        assert!(rig.open(851_600_000).unwrap() < 1 << 24, "inside the main window");
+        // 851.6 to 853.95 MHz is wider than one RTL-SDR window: the main tuner cannot move, RTL-SDR 2 takes it.
+        let id = rig.open(853_950_000).unwrap();
+        assert!(id >= 1 << 24, "helper id {id}");
+        assert!(rig.main_tunes.lock().unwrap().is_empty(), "the main window stayed");
+        assert_eq!(rig.helpers.len(), 1);
+        let h = &rig.helpers[0];
+        assert_eq!(h.serial, RTL2);
+        let opens = rig.opens.lock().unwrap().clone();
+        assert_eq!(opens.len(), 1);
+        let at = rig.helper_tunes.lock().unwrap().last().copied().unwrap_or(opens[0].1);
+        assert_eq!(at as i64, h.win.center, "the SDR sits where its window says");
+        assert!(h.win.covers(853_950_000));
+        assert!(rig.claims(RTL2), "claimed like a main tuner");
+
+        // The main tuner could move to 853.8 MHz, but a helper already covering it is used first (no main retune).
+        assert_eq!(rig.open(853_800_000).unwrap(), id + 1, "same helper");
+        assert_eq!((rig.helpers.len(), rig.opens.lock().unwrap().len()), (1, 1), "no new claim");
+        assert!(rig.main_tunes.lock().unwrap().is_empty(), "the main tuner was not retuned");
+        assert_eq!(rig.helpers[0].bank.voice_freqs(), vec![853_950_000, 853_800_000]);
+        assert_eq!(rig.cc.voice_freqs(), vec![851_600_000], "the call in progress stays on the main tuner");
+    }
+
+    #[test]
+    fn no_free_tuner_is_an_error_not_a_crash() {
+        let mut rig = Rig::new(&[RTL2], false);
+        rig.open(851_600_000).unwrap();
+        let e = rig.open(853_950_000).unwrap_err();
+        assert!(e.contains("no tuner can reach it"), "{e}");
+        assert!(!rig.claims(RTL2) && rig.opens.lock().unwrap().is_empty(), "the pinned tuner is not taken");
+        assert!(rig.helpers.is_empty());
+    }
+
+    #[test]
+    fn idle_helper_released() {
+        let mut rig = Rig::new(&[], false);
+        rig.open(851_600_000).unwrap();
+        let id = rig.open(853_950_000).unwrap();
+        release_idle(&mut rig.helpers, 1_000);
+        assert_eq!(rig.helpers.len(), 1, "a call in progress");
+        rig.close(id);
+        assert!(rig.helpers[0].bank.voice_freqs().is_empty(), "closed on the helper");
+        release_idle(&mut rig.helpers, 2_000);
+        release_idle(&mut rig.helpers, 2_000 + HELPER_IDLE_MS - 1);
+        assert_eq!(rig.helpers.len(), 1, "not idle long enough");
+        assert!(rig.free().is_empty());
+        release_idle(&mut rig.helpers, 2_000 + HELPER_IDLE_MS);
+        assert!(rig.helpers.is_empty(), "released");
+        assert!(!rig.claims(RTL2));
+        assert_eq!(rig.free(), vec![RTL2.to_string()], "free again");
+    }
+
+    #[test]
+    fn helper_source_lost() {
+        let mut rig = Rig::new(&[], true);
+        let names = Names { system: "KSICS".into(), site: "Site".into(), channel: "Control".into() };
+        let mut rec = Recorder::new(&std::env::temp_dir().join("sdrtrunk-helper-lost"), names, Arc::default());
+        let hz = 855_950_000;
+        let grant = ControlEvent::Call(sdrtrunk_p25::trunk::CallGrant { group: 1, source: 0, hz, encrypted: false, emergency: false,
+            channel: sdrtrunk_p25::tsbk_msg::Channel { band: 0, number: 1 } });
+        rig.follow(|f| rec.handle(&grant, 0, f));
+        let id = rig.helpers[0].bank.voice_ids()[0];
+        assert!(id >= 1 << 24);
+        let (mut events, mut lost) = (Vec::new(), Vec::new());
+        read_helpers(&mut rig.helpers, &mut events, &mut lost);
+        assert_eq!(lost, vec![id], "its channels are reported lost");
+        assert!(rig.helpers.is_empty() && !rig.claims(RTL2), "dropped and released");
+        for id in lost { rec.drop_channel(id); }
+        assert!(rec.following().is_empty(), "the recorder forgot the channel");
+        rig.follow(|f| rec.handle(&grant, 100, f));
+        assert_eq!((rig.opens.lock().unwrap().len(), rec.following().len()), (2, 1), "a later grant there gets a new channel");
+        assert!(rig.open(851_600_000).unwrap() < 1 << 24, "the main tuner still follows calls");
+    }
+
+    #[test]
+    fn helper_ids_reused_without_collision() {
+        let mut rig = Rig::new(&[], false);
+        rig.present.push("rtl:00000003".into());
+        rig.open(851_600_000).unwrap();
+        let first = rig.open(853_950_000).unwrap();
+        assert_eq!(first, 1 << 24);
+        // RTL-SDR 2 cannot stretch from 853.95 to 857 MHz: RTL-SDR 3 takes it with the next base.
+        let second = rig.open(857_000_000).unwrap();
+        assert_eq!((second, rig.helpers.len()), (2 << 24, 2));
+        rig.close(first);
+        release_idle(&mut rig.helpers, 0);
+        release_idle(&mut rig.helpers, HELPER_IDLE_MS);
+        assert_eq!(rig.helpers.len(), 1, "RTL-SDR 2 released, RTL-SDR 3 still on its call");
+        // 1 << 24 is free again; 2 << 24 is still RTL-SDR 3's.
+        let again = rig.open(853_950_000).unwrap();
+        assert_eq!(again, 1 << 24);
+        let ids: Vec<Vec<u32>> = rig.helpers.iter().map(|h| h.bank.voice_ids()).collect();
+        assert_eq!(ids, vec![vec![2 << 24], vec![1 << 24]], "no id in two banks");
+    }
+
+    #[test]
+    fn failover_keeps_helpers_and_their_calls() {
+        let mut rig = Rig::new(&[], false);
+        let names = Names { system: "KSICS".into(), site: "Site".into(), channel: "Control".into() };
+        let mut rec = Recorder::new(&std::env::temp_dir().join("sdrtrunk-failover-helpers"), names, Arc::default());
+        let grant = |hz: u64| ControlEvent::Call(sdrtrunk_p25::trunk::CallGrant { group: 1, source: 0, hz, encrypted: false,
+            emergency: false, channel: sdrtrunk_p25::tsbk_msg::Channel { band: 0, number: 1 } });
+        rig.follow(|f| { rec.handle(&grant(851_600_000), 0, f); rec.handle(&grant(853_950_000), 0, f); });
+        assert_eq!(rec.following().len(), 2);
+        let next = ControlChannel::new(rig.win.center as f64, 2.4e6, 852_200_000, 0.0, 0, Modulation::C4fm).unwrap();
+        switch_control(&mut rig.cc, next, &mut rec);
+        let following: Vec<u64> = rec.following().iter().map(|f| f.0).collect();
+        assert_eq!(following, vec![853_950_000], "only the main tuner's call is gone");
+        assert_eq!(rig.helpers[0].bank.voice_freqs(), vec![853_950_000], "the helper keeps its call");
+        assert!(rig.cc.voice_freqs().is_empty());
+        // A grant on the dropped main frequency opens a fresh channel on the new control channel's bank.
+        rig.follow(|f| rec.handle(&grant(851_600_000), 100, f));
+        assert_eq!(rig.cc.voice_freqs(), vec![851_600_000]);
     }
 
     #[test]
@@ -971,6 +1522,97 @@ mod tests {
         rx.get(id).unwrap().known.lock().unwrap().insert(861_100_000);
         rx.record_minute(&db, now_ms());
         assert_eq!(db.voice_freqs(id), vec![861_000_000, 861_100_000], "remembered for the next start");
+    }
+
+    #[test]
+    fn known_frequencies_outside_the_main_window_get_a_helper_at_start() {
+        for (list, helper) in [(vec![RTL1, RTL2], true), (vec![RTL1], false)] {
+            let db = Db::open_in_memory().unwrap();
+            let list: Vec<String> = list.into_iter().map(String::from).collect();
+            let sdrs = Sdrs {
+                list: Arc::new(move || list.clone()),
+                open: Arc::new(|_, _, _| Ok(Box::new(Tunes(Arc::default())) as Box<dyn IqSource>)),
+            };
+            let id = db.save_system(&sys("SGCo", "")).unwrap();
+            // Spread over 4 MHz: one RTL-SDR window cannot hold them all.
+            db.add_voice_freqs(id, &[859_000_000, 860_000_000, 862_500_000, 863_000_000]).unwrap();
+            let rx = Receivers::new(sdrs);
+            rx.restart_all(&db);
+            assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+            let st = rx.status(id).unwrap();
+            let main = tuning::Window::for_tuner(RTL1, 2_400_000, st.center_hz.unwrap() as i64, None, None);
+            assert!(main.covers(858_962_500) && !main.covers(863_000_000), "the main window leaves the far ones out");
+            if helper {
+                assert!(wait_for(Duration::from_secs(2), || !rx.status(id).unwrap().helpers.is_empty()));
+                let st = rx.status(id).unwrap();
+                assert_eq!(st.helpers.len(), 1);
+                assert_eq!(st.helpers[0].0, RTL2);
+                let w = tuning::Window::for_tuner(RTL2, 2_400_000, st.helpers[0].1 as i64, None, None);
+                assert!(w.covers(862_500_000) && w.covers(863_000_000), "helper centre {}", st.helpers[0].1);
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+                let st = rx.status(id).unwrap();
+                assert!(st.helpers.is_empty() && st.state == "running", "alone on the main tuner");
+            }
+        }
+    }
+
+    #[test]
+    fn helpers_vanish_from_status_when_the_decoder_stops() {
+        let db = Db::open_in_memory().unwrap();
+        let sdrs = Sdrs {
+            list: Arc::new(|| vec![RTL1.into(), RTL2.into()]),
+            open: Arc::new(|_, _, _| Ok(Box::new(Tunes(Arc::default())) as Box<dyn IqSource>)),
+        };
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        db.add_voice_freqs(id, &[859_000_000, 862_500_000, 863_000_000]).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || !rx.status(id).is_none_or(|s| s.helpers.is_empty())));
+        assert!(rx.tuner_view(RTL2).is_some(), "the helper's own spectrum");
+        assert!(rx.tuner_view(RTL1).is_some_and(|v| !Arc::ptr_eq(&v, &rx.tuner_view(RTL2).unwrap())), "a different view from the main tuner's");
+        let r = rx.get(id).unwrap();
+        assert_eq!(r.status.lock().unwrap().helper_bands.len(), 1);
+        db.delete_system(id).unwrap();
+        rx.apply(&db, id);
+        let st = r.status.lock().unwrap().clone();
+        assert!(st.helpers.is_empty() && st.helper_bands.is_empty() && st.state == "stopped", "{st:?}");
+        assert!(rx.tuner_view(RTL2).is_none());
+    }
+
+    /// Known 859.0/862.5/863.0 MHz leave the main window (RTL-SDR 1 sits on the control channel + 859.0 side); the helper must
+    /// take the two that fit together, not anchor on the outlier. `min_hz` is RTL-SDR 2's lower limit.
+    fn helper_for_outliers(min_hz: Option<u64>, known: &[u64]) -> Vec<(String, u64)> {
+        let db = Db::open_in_memory().unwrap();
+        let sdrs = Sdrs {
+            list: Arc::new(|| vec![RTL1.into(), RTL2.into()]),
+            open: Arc::new(|_, _, _| Ok(Box::new(Tunes(Arc::default())) as Box<dyn IqSource>)),
+        };
+        db.save_tuner(RTL2, &TunerConfig { min_hz, ..TunerConfig::default() }).unwrap();
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        db.add_voice_freqs(id, known).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        wait_for(Duration::from_millis(500), || !rx.status(id).unwrap().helpers.is_empty());
+        rx.status(id).unwrap().helpers
+    }
+
+    #[test]
+    fn start_helper_covers_the_most_not_the_first() {
+        let h = helper_for_outliers(None, &[865_000_000, 868_500_000, 869_000_000]);
+        assert_eq!(h.len(), 1);
+        let w = tuning::Window::for_tuner(RTL2, 2_400_000, h[0].1 as i64, None, None);
+        assert!(w.covers(868_500_000) && w.covers(869_000_000), "the two that fit together, centre {}", h[0].1);
+    }
+
+    #[test]
+    fn start_helper_skips_known_outside_its_limits() {
+        // 855.0 MHz is first but under RTL-SDR 2's floor; the two near 863 still fit.
+        let h = helper_for_outliers(Some(860_000_000), &[855_000_000, 863_000_000, 863_500_000]);
+        assert_eq!(h.len(), 1);
+        let w = tuning::Window::for_tuner(RTL2, 2_400_000, h[0].1 as i64, Some(860_000_000), None);
+        assert!(w.covers(863_000_000) && w.covers(863_500_000), "centre {}", h[0].1);
     }
 
     #[test]
@@ -1009,5 +1651,231 @@ mod tests {
         let want = center_for(859_962_500) as u32;
         assert!(wait_for(Duration::from_secs(20), || tunes.lock().unwrap().contains(&want)), "tunes {:?}", tunes.lock().unwrap());
         assert!(wait_for(Duration::from_secs(1), || rx.status(id).unwrap().control_hz == Some(859_962_500)));
+    }
+
+    /// A fake SDR: blocks of zeros (empty ones when `silent`) until `end` is set, then None (unplugged).
+    struct Fake { id: String, rate: u32, silent: bool, probe: Probe }
+    impl IqSource for Fake {
+        fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> {
+            if self.probe.end.load(Ordering::SeqCst) { return None; }
+            *self.probe.reads.lock().unwrap().entry(self.id.clone()).or_default() += 1;
+            Some(if self.silent { Vec::new() } else { vec![0; 2 * 4_096] })
+        }
+        fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
+        fn dropped(&self) -> u64 { 0 }
+        fn rate_hz(&self) -> u32 { self.rate }
+    }
+    impl Drop for Fake { fn drop(&mut self) { self.probe.open.fetch_sub(1, Ordering::SeqCst); } }
+
+    /// What the fakes saw: open sources, reads per tuner, calls of `list`; `end` unplugs every open source.
+    #[derive(Clone, Default)]
+    struct Probe { open: Arc<AtomicUsize>, end: Arc<AtomicBool>, reads: Arc<Mutex<BTreeMap<String, usize>>>, lists: Arc<AtomicUsize> }
+    impl Probe { fn reads(&self, id: &str) -> usize { self.reads.lock().unwrap().get(id).copied().unwrap_or(0) } }
+
+    /// Fake SDRs `list`; those in `silent` deliver only empty blocks.
+    fn fakes(list: &[&str], silent: &[&str]) -> (Sdrs, Probe) {
+        let probe = Probe::default();
+        let (list, silent): (Vec<String>, Vec<String>) = (list.iter().map(|s| s.to_string()).collect(), silent.iter().map(|s| s.to_string()).collect());
+        let (p, q) = (probe.clone(), probe.clone());
+        let sdrs = Sdrs {
+            list: Arc::new(move || { p.lists.fetch_add(1, Ordering::SeqCst); list.clone() }),
+            open: Arc::new(move |_, _, id| {
+                q.open.fetch_add(1, Ordering::SeqCst);
+                let rate = if id.starts_with("rtl:") { 2_400_000 } else { 3_000_000 };
+                Ok(Box::new(Fake { id: id.into(), rate, silent: silent.iter().any(|s| s == id), probe: q.clone() }) as Box<dyn IqSource>)
+            }),
+        };
+        (sdrs, probe)
+    }
+
+    /// A system on RTL-SDR 1 whose known voice frequencies need a helper (RTL-SDR 2), running with it.
+    fn with_helper(db: &Db, rx: &Receivers) -> i64 {
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        db.add_voice_freqs(id, &[859_000_000, 862_500_000, 863_000_000]).unwrap();
+        rx.restart_all(db);
+        assert!(wait_for(Duration::from_secs(2), || rx.status(id).is_some_and(|s| s.helpers.iter().any(|h| h.0 == RTL2))), "{:?}", rx.status(id));
+        id
+    }
+
+    #[test]
+    fn main_source_end_is_an_error_and_retried() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, probe) = fakes(&[RTL1], &[]);
+        let id = db.save_system(&sys("SGCo", "")).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        rx.rescan(&db);
+        probe.end.store(true, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "error"), "{:?}", rx.status(id));
+        assert!(rx.status(id).unwrap().error.unwrap().contains("stopped delivering samples"));
+        probe.end.store(false, Ordering::SeqCst);
+        rx.rescan(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"), "the SDR is there and free: retried {:?}", rx.status(id));
+        assert_eq!(probe.open.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn helper_switched_to_setup_is_released() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        db.save_tuner(RTL2, &TunerConfig { mode: TunerMode::Setup, center_hz: Some(863_000_000), ..TunerConfig::default() }).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(wait_for(Duration::from_secs(2), || rx.setup_status(RTL2).is_some_and(|s| s.state == "running")), "{:?}", rx.setup_status(RTL2));
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.status(id).unwrap().helpers.is_empty(), "a Setup tuner is never a helper");
+    }
+
+    #[test]
+    fn newly_pinned_helper_goes_to_its_system() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let a = with_helper(&db, &rx);
+        let b = db.save_system(&sys("KSICS", RTL2)).unwrap();
+        rx.apply(&db, b);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, b) == "running"), "{:?}", rx.status(b));
+        assert_eq!(rx.status(b).unwrap().tuner.as_deref(), Some(RTL2));
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, a) == "running"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.status(a).unwrap().helpers.is_empty(), "a pinned tuner is never a helper");
+    }
+
+    #[test]
+    fn tuner_freed_without_a_device_change_retries_a_waiting_system() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1], &[]);
+        let rx = Receivers::new(sdrs);
+        // Held as another system's helper.
+        rx.claimed.lock().unwrap().insert(RTL1.into());
+        let id = db.save_system(&sys("SGCo", "")).unwrap();
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "error"));
+        rx.rescan(&db);
+        rx.claimed.lock().unwrap().remove(RTL1);
+        rx.rescan(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"), "{:?}", rx.status(id));
+    }
+
+    #[test]
+    fn stopping_a_system_releases_its_helpers() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, probe) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        assert_eq!(probe.open.load(Ordering::SeqCst), 2);
+        db.delete_system(id).unwrap();
+        rx.apply(&db, id);
+        assert!(rx.claimed.lock().unwrap().is_empty(), "every claim dropped");
+        assert_eq!(probe.open.load(Ordering::SeqCst), 0, "every source closed");
+    }
+
+    #[test]
+    fn silent_main_does_not_stall_helpers() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, probe) = fakes(&[RTL1, RTL2], &[RTL1]);
+        let rx = Receivers::new(sdrs);
+        let id = with_helper(&db, &rx);
+        let before = probe.reads(RTL2);
+        assert!(wait_for(Duration::from_secs(2), || probe.reads(RTL2) > before + 20), "the helper keeps being read: {} then {}", before, probe.reads(RTL2));
+        let view = rx.tuner_view(RTL2).expect("the helper's spectrum");
+        view.lock().unwrap().watch_until_ms = now_ms() + 5000;
+        assert!(wait_for(Duration::from_secs(2), || view.lock().unwrap().frame.is_some()), "its samples are decoded and drawn");
+        assert_eq!(state(&rx, id), "running");
+    }
+
+    #[test]
+    fn helper_search_reads_the_cached_device_list() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, probe) = fakes(&[RTL1], &[]);
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        db.add_voice_freqs(id, &[863_000_000]).unwrap();
+        let rx = Receivers::new(sdrs);
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(probe.lists.load(Ordering::SeqCst), 2, "start-up and the main tuner's pick; looking for a helper uses the last scan");
+    }
+
+    #[test]
+    fn locked_helper_missing_the_call_is_never_opened() {
+        let mut rig = Rig::new(&[], false);
+        rig.cfg = TunerConfig { center_hz: Some(860_000_000), ..TunerConfig::default() };
+        rig.open(851_600_000).unwrap();
+        let e = rig.open(853_950_000).unwrap_err();
+        assert!(e.contains("cannot cover"), "{e}");
+        assert!(rig.opens.lock().unwrap().is_empty() && !rig.claims(RTL2), "not opened, not claimed");
+    }
+
+    #[test]
+    fn stalled_airspy_ends() {
+        use std::sync::mpsc::RecvTimeoutError;
+        assert_eq!(block_or_end(Ok(vec![1, 2]), || unreachable!()), Some(vec![1, 2]));
+        assert_eq!(block_or_end(Err(RecvTimeoutError::Timeout), || true), Some(Vec::new()), "streaming: just quiet");
+        assert_eq!(block_or_end(Err(RecvTimeoutError::Timeout), || false), None, "stopped streaming (unplugged): the source ends");
+        assert_eq!(block_or_end(Err(RecvTimeoutError::Disconnected), || true), None);
+    }
+
+    #[test]
+    fn helper_spectrum_asks_for_calls_only_when_drawn() {
+        let mut rig = Rig::new(&[], false);
+        rig.open(851_600_000).unwrap();
+        rig.open(853_950_000).unwrap();
+        let asked = AtomicUsize::new(0);
+        let following = || { asked.fetch_add(1, Ordering::SeqCst); Vec::new() };
+        rig.helpers[0].last = vec![0; 2 * SPECTRUM_FFT];
+        draw_helpers(&mut rig.helpers, following, 1_000);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "nobody watching");
+        rig.helpers[0].view.lock().unwrap().watch_until_ms = 5_000;
+        rig.helpers[0].last = vec![0; 2 * SPECTRUM_FFT];
+        draw_helpers(&mut rig.helpers, following, 1_000);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn helper_choice_follows_saved_settings() {
+        let db = Db::open_in_memory().unwrap();
+        let (sdrs, _) = fakes(&[RTL1, RTL2], &[]);
+        let rx = Receivers::new(sdrs);
+        let id = db.save_system(&sys("SGCo", RTL1)).unwrap();
+        rx.restart_all(&db);
+        assert!(wait_for(Duration::from_secs(2), || state(&rx, id) == "running"));
+        let free = || rx.pool.lock().unwrap().free(&rx.claimed, id);
+        assert_eq!(free(), vec![RTL2.to_string()]);
+        db.save_tuner(RTL2, &TunerConfig { mode: TunerMode::Disabled, ..TunerConfig::default() }).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        assert!(free().is_empty(), "switched off: no longer a helper");
+        db.save_tuner(RTL2, &TunerConfig::default()).unwrap();
+        rx.apply_tuner(&db, RTL2);
+        let other = db.save_system(&System { enabled: false, ..sys("KSICS", RTL2) }).unwrap();
+        rx.apply(&db, other);
+        assert_eq!(free(), vec![RTL2.to_string()], "pinned to a disabled system: still free");
+        db.save_system(&System { id: other, ..sys("KSICS", RTL2) }).unwrap();
+        rx.apply(&db, other);
+        assert!(rx.pool.lock().unwrap().reserved(id).contains(&RTL2.to_string()), "pinned to an enabled system");
+        assert!(!free().contains(&RTL2.to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn expected_rtl_rate_is_the_driver_rate() {
+        assert_eq!(expected_rate(RTL1, &TunerConfig::default()), sdrtrunk_source::rtlsdr::RATE_HZ);
+        assert_eq!(expected_rate(A, &TunerConfig { rate_hz: 3_000_000, ..TunerConfig::default() }), 3_000_000);
+    }
+
+    #[test]
+    fn failing_covering_helper_falls_through() {
+        let mut rig = Rig::new(&[], false);
+        rig.present.push("rtl:00000003".into());
+        rig.open(851_600_000).unwrap();
+        rig.open(853_950_000).unwrap();
+        // Its window claims 857.2 MHz but its channels sit around 853.9 MHz: adding a channel there fails.
+        rig.helpers[0].win = rig.helpers[0].win.at(857_000_000);
+        assert!(rig.helpers[0].win.covers(857_200_000));
+        let id = rig.open(857_200_000).expect("another tuner takes it");
+        assert_eq!((id, rig.helpers.len()), (2 << 24, 2), "RTL-SDR 3");
     }
 }

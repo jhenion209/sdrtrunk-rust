@@ -33,6 +33,7 @@ extern "C" {
     fn airspy_set_linearity_gain(device: *mut Device, value: u8) -> c_int;
     fn airspy_start_rx(device: *mut Device, cb: extern "C" fn(*mut Transfer) -> c_int, ctx: *mut c_void) -> c_int;
     fn airspy_stop_rx(device: *mut Device) -> c_int;
+    fn airspy_is_streaming(device: *mut Device) -> c_int;
 }
 
 struct Ctx {
@@ -111,6 +112,13 @@ impl Airspy {
             check("airspy_start_rx", airspy_start_rx(dev, on_samples, ctx as *mut c_void))?;
             Ok(me)
         }
+    }
+
+    /// False once streaming stopped, e.g. the device was unplugged (libairspy stops on a failed USB transfer; the
+    /// sample channel stays open, so only this shows it).
+    pub fn is_streaming(&self) -> bool {
+        // SAFETY: valid open handle; only reads the device's streaming flags.
+        unsafe { airspy_is_streaming(self.dev) == 1 }
     }
 
     pub fn set_frequency(&self, freq_hz: u32) -> Result<(), AirspyError> {

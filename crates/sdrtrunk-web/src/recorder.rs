@@ -170,6 +170,15 @@ impl Recorder {
         if self.chans.remove(&id).is_some() { tuner.close(id); }
     }
 
+    /// Forgets voice channel `id` without closing it (its tuner is gone): the transmission ends as at a `VoiceEnd`, and
+    /// the next grant on its frequency opens a fresh channel.
+    pub fn drop_channel(&mut self, id: u32) {
+        // `finish` reads the channel's grant, so remove it only afterwards (as `release` does).
+        let seg = self.chans.get_mut(&id).and_then(|c| c.seg.take());
+        self.finish(id, seg);
+        self.chans.remove(&id);
+    }
+
     fn error(&mut self, msg: String) {
         eprintln!("recorder: {msg}");
         self.last_error = Some(msg);
@@ -278,6 +287,29 @@ mod tests {
         assert!(text.contains("27\"Jail 1\"") && text.contains("Frequency:858737500;") && text.contains("Channel:0-4016;"), "{}", &text[..300]);
         assert!(text.contains("System:Sedgwick County;Site:Simulcast;Name:T-Control;Decoder:P25 Phase 1;"));
         assert!(t.closed.is_empty(), "channel kept for a rekey");
+    }
+
+    #[test]
+    fn dropped_channel_forgotten() {
+        let (mut r, mut t) = (Recorder::new(&dir("dropped"), names(), Arc::default()), FakeTuner::default());
+        r.handle(&grant(1, 859_962_500), 0, &mut t);
+        r.handle(&ldu1(None), 10, &mut t);
+        r.drop_channel(1);
+        assert!(r.following().is_empty() && t.closed.is_empty(), "forgotten without closing (its tuner is gone)");
+        r.handle(&grant(1, 859_962_500), 100, &mut t);
+        assert_eq!(t.open, vec![(1, 859_962_500), (2, 859_962_500)], "the next grant opens a fresh channel");
+    }
+
+    #[test]
+    fn dropped_channel_with_audio_written() {
+        let d = dir("dropped-audio");
+        let (mut r, mut t) = (Recorder::new(&d, names(), Arc::default()), FakeTuner::default());
+        r.handle(&grant(27, 858_737_500), 1_000, &mut t);
+        r.handle(&ldu1(Some(lc(27, 711_013, 0x04))), 1_100, &mut t);
+        r.handle(&ldu2(Some(ess(0x80))), 1_280, &mut t);
+        r.drop_channel(1);
+        assert_eq!((r.recorded, files(&d).len()), (1, 1), "the clear call in progress is written");
+        assert!(r.following().is_empty() && t.closed.is_empty());
     }
 
     #[test]

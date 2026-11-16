@@ -49,6 +49,13 @@ pub(crate) fn rows(st: &AppState) -> Vec<Row> {
         let config = configured.iter().find(|(t, _)| *t == id).map(|(_, c)| c.clone()).unwrap_or_default();
         let user = users.iter().find(|(_, s)| s.tuner.as_deref() == Some(id.as_str()))
             .map(|(sys, s)| (systems.iter().find(|x| x.id == *sys).map(|x| x.label()).unwrap_or_default(), s.clone()))
+            .or_else(|| users.iter().find_map(|(sys, s)| {
+                let i = s.helpers.iter().position(|(t, _)| *t == id)?;
+                let (rate_hz, usable_hz) = s.helper_bands.get(i).copied().unwrap_or_default();
+                let label = systems.iter().find(|x| x.id == *sys).map(|x| x.label()).unwrap_or_default();
+                Some((format!("{label} (helper)"), Status { state: s.state.clone(), tuner: Some(id.clone()), center_hz: Some(s.helpers[i].1),
+                    rate_hz, usable_hz, ppm: config.ppm, ..Status::default() }))
+            }))
             .or_else(|| st.receivers.setup_status(&id).map(|s| ("Setup mode".to_string(), s)));
         Row { connected: devices.contains(&id), id, config, user }
     }).collect()
@@ -261,7 +268,8 @@ pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Pa
 pub async fn spectrum_page(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<String>) -> Response {
     if !valid(&id) { return (StatusCode::NOT_FOUND, "No such tuner.").into_response(); }
     let user = st.receivers.on_tuner(&id).map(|r| format!("Used by {}.", r.system.label()))
-        .or_else(|| st.receivers.setup_status(&id).map(|s| format!("Setup mode at {}.", tuned_to(&s).unwrap_or_default())));
+        .or_else(|| st.receivers.setup_status(&id).map(|s| format!("Setup mode at {}.", tuned_to(&s).unwrap_or_default())))
+        .or_else(|| rows(&st).into_iter().find(|r| r.id == id).and_then(|r| r.user).map(|(label, _)| format!("Used by {label}.")));
     let head = Head {
         subtitle: Some(html! { (user.as_deref().unwrap_or("Not in use.")) }),
         actions: Some(html! { a.button.quiet href={ "/tuners/" (id) } { "Settings" } }),

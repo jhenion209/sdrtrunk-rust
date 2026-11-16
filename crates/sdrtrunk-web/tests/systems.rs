@@ -29,6 +29,12 @@ async fn wait_opens(opens: &AtomicUsize, n: usize) -> bool {
     false
 }
 
+/// Waits up to 5 s for tuner `serial` to be opened.
+async fn wait_opened(serials: &Mutex<Vec<String>>, serial: &str) -> bool {
+    for _ in 0..500 { if serials.lock().unwrap().iter().any(|s| s == serial) { return true; } tokio::time::sleep(Duration::from_millis(10)).await; }
+    false
+}
+
 fn form<'a>(csrf: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
     let mut f = vec![("csrf", csrf), ("enabled", "on"), ("system_name", "KSICS"), ("site_name", "KSICS-Sedgwick"),
         ("channel_name", "T-KSICS-Wichita"), ("primary", "852.1125"), ("backups", "852.4125"), ("failover_ms", "1000"),
@@ -51,8 +57,8 @@ async fn add_edit_delete_system() {
     let k = st.db.systems().into_iter().find(|s| s.system_name == "KSICS").unwrap();
     assert_eq!((k.control_hz.clone(), k.modulation.as_str(), k.tuner.as_str()), (vec![852_112_500, 852_412_500], "c4fm", B),
         "serial stored in sdrtrunk's form");
-    assert!(wait_opens(&opens, 2).await, "the new system started");
-    assert!(serials.lock().unwrap().contains(&B.to_string()), "pinned tuner opened");
+    // Not an open count: saving also retries system 1 (its open failed), and the two decoder threads open in either order.
+    assert!(wait_opened(&serials, B).await, "the new system started on its pinned tuner");
     assert_eq!(st.db.audit_log(1)[0].action, "added system KSICS / T-KSICS-Wichita");
     let list = send(&st, "GET", "/systems", c, &[]).await.body;
     assert!(list.contains("KSICS / T-KSICS-Wichita") && list.contains("P25 / Control") && list.contains("C4FM"), "{list}");
@@ -209,7 +215,7 @@ async fn system_uses_chosen_alias_list() {
 
 struct Zeros;
 impl sdrtrunk_web::receiver::IqSource for Zeros {
-    fn next_block(&mut self) -> Option<Vec<i16>> { std::thread::sleep(Duration::from_millis(5)); Some(vec![0; 2 * 32_768]) }
+    fn next_block(&mut self, _wait: Duration) -> Option<Vec<i16>> { std::thread::sleep(Duration::from_millis(5)); Some(vec![0; 2 * 32_768]) }
     fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
     fn dropped(&self) -> u64 { 0 }
     fn rate_hz(&self) -> u32 { 3_000_000 }
@@ -300,4 +306,40 @@ async fn signal_page_history_and_symbols() {
     assert!(seen.contains("event: frame") && seen.contains("\"center_hz\":858962500") && seen.contains("\"rate_hz\":50000"), "{seen}");
     assert_eq!(send(&st, "GET", "/systems/9/signal", c, &[]).await.status, StatusCode::NOT_FOUND);
     assert_eq!(send(&st, "GET", "/systems/1/signal.csv", None, &[]).await.status, StatusCode::SEE_OTHER, "login required");
+}
+
+#[tokio::test]
+async fn helper_tuner_on_the_pages() {
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let st = state_with(Sdrs { list: Arc::new(|| vec![A.into(), B.into()]), open: Arc::new(|_, _, _| Ok(Box::new(Zeros) as Box<dyn sdrtrunk_web::receiver::IqSource>)) });
+    // A voice frequency far outside the main window, known before the system starts: the start-up helper takes the second tuner.
+    st.db.add_voice_freqs(1, &[870_000_000]).unwrap();
+    st.receivers.restart_all(&st.db);
+    let (cookie, _) = login_as(&st, "owner", Role::Owner);
+    let c = Some(cookie.as_str());
+    for _ in 0..300 { if st.receivers.status(1).is_some_and(|s| !s.helpers.is_empty()) { break; } tokio::time::sleep(Duration::from_millis(10)).await; }
+    let s = st.receivers.status(1).unwrap();
+    assert_eq!(s.helpers.len(), 1, "{s:?}");
+    let (helper, centre) = s.helpers[0].clone();
+
+    let list = send(&st, "GET", "/tuners", c, &[]).await.body;
+    assert!(list.contains("(helper)") && list.contains(&format!("/tuners/{helper}/spectrum")), "{list}");
+    let dash = send(&st, "GET", "/", c, &[]).await.body;
+    assert!(dash.contains("Helper tuners") && dash.contains(&format!("{:.4} MHz", centre as f64 / 1e6)), "{dash}");
+    let page = send(&st, "GET", &format!("/tuners/{helper}/spectrum"), c, &[]).await.body;
+    assert!(page.contains("(helper)"), "{page}");
+
+    let req = Request::get(format!("/tuners/{helper}/spectrum/events")).header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+    let mut body = sdrtrunk_web::app::router(st.clone()).oneshot(req).await.unwrap().into_body();
+    let mut seen = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(Ok(f)) = body.frame().await {
+            if let Some(d) = f.data_ref() { seen.push_str(&String::from_utf8_lossy(d)); }
+            if seen.contains("event: frame") { break; }
+        }
+    }).await;
+    assert!(seen.contains("event: frame") && seen.contains(&format!("\"center_hz\":{centre}")), "{seen}");
 }

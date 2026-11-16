@@ -49,6 +49,12 @@ fn readouts_of(st: &AppState, id: i64, status: &Status) -> Readouts {
     }
 }
 
+/// "none", or each helper tuner with where it sits: "Airspy 735863DC-2F67AFE3 at 862.5000 MHz".
+fn helpers_text(status: &Status) -> String {
+    if status.helpers.is_empty() { return "none".into(); }
+    status.helpers.iter().map(|(t, hz)| format!("{} at {} MHz", sdrtrunk_source::tuner_label(t), mhz(*hz))).collect::<Vec<_>>().join(", ")
+}
+
 fn site_text(status: &Status) -> String {
     status.site.map_or("not decoded yet".into(), |(nac, wacn, system)| format!("NAC {nac:03X}, WACN {wacn:05X}, system {system:03X}"))
 }
@@ -98,6 +104,7 @@ fn system_panel(st: &AppState, sys: &crate::db::System, now: i64) -> Markup {
             dl.details {
                 dt { "Site" } dd id={ "site-" (id) } { (site_text(&status)) }
                 dt { "Tuner" } dd id={ "tuner-" (id) } { (status.tuner.as_deref().map(sdrtrunk_source::tuner_label).unwrap_or_else(|| NONE.into())) }
+                dt { "Helper tuners" } dd id={ "helpers-" (id) } { (helpers_text(&status)) }
                 dt { "Correction" } dd id={ "correction-" (id) } { (r.correction) }
                 dt { "Calls recorded" } dd id={ "recorded-" (id) } { (status.recorded) }
                 dt { "Dropped samples" } dd id={ "dropped-" (id) } { (status.dropped) }
@@ -171,7 +178,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed) -> Markup {
 struct CallJson<'a> { #[serde(flatten)] call: &'a CallEvent, name: Option<String> }
 
 #[derive(Serialize)]
-struct SystemStatusJson { id: i64, #[serde(flatten)] s: Status, uptime: String, site_text: String, #[serde(flatten)] readouts: Readouts }
+struct SystemStatusJson { id: i64, #[serde(flatten)] s: Status, uptime: String, site_text: String, helpers_text: String, #[serde(flatten)] readouts: Readouts }
 
 /// `status` every second (an array, one entry per system), `call` per grant. A slow page skips missed calls instead
 /// of stalling anything.
@@ -186,7 +193,7 @@ pub async fn events(State(st): State<AppState>, Authed(_, token): Authed) -> Sse
     let ticks = IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).filter_map(move |_| {
         let all: Vec<SystemStatusJson> = state.db.systems().iter().map(|sys| {
             let s = status_of(&state, sys.id);
-            SystemStatusJson { id: sys.id, uptime: uptime(&s), site_text: site_text(&s), readouts: readouts_of(&state, sys.id, &s), s }
+            SystemStatusJson { id: sys.id, uptime: uptime(&s), site_text: site_text(&s), helpers_text: helpers_text(&s), readouts: readouts_of(&state, sys.id, &s), s }
         }).collect();
         Event::default().event("status").json_data(all).ok()
     });

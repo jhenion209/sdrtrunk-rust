@@ -50,6 +50,7 @@
       f("signal", s.signal);
       f("decode", s.decode);
       f("freq", s.freq);
+      f("helpers", s.helpers_text);
       f("correction", s.correction);
       f("dropped", String(s.dropped));
       f("recorded", String(s.recorded));

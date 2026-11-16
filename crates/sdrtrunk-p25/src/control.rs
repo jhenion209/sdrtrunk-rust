@@ -300,6 +300,9 @@ impl VoiceBank {
 
     pub fn voice_count(&self) -> usize { self.voices.len() }
 
+    /// Ids of the voice channels being decoded.
+    pub fn voice_ids(&self) -> Vec<u32> { self.voices.iter().map(|(id, _)| *id).collect() }
+
     /// The tuner moved to `center_hz`: every voice channel is set up again at its new place in the band (frames in
     /// progress are lost). On error (a channel would fall outside) nothing changes.
     pub fn set_center(&mut self, center_hz: f64) -> Result<(), String> {
@@ -444,6 +447,7 @@ impl ControlChannel {
     pub fn remove_voice(&mut self, id: u32) { self.voices.remove_voice(id); }
 
     pub fn voice_count(&self) -> usize { self.voices.voice_count() }
+    pub fn voice_ids(&self) -> Vec<u32> { self.voices.voice_ids() }
 
     /// Interleaved int16 IQ, scaled /2048 inside. Events go to `sink`.
     pub fn process(&mut self, iq: &[i16], sink: &mut dyn FnMut(ControlEvent)) {
