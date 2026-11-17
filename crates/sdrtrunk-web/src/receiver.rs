@@ -152,7 +152,6 @@ pub fn sdrs() -> Sdrs {
 /// What `next_block` gives for one receive: the block; an empty one when none came in time but the device still
 /// streams; None when the reader ended or the device stopped streaming (an unplugged Airspy keeps its channel open, so
 /// only `streaming` shows it; an RTL-SDR's reader ends).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn block_or_end(got: Result<Vec<i16>, std::sync::mpsc::RecvTimeoutError>, streaming: impl FnOnce() -> bool) -> Option<Vec<i16>> {
     use std::sync::mpsc::RecvTimeoutError;
     match got {
@@ -164,6 +163,145 @@ fn block_or_end(got: Result<Vec<i16>, std::sync::mpsc::RecvTimeoutError>, stream
 
 #[cfg(not(target_os = "linux"))]
 pub fn sdrs() -> Sdrs { Sdrs { list: Arc::new(Vec::new), open: Arc::new(|_, _, _| Err("SDRs are Linux only".into())) } }
+
+/// Records `seconds` of `src` into `w` (sdrtrunk's baseband WAV); returns the complex samples written and those the
+/// source dropped. The file is finished whatever happens, so a recording cut short is still a valid WAV.
+fn record_baseband<S: Sink>(src: &mut dyn IqSource, seconds: u32, w: S) -> Result<(u64, u64), String> {
+    too_long(seconds, src.rate_hz())?;
+    let (result, w) = record_to(src, seconds, w);
+    // Counted now: the tuner keeps streaming, unread, while the file is flushed (seconds on an SD card).
+    let dropped = src.dropped();
+    let written = w.finish().map_err(|e| e.to_string())?;
+    result.map(|_| (written, dropped))
+}
+
+/// The largest WAV sdrtrunk writes or plays as one file (the Java reference's `WaveWriter.MAX_WAVE_SIZE`).
+const MAX_WAV_BYTES: u64 = 2 * i32::MAX as u64;
+
+/// Most whole seconds one recording can hold at `rate_hz` (4 bytes per complex sample, 44-byte header).
+pub fn max_record_seconds(rate_hz: u32) -> u32 { ((MAX_WAV_BYTES - 44) / (rate_hz as u64 * 4)) as u32 }
+
+fn too_long(seconds: u32, rate_hz: u32) -> Result<(), String> {
+    let max = max_record_seconds(rate_hz);
+    if seconds <= max { Ok(()) } else {
+        Err(format!("one recording holds at most {max} s at {rate_hz} samples/s (sdrtrunk plays WAV files up to 4 GB)"))
+    }
+}
+
+/// Where a recording goes: samples on the writer thread, then the final flush. A WAV file, or a stand-in in tests.
+trait Sink: Send + 'static {
+    fn put(&mut self, iq: &[i16]) -> std::io::Result<()>;
+    /// Completes the recording; returns the complex samples it holds.
+    fn finish(self) -> std::io::Result<u64>;
+}
+
+impl Sink for sdrtrunk_source::wav::WavWriter {
+    fn put(&mut self, iq: &[i16]) -> std::io::Result<()> { self.write(iq) }
+    fn finish(self) -> std::io::Result<u64> { sdrtrunk_source::wav::WavWriter::finish(self) }
+}
+
+/// Blocks waiting for the disk: an SD card can stall for seconds, far longer than a tuner's own queue (64 blocks,
+/// under a second at 6 MS/s); 2048 Airspy blocks are about 23 s and 512 MB.
+const WRITE_QUEUE_BLOCKS: usize = 2048;
+
+/// Takes `seconds` of `src` and hands them to `sink` on a writer thread, so a slow disk never stops the tuner being
+/// read. Returns the samples taken (or why it stopped) and the sink.
+fn record_to<S: Sink>(src: &mut dyn IqSource, seconds: u32, sink: S) -> (Result<u64, String>, S) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<i16>>(WRITE_QUEUE_BLOCKS);
+    let writer = std::thread::spawn(move || {
+        let (mut sink, mut err) = (sink, None);
+        for b in rx {
+            if err.is_none() { err = sink.put(&b).err(); }
+        }
+        (sink, err)
+    });
+    let want = seconds as u64 * src.rate_hz() as u64;
+    let (mut have, mut last) = (0u64, Instant::now());
+    let read = loop {
+        if have >= want { break Ok(have); }
+        match src.next_block(Duration::from_millis(500)) {
+            None => break Err(format!("the tuner ended after {have} samples")),
+            Some(b) if b.is_empty() => {
+                if last.elapsed() > Duration::from_secs(5) { break Err(format!("no samples for 5 s after {have}")); }
+            }
+            Some(mut b) => {
+                b.truncate(((want - have) as usize * 2).min(b.len() / 2 * 2));
+                have += b.len() as u64 / 2;
+                last = Instant::now();
+                if tx.send(b).is_err() { break Err("the writer stopped".into()); }
+            }
+        }
+    };
+    drop(tx);
+    let (sink, err) = writer.join().unwrap_or_else(|_| panic!("recording writer panicked"));
+    match (read, err) {
+        (Err(e), _) => (Err(e), sink),
+        (Ok(_), Some(e)) => (Err(e.to_string()), sink),
+        (Ok(n), None) => (Ok(n), sink),
+    }
+}
+
+/// `sdrtrunk-rust record`: opens SDR `id` with its saved settings from database `db` at `center` Hz and records `seconds`
+/// into `out` under sdrtrunk's baseband name. Returns the file, the samples written and the samples dropped.
+pub fn record_tuner(db: &Path, id: &str, center: u32, seconds: u32, out: &Path) -> Result<(std::path::PathBuf, u64, u64), String> {
+    let id = sdrtrunk_source::normalize_tuner(id).ok_or_else(|| format!("{id} is not an SDR id"))?;
+    let cfg = Db::open(db).map_err(|e| format!("{}: {e}", db.display()))?.tuner(&id);
+    let mut src = (sdrs().open)(&cfg, center, &id)?;
+    too_long(seconds, src.rate_hz())?;
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let name = sdrtrunk_source::wav::baseband_file_name(&sdrtrunk_source::tuner_label(&id).replace(' ', "_"), center, &stamp);
+    let path = out.join(name);
+    let w = sdrtrunk_source::wav::WavWriter::create(&path, src.rate_hz()).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (written, dropped) = record_baseband(src.as_mut(), seconds, w)?;
+    Ok((path, written, dropped))
+}
+
+/// The baseband recordings in `dir` (sdrtrunk's `NAME_HZ_baseband_yyyyMMdd_HHmmss.wav`) as tuners "file:NAME", played
+/// in real time and looping. A recording only opens and tunes at the centre it was recorded at.
+pub fn replay_sdrs(dir: &Path) -> Result<Sdrs, String> {
+    use sdrtrunk_source::{replay::Replay, wav::center_from_name, FILE_PREFIX};
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut files: BTreeMap<String, (std::path::PathBuf, u32)> = BTreeMap::new();
+    for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(center) = center_from_name(name) else { continue };
+        let stem = &name[..name.len() - 4];
+        files.insert(format!("{FILE_PREFIX}{stem}"), (path.clone(), center));
+    }
+    if files.is_empty() { return Err(format!("{}: no baseband recordings (NAME_HZ_baseband_yyyyMMdd_HHmmss.wav)", dir.display())); }
+    struct Playing { r: Replay, label: String }
+    fn at_centre(label: &str, recorded: u32, asked: u32) -> Result<(), String> {
+        if asked == recorded { Ok(()) } else { Err(format!("{label} was recorded at {recorded} Hz; it cannot tune to {asked} Hz")) }
+    }
+    impl IqSource for Playing {
+        fn next_block(&mut self, wait: Duration) -> Option<Vec<i16>> {
+            let got = if wait.is_zero() {
+                self.r.blocks.try_recv().map_err(|e| match e {
+                    std::sync::mpsc::TryRecvError::Empty => std::sync::mpsc::RecvTimeoutError::Timeout,
+                    std::sync::mpsc::TryRecvError::Disconnected => std::sync::mpsc::RecvTimeoutError::Disconnected,
+                })
+            } else {
+                self.r.blocks.recv_timeout(wait)
+            };
+            block_or_end(got, || true)
+        }
+        fn tune(&mut self, center_hz: u32) -> Result<(), String> { at_centre(&self.label, self.r.center_hz, center_hz) }
+        fn dropped(&self) -> u64 { self.r.dropped.load(AtomicOrdering::Relaxed) }
+        fn rate_hz(&self) -> u32 { self.r.rate_hz }
+    }
+    let files = Arc::new(files);
+    let ids: Vec<String> = files.keys().cloned().collect();
+    Ok(Sdrs {
+        list: Arc::new(move || ids.clone()),
+        open: Arc::new(move |_: &TunerConfig, center: u32, id: &str| {
+            let label = sdrtrunk_source::tuner_label(id);
+            let (path, recorded) = files.get(id).ok_or_else(|| format!("{label} not found"))?;
+            at_centre(&label, *recorded, center)?;
+            let r = Replay::open(path).map_err(|e| format!("{label}: {e}"))?;
+            Ok(Box::new(Playing { r, label }) as Box<dyn IqSource>)
+        }),
+    })
+}
 
 /// Which tuner a system gets. `want` is its pinned tuner id or "" for Automatic; `claimed` are in use by running
 /// systems; `reserved` are pinned by the other enabled systems (Automatic never takes those).
@@ -2142,5 +2280,139 @@ mod tests {
         assert!(rig.helpers[0].win.covers(857_200_000));
         let id = rig.open(857_200_000).expect("another tuner takes it");
         assert_eq!((id, rig.helpers.len()), (2 << 24, 2), "RTL-SDR 3");
+    }
+
+    const REC: &str = "a_851012500_baseband_20261116_120000";
+
+    /// A folder with one 48 kHz recording named `REC`, plus files replay must ignore.
+    fn replay_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("replay_sdrs_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut w = sdrtrunk_source::wav::WavWriter::create(&d.join(format!("{REC}.wav")), 48_000).unwrap();
+        w.write(&vec![1i16; 9_600]).unwrap();
+        w.finish().unwrap();
+        std::fs::write(d.join("notes.txt"), "x").unwrap();
+        std::fs::write(d.join("b_baseband.wav"), "x").unwrap();
+        d
+    }
+
+    #[test]
+    fn replay_lists_recordings() {
+        let sdrs = replay_sdrs(&replay_dir("list")).unwrap();
+        assert_eq!((sdrs.list)(), vec![format!("file:{REC}")]);
+    }
+
+    #[test]
+    fn replay_opens_only_at_recorded_centre() {
+        let sdrs = replay_sdrs(&replay_dir("open")).unwrap();
+        let id = format!("file:{REC}");
+        let e = (sdrs.open)(&TunerConfig::default(), 851_000_000, &id).err().unwrap();
+        assert!(e.contains("851012500") && e.contains("851000000"), "{e}");
+        let mut src = (sdrs.open)(&TunerConfig::default(), 851_012_500, &id).unwrap();
+        assert_eq!(src.rate_hz(), 48_000);
+        assert!(src.next_block(Duration::from_millis(100)).is_some_and(|b| !b.is_empty()));
+        assert!(src.tune(851_012_500).is_ok());
+        assert!(src.tune(852_000_000).is_err());
+        assert!((sdrs.open)(&TunerConfig::default(), 851_012_500, "file:other").is_err());
+    }
+
+    /// Delivers 1 000-sample blocks at 48 kHz; ends after `blocks` of them when set.
+    struct Steady { left: Option<usize> }
+    impl IqSource for Steady {
+        fn next_block(&mut self, _: Duration) -> Option<Vec<i16>> {
+            if let Some(n) = self.left.as_mut() { if *n == 0 { return None; } *n -= 1; }
+            Some(vec![5i16; 2_000])
+        }
+        fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
+        fn dropped(&self) -> u64 { 0 }
+        fn rate_hz(&self) -> u32 { 48_000 }
+    }
+
+    fn rec_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("record_{tag}_{}.wav", std::process::id()))
+    }
+
+    #[test]
+    fn records_exact_length() {
+        let p = rec_path("exact");
+        let w = sdrtrunk_source::wav::WavWriter::create(&p, 48_000).unwrap();
+        assert_eq!(record_baseband(&mut Steady { left: None }, 1, w), Ok((48_000, 0)));
+        let info = sdrtrunk_source::wav::read_header(&mut std::fs::File::open(&p).unwrap()).unwrap();
+        assert_eq!(info.data_len, 192_000);
+    }
+
+    /// A sink that stalls 20 ms on every block, like an SD card flushing.
+    struct Slow(usize);
+    impl Sink for Slow {
+        fn put(&mut self, iq: &[i16]) -> std::io::Result<()> { std::thread::sleep(Duration::from_millis(20)); self.0 += iq.len() / 2; Ok(()) }
+        fn finish(self) -> std::io::Result<u64> { Ok(self.0 as u64) }
+    }
+
+    /// Steady, remembering when each block was taken.
+    struct Timed { taken: Vec<Instant> }
+    impl IqSource for Timed {
+        fn next_block(&mut self, _: Duration) -> Option<Vec<i16>> { self.taken.push(Instant::now()); Some(vec![5i16; 2_000]) }
+        fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
+        fn dropped(&self) -> u64 { 0 }
+        fn rate_hz(&self) -> u32 { 48_000 }
+    }
+
+    /// A sink whose `finish` (the file's final flush) raises `done`; the source reports drops only after that.
+    struct Flushing(Arc<AtomicBool>);
+    impl Sink for Flushing {
+        fn put(&mut self, _: &[i16]) -> std::io::Result<()> { Ok(()) }
+        fn finish(self) -> std::io::Result<u64> { self.0.store(true, Ordering::SeqCst); Ok(48_000) }
+    }
+    struct DropsLater(Arc<AtomicBool>);
+    impl IqSource for DropsLater {
+        fn next_block(&mut self, _: Duration) -> Option<Vec<i16>> { Some(vec![5i16; 2_000]) }
+        fn tune(&mut self, _: u32) -> Result<(), String> { Ok(()) }
+        fn dropped(&self) -> u64 { if self.0.load(Ordering::SeqCst) { 999 } else { 0 } }
+        fn rate_hz(&self) -> u32 { 48_000 }
+    }
+
+    #[test]
+    fn refuses_a_wav_too_big_for_sdrtrunk() {
+        // 48 kHz x 4 bytes: 22 369 s is the most one WAV sdrtrunk plays can hold (4 294 967 294 bytes).
+        let e = record_baseband(&mut Steady { left: None }, 22_370, Slow(0)).unwrap_err();
+        assert!(e.contains("22369"), "{e}");
+        assert_eq!(max_record_seconds(6_000_000), 178);
+    }
+
+    #[test]
+    fn drops_after_the_recording_do_not_count() {
+        let done = Arc::new(AtomicBool::new(false));
+        let r = record_baseband(&mut DropsLater(done.clone()), 1, Flushing(done));
+        assert_eq!(r, Ok((48_000, 0)), "the tuner keeps streaming while the file is flushed; those drops are not the recording's");
+    }
+
+    #[test]
+    fn slow_disk_does_not_hold_up_the_tuner() {
+        let mut src = Timed { taken: Vec::new() };
+        let (got, sink) = record_to(&mut src, 1, Slow(0));
+        assert_eq!((got, sink.0), (Ok(48_000), 48_000), "every sample still written");
+        let span = *src.taken.last().unwrap() - src.taken[0];
+        assert!(span < Duration::from_millis(300), "48 blocks taken in {span:?}; a 20 ms write each would take ~1 s");
+    }
+
+    #[test]
+    fn device_end_keeps_a_valid_file() {
+        let p = rec_path("ended");
+        let w = sdrtrunk_source::wav::WavWriter::create(&p, 48_000).unwrap();
+        let e = record_baseband(&mut Steady { left: Some(5) }, 1, w).unwrap_err();
+        assert!(e.contains("ended"), "{e}");
+        let info = sdrtrunk_source::wav::read_header(&mut std::fs::File::open(&p).unwrap()).unwrap();
+        assert_eq!(info.data_len, 5 * 4_000);
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize, bytes.len() - 8);
+    }
+
+    #[test]
+    fn replay_needs_a_recording() {
+        let empty = std::env::temp_dir().join(format!("replay_sdrs_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let e = replay_sdrs(&empty).err().unwrap();
+        assert!(e.contains(&empty.display().to_string()), "{e}");
+        assert!(replay_sdrs(&empty.join("missing")).is_err());
     }
 }

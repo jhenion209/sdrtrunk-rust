@@ -15,9 +15,11 @@ pub struct Window { pub center: i64, pub usable: i64, pub gap_half: i64, pub min
 
 impl Window {
     /// RTL-SDR: 98% of the sample rate, 5 kHz either side of the centre avoided; Airspy: 90%, no gap (the Java
-    /// reference's R8x and Airspy figures). No limit set: the whole range.
+    /// reference's R8x and Airspy figures). A recording (`file:`) keeps the window of the tuner it was made with: its
+    /// name starts with that tuner's label ("RTL-SDR_..." from `sdrtrunk-rust record`). No limit set: the whole range.
     pub fn for_tuner(id: &str, rate_hz: u32, center: i64, min_hz: Option<u64>, max_hz: Option<u64>) -> Window {
-        let (share, gap_half) = if id.starts_with("rtl:") { (0.98, 5_000) } else { (0.90, 0) };
+        let rtl = id.starts_with("rtl:") || id.starts_with("file:RTL-SDR_");
+        let (share, gap_half) = if rtl { (0.98, 5_000) } else { (0.90, 0) };
         Window {
             center, usable: (rate_hz as f64 * share) as i64, gap_half,
             min: min_hz.map_or(1, |m| m as i64), max: max_hz.map_or(i64::MAX / 2, |m| m as i64),
@@ -93,6 +95,14 @@ mod tests {
         assert_eq!((a.usable, a.gap_half), (5_400_000, 0));
         assert!(a.covers(859_000_000), "an Airspy has no centre gap");
         assert!(!a.covers(860_000_000) && !a.allowed(850_999_000), "frequency limits");
+    }
+
+    #[test]
+    fn recordings_keep_their_tuners_window() {
+        let r = Window::for_tuner("file:RTL-SDR_00000001_852730250_baseband_20261116_120000", 2_400_000, 852_730_250, None, None);
+        assert_eq!((r.usable, r.gap_half), (2_352_000, 5_000), "an RTL-SDR recording: RTL width and centre gap");
+        let a = Window::for_tuner("file:Airspy_35AC63DC-2D40B04F_858912500_baseband_20261116_120000", 6_000_000, 858_912_500, None, None);
+        assert_eq!((a.usable, a.gap_half), (5_400_000, 0));
     }
 
     #[test]

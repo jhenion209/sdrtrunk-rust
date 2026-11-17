@@ -21,18 +21,23 @@ fn num<T: std::str::FromStr>(name: &str, default: Option<T>) -> T {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
+    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
     std::process::exit(2)
 }
 
-/// `sdrtrunk-rust serve [--listen ADDR] [--db PATH] [--secure-cookies]`: web UI plus decoder.
+/// `sdrtrunk-rust serve [--listen ADDR] [--db PATH] [--secure-cookies] [--replay DIR]`: web UI plus decoder.
+/// `--replay DIR` uses the baseband recordings in DIR as tuners instead of the SDRs.
 fn serve() -> ! {
     let listen: std::net::SocketAddr = num("--listen", Some("0.0.0.0:8080".parse().unwrap()));
     let db = arg("--db").map(std::path::PathBuf::from).unwrap_or_else(default_db);
     let secure = std::env::args().any(|a| a == "--secure-cookies");
+    let sdrs = match arg("--replay") {
+        Some(dir) => sdrtrunk_web::receiver::replay_sdrs(std::path::Path::new(&dir)).unwrap_or_else(|e| die(&format!("replay: {e}"))),
+        None => sdrtrunk_web::receiver::sdrs(),
+    };
     eprintln!("database {}", db.display());
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(&format!("runtime: {e}")));
-    match rt.block_on(sdrtrunk_web::app::serve(db, listen, secure, sdrtrunk_web::receiver::sdrs())) {
+    match rt.block_on(sdrtrunk_web::app::serve(db, listen, secure, sdrs)) {
         Ok(()) => std::process::exit(0),
         Err(e) => die(&format!("serve: {e}")),
     }
@@ -47,8 +52,25 @@ fn default_db() -> std::path::PathBuf {
     if writable { path } else { "sdrtrunk-rust.db".into() }
 }
 
+/// `sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR`: one SDR's baseband to a WAV that
+/// sdrtrunk, sdrtrunk-vce and `serve --replay` can play.
+fn record() -> ! {
+    let db = arg("--db").map(std::path::PathBuf::from).unwrap_or_else(default_db);
+    let tuner = arg("--tuner").unwrap_or_else(|| die("missing --tuner"));
+    let (center, seconds): (u32, u32) = (num("--center", None), num("--seconds", None));
+    let out = std::path::PathBuf::from(arg("--out").unwrap_or_else(|| die("missing --out")));
+    match sdrtrunk_web::receiver::record_tuner(&db, &tuner, center, seconds, &out) {
+        Ok((path, written, dropped)) => {
+            println!("{}: {written} samples, {dropped} dropped", path.display());
+            std::process::exit(if dropped == 0 { 0 } else { 1 })
+        }
+        Err(e) => die(&format!("record: {e}")),
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("serve") { serve(); }
+    if std::env::args().nth(1).as_deref() == Some("record") { record(); }
     let freq: i64 = num("--freq", None);
     let ppm: f64 = num("--ppm", Some(0.0));
     let rate: f64 = num("--rate", Some(6_000_000.0));

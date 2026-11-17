@@ -10,8 +10,11 @@ Three rounds in rotated order (A B C, B C A, C A B) so time-of-day traffic does 
 | `run.sh` | one run of one program in a fresh settings folder; writes `results/ROUND-PROGRAM.csv` and `.meta` |
 | `measure.py` | samples CPU (% of one core, all threads), RSS and new MP3s of one process |
 | `summarize.py` | `results/` → Markdown table; incomplete runs and runs with no calls are listed, not counted |
+| `replay_db.py` | points the sdrtrunk-rust database copy at the baseband recordings for replay runs |
+| `ppm_correct.py` | removes a tuner's PPM error from a baseband recording |
+| `charts.py` | `results/` and `results-replay/` → the README's CPU and memory charts in `charts/` |
 
-Tests: `python3 -m unittest bench/test_make_config.py bench/test_measure.py bench/test_summarize.py`
+Tests: `python3 -m unittest bench/test_make_config.py bench/test_measure.py bench/test_summarize.py bench/test_replay_db.py bench/test_ppm_correct.py bench/test_charts.py`
 (the sampler tests need Linux `/proc`).
 
 ## Setup (once)
@@ -42,6 +45,32 @@ python3 bench/summarize.py > bench/results/summary.md
 ```
 
 Then `sudo systemctl start sdrtrunk-rust`.
+
+## Replay (same signal for all three)
+
+Live runs hear different calls, so only CPU and memory compare. Replay plays one baseband recording to every program.
+
+1. Record both SDRs at once, at the centre each tuner uses live (Tuners page), with the service stopped:
+   `sdrtrunk-rust record --db ~/bench/live-copy.db --tuner 35AC63DC-2D40B04F --center HZ --seconds 175 --out ~/bench/replay`
+   and the same for `rtl:00000001`, in parallel. Each prints its samples and must report 0 dropped.
+   sdrtrunk plays WAV files up to 4 GB, which is 178 s for the Airspy at 6 MS/s (`record` refuses longer); every
+   program loops the recording, so a 600 s run hears it about 3.4 times (4.2 GB Airspy, 1.7 GB RTL-SDR).
+2. Remove each tuner's PPM error from its recording (sdrtrunk-vce has no PPM setting for recording tuners), keeping
+   the raw files: `mkdir ~/bench/replay-raw && mv ~/bench/replay/*.wav ~/bench/replay-raw/`, then for each
+   `python3 bench/ppm_correct.py --ppm PPM ~/bench/replay-raw/NAME.wav ~/bench/replay/NAME.wav` with the live tuner's PPM.
+   Every program then plays the recordings at PPM 0 with automatic PPM off.
+3. `~/bench/template-replay/sdrtrunk` and `~/bench/template-replay/vce-data`: copies of the live templates where each
+   tuner is a Recording tuner on its WAV, at PPM 0, and each channel's preferred tuner set to
+   it. sdrtrunk-vce plays only regular files in `data/recording_tuners` (symlinks refused): hard-link the WAVs there
+   (`ln ~/bench/replay/*.wav ~/bench/vce/data/recording_tuners/`) before adding the tuners, and leave them out of the
+   template; `run.sh` links them in for each run. sdrtrunk-rust needs no template: `run.sh` pins its database copy to
+   the recordings with `replay_db.py`.
+4. Run as above with `REPLAY_DIR=~/bench/replay` exported. Both Java programs start recording tuners disabled at
+   every launch, so their runs are attended: when `run.sh` says so, enable both Recording tuners and start both
+   channels in the program's window. Measuring starts 60 s after the first MP3, for all three programs. Each run
+   starts at a different point in the loop; over about 3.4 loops that changes calls per minute only a little.
+   Replay hears the same signal at any hour, so the order needs no rotation.
+   Results go to `results-replay/`; summarize with `python3 bench/summarize.py --results bench/results-replay`.
 
 ## Caveats
 

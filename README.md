@@ -29,6 +29,38 @@ Calls can also be played live to Icecast streams.
 
 Not supported: P25 Phase 2 (TDMA), DMR, NXDN, analog, and decryption.
 
+## Performance comparison
+
+sdrtrunk, sdrtrunk-vce and sdrtrunk-rust, each run alone on a Raspberry Pi 5 (8 GB) for 10 minutes, three times,
+following the same two P25 systems and recording the same talkgroups. Each line is a program's three runs averaged
+second by second; CPU 100% is one of the Pi's four cores, memory is RSS (physical RAM in use).
+
+**Same signal:** one 175 s recording of both SDRs (a busy afternoon), looped to every program.
+
+| Program | CPU mean | CPU peak | Memory mean | Memory peak |
+|---|---|---|---|---|
+| sdrtrunk | 110.8% | 211.9% | 1,570 MB | 1,825 MB |
+| sdrtrunk-vce | 117.6% | 230.0% | 1,120 MB | 1,205 MB |
+| sdrtrunk-rust | 59.1% | 79.3% | 18 MB | 20 MB |
+
+![CPU over 10 minutes on the same recorded signal](bench/charts/replay-cpu.svg)
+![Memory over 10 minutes on the same recorded signal](bench/charts/replay-memory.svg)
+
+**Live:** the SDRs on the air at night.
+
+| Program | CPU mean | CPU peak | Memory mean | Memory peak |
+|---|---|---|---|---|
+| sdrtrunk | 83.8% | 207.1% | 1,342 MB | 2,039 MB |
+| sdrtrunk-vce | 101.5% | 229.4% | 758 MB | 776 MB |
+| sdrtrunk-rust | 67.6% | 84.0% | 22 MB | 23 MB |
+
+![CPU over 10 minutes, live](bench/charts/live-cpu.svg)
+![Memory over 10 minutes, live](bench/charts/live-memory.svg)
+
+Peaks are the mean of each run's peak. The Java programs ran with their desktop windows open; sdrtrunk-rust ran
+headless. [BENCHMARK.md](BENCHMARK.md) has the per-run numbers, setup, method and caveats; [bench/](bench/) has the
+scripts and raw samples to repeat it.
+
 ## Build
 
 Linux with a current stable Rust toolchain (`rustup`), a C compiler, and the Airspy library:

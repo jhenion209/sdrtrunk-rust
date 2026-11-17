@@ -20,26 +20,29 @@ SDRTRUNK=${SDRTRUNK:-$HOME/sdrtrunk-1.0.0/sdr-trunk-linux-aarch64-v1.0.0}
 VCE=${VCE:-$BENCH/vce}
 RUST=${RUST:-$HERE/../target/release/sdrtrunk-rust}
 RUN=$BENCH/run/$PROGRAM
-RESULTS=$HERE/results
+# REPLAY_DIR: play the baseband recordings there instead of the SDRs (same signal for every program), with the
+# templates made for it, a fixed warm-up and separate results.
+REPLAY=${REPLAY_DIR:-}
+if [[ -n $REPLAY ]]; then TEMPLATE=$BENCH/template-replay; RESULTS=$HERE/results-replay; else TEMPLATE=$BENCH/template; RESULTS=$HERE/results; fi
 OUT=$RESULTS/$ROUND-$PROGRAM
 
 case $PROGRAM in
   sdrtrunk)
     REC=$RUN/SDRTrunk/recordings
     VERSION=$(basename "$SDRTRUNK")
-    PREPARE=(cp -a "$BENCH/template/sdrtrunk/." "$RUN/")  # SDRTrunk/ and Java preferences (.java/)
+    PREPARE=(cp -a "$TEMPLATE/sdrtrunk/." "$RUN/")  # SDRTrunk/ and Java preferences (.java/)
     # Java takes user.home from the password file, not $HOME.
-    LAUNCH=(env JAVA_OPTS="-Duser.home=$RUN" DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" "$SDRTRUNK/bin/sdr-trunk") ;;
+    LAUNCH=(env JAVA_OPTS="-Duser.home=$RUN" DISPLAY=:0 _JAVA_AWT_WM_NONREPARENTING=1 XAUTHORITY="$HOME/.Xauthority" "$SDRTRUNK/bin/sdr-trunk") ;;
   sdrtrunk-vce)
     REC=$VCE/data
     VERSION="sdrtrunk-vce nightly, java $(sed -n 's/^JAVA_VERSION="\(.*\)"/\1/p' "$VCE/release" 2>/dev/null || true)"
-    PREPARE=(cp -a "$BENCH/template/vce-data" "$VCE/data")
-    LAUNCH=(env DISPLAY=:0 XAUTHORITY="$HOME/.Xauthority" "$VCE/Start VCE.sh") ;;
+    PREPARE=(cp -a "$TEMPLATE/vce-data" "$VCE/data")
+    LAUNCH=(env DISPLAY=:0 _JAVA_AWT_WM_NONREPARENTING=1 XAUTHORITY="$HOME/.Xauthority" "$VCE/Start VCE.sh") ;;
   sdrtrunk-rust)
     REC=$RUN/recordings
     VERSION="sdrtrunk-rust ${RUST_VERSION:-unknown}"
     PREPARE=(cp "$BENCH/template/rust.db" "$RUN/bench.db")
-    LAUNCH=("$RUST" serve --db "$RUN/bench.db" --listen 127.0.0.1:8099) ;;
+    LAUNCH=("$RUST" serve --db "$RUN/bench.db" --listen 127.0.0.1:8099 ${REPLAY:+--replay "$REPLAY"}) ;;
   *) echo "unknown program: $PROGRAM" >&2; exit 2 ;;
 esac
 
@@ -48,6 +51,7 @@ if (( DRY )); then
   echo "prepare: ${PREPARE[*]}"
   echo "launch:  ${LAUNCH[*]}"
   echo "recordings: $REC"
+  if [[ -n $REPLAY ]]; then echo "replay: $REPLAY (template $TEMPLATE, warm-up from the first MP3)"; fi
   echo "warm-up ${WARMUP}s, measure ${MEASURE}s -> $OUT.csv, $OUT.meta"
   echo "version: $VERSION"
   exit 0
@@ -59,6 +63,8 @@ if pgrep -x 'java|sdrtrunk-rust' >/dev/null; then echo "another program is runni
 rm -rf "$RUN"; mkdir -p "$RUN" "$RESULTS"
 if [[ $PROGRAM == sdrtrunk-vce ]]; then rm -rf "$VCE/data"; fi
 "${PREPARE[@]}"
+# sdrtrunk-vce plays only regular files in data/recording_tuners (no symlinks): hard-link them, no 6 GB copy.
+if [[ $PROGRAM == sdrtrunk-vce && -n $REPLAY ]]; then mkdir -p "$VCE/data/recording_tuners"; ln -f "$REPLAY"/*.wav "$VCE/data/recording_tuners/"; fi
 if [[ $PROGRAM == sdrtrunk-rust ]]; then
   # The copy records into this run's folder, follows only listed talkgroups set to record, and streams nothing.
   python3 - "$RUN/bench.db" "$REC" <<'EOF'
@@ -74,6 +80,7 @@ for i, j in c.execute("SELECT id, json FROM streams").fetchall():
     c.execute("UPDATE streams SET json = ? WHERE id = ?", (json.dumps(d), i))
 c.commit()
 EOF
+  if [[ -n $REPLAY ]]; then python3 "$HERE/replay_db.py" --db "$RUN/bench.db" --replay "$REPLAY"; fi
 fi
 mkdir -p "$REC"
 
@@ -81,6 +88,7 @@ MARK=$RUN/.launched; touch "$MARK"
 STARTED=$(date -Iseconds); T0=$(date +%s)
 setsid "${LAUNCH[@]}" >"$RUN/console.log" 2>&1 &
 PID=$!
+if [[ -n $REPLAY && $PROGRAM != sdrtrunk-rust ]]; then echo "now enable both Recording tuners and start both channels in $PROGRAM"; fi
 stop() {
   kill -TERM -- "-$PID" 2>/dev/null || true
   for _ in $(seq 15); do kill -0 "$PID" 2>/dev/null || return 0; sleep 1; done
@@ -94,7 +102,13 @@ while :; do
   kill -0 "$PID" 2>/dev/null || { echo "program exited during warm-up (see $RUN/console.log)" >&2; break; }
   ELAPSED=$(( $(date +%s) - T0 ))
   if [[ -z $FIRST ]] && [[ -n $(find "$REC" -name '*.mp3' -newer "$MARK" -print -quit 2>/dev/null) ]]; then FIRST=$ELAPSED; fi
-  (( ELAPSED >= WARMUP )) && { [[ -n $FIRST ]] || (( ELAPSED >= WARMUP + MEASURE )); } && break
+  if [[ -n $REPLAY ]]; then
+    # Replay: measure from WARMUP s after the first MP3, the same for all three; the Java programs play only once
+    # someone enables their recording tuners by hand (both start them disabled).
+    { [[ -n $FIRST ]] && (( ELAPSED >= FIRST + WARMUP )); } || (( ELAPSED >= WARMUP + MEASURE )) && break
+  else
+    (( ELAPSED >= WARMUP )) && { [[ -n $FIRST ]] || (( ELAPSED >= WARMUP + MEASURE )); } && break
+  fi
 done
 
 python3 "$HERE/measure.py" --pid "$PID" --seconds "$MEASURE" --recordings "$REC" --out "$OUT.csv" || true
