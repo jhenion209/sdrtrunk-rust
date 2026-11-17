@@ -25,7 +25,6 @@ class Charts(unittest.TestCase):
         self.assertEqual(s.count("<path"), 2)
         self.assertIn(">a</text>", s)
         self.assertIn(">CPU (%)</text>", s)
-        self.assertIn(">Time since measuring started</text>", s)
         self.assertIn("prefers-color-scheme:dark", s)
 
 

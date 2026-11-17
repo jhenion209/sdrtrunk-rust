@@ -12,8 +12,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = [("sdrtrunk", "#2a78d6", "#3987e5"), ("sdrtrunk-vce", "#eb6834", "#d95926"), ("sdrtrunk-rust", "#1baf7a", "#199e70")]
 SETS = [("live", "results"), ("replay", "results-replay")]
-METRICS = [("cpu", "cpu_pct", "%", 10, "CPU (% of one core, 10 s average)"), ("memory", "rss_mb", " MB", 1, "Memory (RSS, MB)")]
-W, H, L, R, T, B = 760, 300, 84, 116, 18, 52
+METRICS = [("cpu", "cpu_pct", "%", 10, "CPU use, % of one core (the Pi 5 has 4), 10-second average"),
+           ("memory", "rss_mb", " MB", 1, "Memory in use (RSS), MB of RAM")]
+W, H, L, R, T, B = 760, 300, 64, 116, 44, 32
 
 
 def average_runs(results, program, field):
@@ -54,8 +55,8 @@ def svg(lines, unit, title, y_title):
     y = lambda v: T + ih - v / top * ih
     # Own background, same light/dark rule as the text, so it reads on any page theme.
     css = ["text{font:11px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#6e6d68}.bg{fill:#ffffff}",
-           ".title{font-size:12px;fill:#52514e}.end{font-size:12px;font-weight:600;fill:#2b2b29}.grid{stroke:#e7e6e2}.axis{stroke:#c9c8c2}"]
-    dark = ["text{fill:#9d9c94}.title{fill:#c3c2b7}.end{fill:#f0efec}.bg{fill:#0d1117}.grid{stroke:#2a2f36}.axis{stroke:#4a4f57}"]
+           ".title{font-size:14px;font-weight:600;fill:#2b2b29}.end{font-size:12px;font-weight:600;fill:#2b2b29}.grid{stroke:#e7e6e2}.axis{stroke:#c9c8c2}"]
+    dark = ["text{fill:#9d9c94}.title{fill:#f0efec}.end{fill:#f0efec}.bg{fill:#0d1117}.grid{stroke:#2a2f36}.axis{stroke:#4a4f57}"]
     for k, (_, light, dk, _) in enumerate(lines):
         css.append(f".s{k}{{stroke:{light};fill:{light}}}")
         dark.append(f".s{k}{{stroke:{dk};fill:{dk}}}")
@@ -70,8 +71,7 @@ def svg(lines, unit, title, y_title):
         v += step
     for t in range(0, 601, 120):
         out.append(f'<text x="{x(min(n - 1, t)):.1f}" y="{T + ih + 18}" text-anchor="middle">{"0 s" if t == 0 else f"{t // 60} min"}</text>')
-    out.append(f'<text class="title" x="{L + iw / 2:.1f}" y="{H - 10}" text-anchor="middle">Time since measuring started</text>')
-    out.append(f'<text class="title" transform="translate(18 {T + ih / 2:.1f}) rotate(-90)" text-anchor="middle">{y_title}</text>')
+    out.append(f'<text class="title" x="16" y="24">{y_title}</text>')
     for k, (*_, vals) in enumerate(lines):
         d = "".join(f'{"L" if i else "M"}{x(i):.1f},{y(val):.1f}' for i, val in enumerate(vals[:n]))
         out.append(f'<path class="s{k}" d="{d}" stroke-width="2" stroke-linejoin="round" style="fill:none"/>')
