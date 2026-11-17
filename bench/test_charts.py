@@ -20,10 +20,12 @@ class Charts(unittest.TestCase):
             self.assertEqual(got, top, peak)
             self.assertLessEqual(got / step, 8)
 
-    def test_one_line_and_label_per_program(self):
-        s = charts.svg([("a", "#000", "#fff", [1, 2, 3]), ("b", "#111", "#eee", [3, 2, 1])], "%", "t")
+    def test_one_line_and_label_per_program_and_axis_titles(self):
+        s = charts.svg([("a", "#000", "#fff", [1, 2, 3]), ("b", "#111", "#eee", [3, 2, 1])], "%", "t", "CPU (%)")
         self.assertEqual(s.count("<path"), 2)
         self.assertIn(">a</text>", s)
+        self.assertIn(">CPU (%)</text>", s)
+        self.assertIn(">Time since measuring started</text>", s)
         self.assertIn("prefers-color-scheme:dark", s)
 
 

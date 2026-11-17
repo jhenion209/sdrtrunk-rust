@@ -12,8 +12,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = [("sdrtrunk", "#2a78d6", "#3987e5"), ("sdrtrunk-vce", "#eb6834", "#d95926"), ("sdrtrunk-rust", "#1baf7a", "#199e70")]
 SETS = [("live", "results"), ("replay", "results-replay")]
-METRICS = [("cpu", "cpu_pct", "%", 10), ("memory", "rss_mb", " MB", 1)]
-W, H, L, R, T, B = 760, 270, 64, 116, 18, 32
+METRICS = [("cpu", "cpu_pct", "%", 10, "CPU (% of one core, 10 s average)"), ("memory", "rss_mb", " MB", 1, "Memory (RSS, MB)")]
+W, H, L, R, T, B = 760, 300, 84, 116, 18, 52
 
 
 def average_runs(results, program, field):
@@ -45,7 +45,7 @@ def label(v, unit):
     return (f"{v:,.0f}" if v >= 10 or v == int(v) else f"{v:.1f}") + unit
 
 
-def svg(lines, unit, title):
+def svg(lines, unit, title, y_title):
     """lines: [(name, light colour, dark colour, values)]."""
     n = min(len(v) for *_, v in lines)
     top, step = nice_top(max(max(v[:n]) for *_, v in lines) * 1.05)
@@ -54,8 +54,8 @@ def svg(lines, unit, title):
     y = lambda v: T + ih - v / top * ih
     # Own background, same light/dark rule as the text, so it reads on any page theme.
     css = ["text{font:11px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#6e6d68}.bg{fill:#ffffff}",
-           ".end{font-size:12px;font-weight:600;fill:#2b2b29}.grid{stroke:#e7e6e2}.axis{stroke:#c9c8c2}"]
-    dark = ["text{fill:#9d9c94}.end{fill:#f0efec}.bg{fill:#0d1117}.grid{stroke:#2a2f36}.axis{stroke:#4a4f57}"]
+           ".title{font-size:12px;fill:#52514e}.end{font-size:12px;font-weight:600;fill:#2b2b29}.grid{stroke:#e7e6e2}.axis{stroke:#c9c8c2}"]
+    dark = ["text{fill:#9d9c94}.title{fill:#c3c2b7}.end{fill:#f0efec}.bg{fill:#0d1117}.grid{stroke:#2a2f36}.axis{stroke:#4a4f57}"]
     for k, (_, light, dk, _) in enumerate(lines):
         css.append(f".s{k}{{stroke:{light};fill:{light}}}")
         dark.append(f".s{k}{{stroke:{dk};fill:{dk}}}")
@@ -69,7 +69,9 @@ def svg(lines, unit, title):
         out.append(f'<text x="{L - 8}" y="{y(v) + 4:.1f}" text-anchor="end">{label(v, unit)}</text>')
         v += step
     for t in range(0, 601, 120):
-        out.append(f'<text x="{x(min(n - 1, t)):.1f}" y="{H - 8}" text-anchor="middle">{"0 s" if t == 0 else f"{t // 60} min"}</text>')
+        out.append(f'<text x="{x(min(n - 1, t)):.1f}" y="{T + ih + 18}" text-anchor="middle">{"0 s" if t == 0 else f"{t // 60} min"}</text>')
+    out.append(f'<text class="title" x="{L + iw / 2:.1f}" y="{H - 10}" text-anchor="middle">Time since measuring started</text>')
+    out.append(f'<text class="title" transform="translate(18 {T + ih / 2:.1f}) rotate(-90)" text-anchor="middle">{y_title}</text>')
     for k, (*_, vals) in enumerate(lines):
         d = "".join(f'{"L" if i else "M"}{x(i):.1f},{y(val):.1f}' for i, val in enumerate(vals[:n]))
         out.append(f'<path class="s{k}" d="{d}" stroke-width="2" stroke-linejoin="round" style="fill:none"/>')
@@ -86,11 +88,11 @@ def svg(lines, unit, title):
 def main(out_dir=os.path.join(HERE, "charts")):
     os.makedirs(out_dir, exist_ok=True)
     for set_name, results in SETS:
-        for metric, field, unit, smooth in METRICS:
+        for metric, field, unit, smooth, y_title in METRICS:
             lines = [(p, light, dark, rolling(average_runs(os.path.join(HERE, results), p, field), smooth))
                      for p, light, dark in PROGRAMS]
             path = os.path.join(out_dir, f"{set_name}-{metric}.svg")
-            open(path, "w").write(svg(lines, unit, f"{set_name} {metric}"))
+            open(path, "w").write(svg(lines, unit, f"{set_name} {metric}", y_title))
             print(path)
 
 
