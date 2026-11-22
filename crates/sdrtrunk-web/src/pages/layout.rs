@@ -36,6 +36,7 @@ pub fn layout_with(title: &str, head: Head, user: Option<&User>, csrf: &str, bod
                             a href="/talkgroups" data-match="/talkgroups" { "Talkgroups" }
                             a href="/streams" data-match="/streams" { "Streams" }
                             a href="/recordings" data-match="/recordings" { "Recordings" }
+                            a href="/event-log" data-match="/event-log" { "Event Log" }
                             p.group { "Admin" }
                             @if u.role == Role::Owner { a href="/users" data-match="/users" { "Users" } }
                             a href="/account" data-match="/account" { "Account" }

@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/streams/import/apply", post(pages::streams::import_apply))
         .route("/streams/{id}", get(pages::streams::edit_page).post(pages::streams::save))
         .route("/streams/{id}/delete", post(pages::streams::delete))
+        .route("/event-log", get(pages::event_log::page))
         .route("/recordings", get(pages::settings::recordings_page).post(pages::settings::recordings_submit))
         .route("/talkgroups", get(pages::talkgroups::page).post(pages::talkgroups::save))
         .route("/talkgroups/{number}/delete", post(pages::talkgroups::delete))
