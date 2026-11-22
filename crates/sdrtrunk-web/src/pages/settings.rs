@@ -31,7 +31,12 @@ pub fn format_mhz(hz: u64) -> String {
 // ---------- Recordings ----------
 
 #[derive(Deserialize)]
-pub struct RecordingsForm { #[serde(default)] csrf: String, recording_dir: String }
+pub struct RecordingsForm {
+    #[serde(default)] csrf: String,
+    recording_dir: String,
+    #[serde(default)] event_log_dir: String,
+    #[serde(default)] event_log_days: String,
+}
 
 fn recordings_view(s: &Session, f: &RecordingsForm, errors: &[FieldError], saved: bool) -> Markup {
     layout("Recordings", Some(&s.user), &s.csrf, html! {
@@ -43,18 +48,29 @@ fn recordings_view(s: &Session, f: &RecordingsForm, errors: &[FieldError], saved
             input type="hidden" name="csrf" value=(s.csrf);
             label { "Folder on this computer" input name="recording_dir" value=(f.recording_dir); }
             (field_error(errors, "recording_dir"))
+            p.muted { "Every call each system hears is also logged, one line per call, to a daily CSV file in sdrtrunk's call event "
+                "format. Search them on the " a href="/event-log" { "Event Log" } " page." }
+            label { "Call event log folder (empty: off)" input name="event_log_dir" value=(f.event_log_dir); }
+            (field_error(errors, "event_log_dir"))
+            label { "Keep call event logs for (days)" input type="number" name="event_log_days" min="1" max="3650" value=(f.event_log_days); }
+            (field_error(errors, "event_log_days"))
             button { "Save and restart all systems" }
         }
     })
 }
 
 pub async fn recordings_page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Query<Saved>) -> Markup {
-    recordings_view(&s, &RecordingsForm { csrf: String::new(), recording_dir: st.db.settings().recording_dir }, &[], q.saved.is_some())
+    let cur = st.db.settings();
+    let f = RecordingsForm { csrf: String::new(), recording_dir: cur.recording_dir, event_log_dir: cur.event_log_dir,
+        event_log_days: cur.event_log_days.to_string() };
+    recordings_view(&s, &f, &[], q.saved.is_some())
 }
 
 pub async fn recordings_submit(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<RecordingsForm>) -> Response {
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
-    let new = Settings { recording_dir: f.recording_dir.trim().to_string() };
+    // An unparsable number becomes 0, which validate rejects with the days message.
+    let new = Settings { recording_dir: f.recording_dir.trim().to_string(), event_log_dir: f.event_log_dir.trim().to_string(),
+        event_log_days: f.event_log_days.trim().parse().unwrap_or(0) };
     if let Err(errors) = new.validate() { return recordings_view(&s, &f, &errors, false).into_response(); }
     if let Err(e) = st.db.save_settings(&new) {
         return recordings_view(&s, &f, &[FieldError { field: "form", message: format!("Could not save: {e}") }], false).into_response();

@@ -107,14 +107,20 @@ async fn recordings_folder_restarts_every_system() {
     let (cookie, csrf) = login_as(&st, "admin", Role::Admin);
     assert!(wait_opens(&opens, 1).await);
     let before = opens.load(Ordering::SeqCst);
-    let r = send(&st, "POST", "/recordings", Some(&cookie), &[("csrf", &csrf), ("recording_dir", "/srv/recordings")]).await;
+    let r = send(&st, "POST", "/recordings", Some(&cookie), &[("csrf", &csrf), ("recording_dir", "/srv/recordings"),
+        ("event_log_dir", "/srv/event_logs"), ("event_log_days", "45")]).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(st.db.settings().recording_dir, "/srv/recordings");
+    assert_eq!((st.db.settings().event_log_dir.as_str(), st.db.settings().event_log_days), ("/srv/event_logs", 45));
     assert!(wait_opens(&opens, before + 2).await, "both systems restarted");
     assert_eq!(st.db.audit_log(1)[0].action, "changed recordings directory");
     let r = send(&st, "POST", "/recordings", Some(&cookie), &[("csrf", &csrf), ("recording_dir", "relative")]).await;
     assert!(r.body.contains("full path"));
     assert_eq!(st.db.settings().recording_dir, "/srv/recordings");
+    let r = send(&st, "POST", "/recordings", Some(&cookie), &[("csrf", &csrf), ("recording_dir", "/srv/recordings"),
+        ("event_log_dir", "/srv/event_logs"), ("event_log_days", "0")]).await;
+    assert!(r.body.contains("Use 1 to 3650 days."));
+    assert_eq!(st.db.settings().event_log_days, 45);
 }
 
 #[tokio::test]
