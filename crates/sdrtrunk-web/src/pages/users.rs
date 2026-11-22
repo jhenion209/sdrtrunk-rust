@@ -1,6 +1,6 @@
 //! Owner only: admins (add, reset password, remove) and the audit log.
 use crate::app::{check_csrf, AppState, OwnerOnly};
-use crate::auth::{Role, Session};
+use crate::auth::{Function, Role, Session};
 use crate::pages::layout::{layout, notice};
 use crate::receiver::now_ms;
 use axum::extract::{Path, State};
@@ -47,10 +47,20 @@ fn view(st: &AppState, s: &Session, error: Option<&str>) -> Markup {
                         button.danger { "Remove" }
                     } }
                 }
+            }
+            @if u.role != Role::Owner {
+                @let allowed = st.db.allowed(u.id);
+                tr { td colspan="4" { form method="post" action={ "/users/" (u.id) "/allowed" } {
+                    input type="hidden" name="csrf" value=(s.csrf);
+                    @for f in Function::ALL {
+                        label { input type="checkbox" name="function" value=(f.id()) checked[allowed.contains(&f)]; " " (f.label()) }
+                    }
+                    button.plain { "Save permissions" }
+                } } }
             } } }
         }
         h2 { "Add an admin" }
-        p.muted { "Admins can change everything except users." }
+        p.muted { "New admins can change nothing until you allow it below their name." }
         form method="post" action="/users" {
             input type="hidden" name="csrf" value=(s.csrf);
             label { "Username" input name="username" autocomplete="off" required; }
@@ -98,6 +108,22 @@ pub async fn reset_password(State(st): State<AppState>, OwnerOnly(s): OwnerOnly,
     match st.db.set_password(id, &f.password) {
         Ok(()) => {
             st.db.audit(now_ms(), &s.user.username, &format!("reset password for {name}"));
+            Redirect::to("/users").into_response()
+        }
+        Err(e) => view(&st, &s, Some(&e.to_string())).into_response(),
+    }
+}
+
+/// Saves what admin `id` may change: the checked boxes arrive as repeated `function=<id>` pairs (unknown ids ignored).
+pub async fn set_allowed(State(st): State<AppState>, OwnerOnly(s): OwnerOnly, Path(id): Path<i64>, Form(pairs): Form<Vec<(String, String)>>) -> Response {
+    let csrf = pairs.iter().find(|(k, _)| k == "csrf").map(|(_, v)| v.as_str()).unwrap_or("");
+    if let Err(code) = check_csrf(&s, csrf) { return code.into_response(); }
+    let Some((name, role)) = name_of(&st, id) else { return view(&st, &s, Some("No such user.")).into_response() };
+    if role == Role::Owner { return view(&st, &s, Some("The owner can always do everything.")).into_response(); }
+    let fs: Vec<Function> = pairs.iter().filter(|(k, _)| k == "function").filter_map(|(_, v)| Function::parse(v)).collect();
+    match st.db.set_allowed(id, &fs) {
+        Ok(()) => {
+            st.db.audit(now_ms(), &s.user.username, &format!("changed permissions of {name}"));
             Redirect::to("/users").into_response()
         }
         Err(e) => view(&st, &s, Some(&e.to_string())).into_response(),

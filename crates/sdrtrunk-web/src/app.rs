@@ -127,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route("/users", get(pages::users::page).post(pages::users::add))
         .route("/users/{id}/password", post(pages::users::reset_password))
         .route("/users/{id}/delete", post(pages::users::remove))
+        .route("/users/{id}/allowed", post(pages::users::set_allowed))
         .route("/account", get(pages::account::page).post(pages::account::submit))
         .route("/login", get(pages::login::page).post(pages::login::submit))
         .route("/logout", post(pages::login::logout))

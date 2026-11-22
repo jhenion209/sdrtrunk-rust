@@ -94,3 +94,53 @@ async fn account_page_always_allowed() {
         ("password", "my new long password"), ("password2", "my new long password")]).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
 }
+
+fn user_id(st: &AppState, name: &str) -> i64 { st.db.users().into_iter().find(|u| u.username == name).unwrap().id }
+
+#[tokio::test]
+async fn owner_saves_permissions() {
+    let st = state();
+    login_with(&st, "jordan", &[]);
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    let id = user_id(&st, "jordan");
+    let r = send(&st, "POST", &format!("/users/{id}/allowed"), Some(&cookie),
+        &[("csrf", csrf.as_str()), ("function", "systems.edit"), ("function", "tuners.edit"), ("function", "bogus")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(st.db.allowed(id), vec![Function::SystemsEdit, Function::TunersEdit]);
+    assert_eq!(st.db.audit_log(1)[0].action, "changed permissions of jordan");
+    let page = send(&st, "GET", "/users", Some(&cookie), &[]).await.body;
+    assert_eq!(page.matches(" checked").count(), 2, "exactly jordan's two boxes are checked: {page}");
+    assert!(page.contains("value=\"systems.edit\" checked") && page.contains("value=\"tuners.edit\" checked"), "{page}");
+}
+
+#[tokio::test]
+async fn only_owner_sets_permissions() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "boss-admin", Role::Admin);
+    let own = user_id(&st, "boss-admin");
+    let r = send(&st, "POST", &format!("/users/{own}/allowed"), Some(&cookie), &[("csrf", csrf.as_str())]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(st.db.allowed(own).len(), 11, "unchanged");
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    let owner = user_id(&st, "owner");
+    let r = send(&st, "POST", &format!("/users/{owner}/allowed"), Some(&cookie), &[("csrf", csrf.as_str())]).await;
+    assert!(r.body.contains("The owner can always do everything."), "{}", r.body);
+}
+
+#[tokio::test]
+async fn change_applies_next_request() {
+    let st = state();
+    let (jordan, jcsrf) = login_with(&st, "jordan", &[Function::SystemsEdit]);
+    let rename = |name: &'static str, csrf: String| vec![("csrf".to_string(), csrf), ("enabled".into(), "on".into()),
+        ("system_name".into(), name.into()), ("site_name".into(), "S".into()), ("channel_name".into(), "C".into()),
+        ("primary".into(), "852.1125".into()), ("failover_ms".into(), "1000".into()), ("modulation".into(), "c4fm".into())];
+    let form = rename("First", jcsrf.clone());
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_ne!(send(&st, "POST", "/systems/1", Some(&jordan), &pairs).await.status, StatusCode::FORBIDDEN);
+    let (owner, ocsrf) = login_as(&st, "owner", Role::Owner);
+    let id = user_id(&st, "jordan");
+    send(&st, "POST", &format!("/users/{id}/allowed"), Some(&owner), &[("csrf", ocsrf.as_str())]).await;
+    let form = rename("Second", jcsrf);
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    assert_eq!(send(&st, "POST", "/systems/1", Some(&jordan), &pairs).await.status, StatusCode::FORBIDDEN, "same session, now refused");
+}
