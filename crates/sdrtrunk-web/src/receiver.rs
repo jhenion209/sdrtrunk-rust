@@ -2,7 +2,8 @@
 //! calls. `Receivers` starts and stops them and hands out tuners (pinned by serial, or Automatic). Tuners in Setup mode
 //! get a thread of their own that only feeds the spectrum display.
 pub use sdrtrunk_p25::control::center_for;
-use crate::db::{Db, System, TunerConfig, TunerMode};
+use crate::db::{Db, Settings, System, TunerConfig, TunerMode};
+use crate::event_log::EventLog;
 use crate::recorder::{Names, RecordPolicy, Recorder, Tuner};
 use crate::streaming::Streams;
 use crate::tuning::{self, choose_center};
@@ -398,7 +399,7 @@ struct Release { asked: AtomicBool, ids: Mutex<Vec<String>> }
 
 impl Receiver {
     #[allow(clippy::too_many_arguments)]
-    fn start(system: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed,
+    fn start(system: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: Claimed,
              calls: broadcast::Sender<CallEvent>, policy: RecordPolicy, known: Vec<u64>, streams: Arc<Streams>,
              pick: Result<String, String>) -> Receiver {
         let main = pick.as_ref().ok().cloned();
@@ -418,7 +419,7 @@ impl Receiver {
         let stop = Arc::new(AtomicBool::new(false));
         let (s, sh, flag) = (system.clone(), shared.clone(), stop.clone());
         let handle = std::thread::Builder::new().name(format!("decoder-{}", system.id))
-            .spawn(move || decode(s, dir, pool, sdrs, claimed, flag, sh, pick)).expect("spawn decoder");
+            .spawn(move || decode(s, settings, pool, sdrs, claimed, flag, sh, pick)).expect("spawn decoder");
         let Shared { status, policy, spectrum, quality, known, helper_views, release, .. } = shared;
         Receiver { system, status, policy, spectrum, quality, known, helper_views, release, main, run: Mutex::new(Some((stop, handle))) }
     }
@@ -529,7 +530,7 @@ impl Receivers {
             }).collect()
         };
         for (s, pick) in systems.into_iter().zip(picks) {
-            run.insert(s.id, Arc::new(Receiver::start(s.clone(), db.settings().recording_dir, self.pool.clone(), self.sdrs.clone(),
+            run.insert(s.id, Arc::new(Receiver::start(s.clone(), db.settings(), self.pool.clone(), self.sdrs.clone(),
                 self.claimed.clone(), self.calls.clone(), policy_for(db, s.list_name()), db.voice_freqs(s.id), self.streams.clone(), pick)));
         }
     }
@@ -788,7 +789,7 @@ impl Drop for Claim {
 
 /// Runs system `s` on main tuner `pick` (already claimed by `Receivers::start_many`, or why it got none).
 #[allow(clippy::too_many_arguments)]
-fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed, stop: Arc<AtomicBool>, sh: Shared, pick: Result<String, String>) {
+fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: Claimed, stop: Arc<AtomicBool>, sh: Shared, pick: Result<String, String>) {
     // First, so the claim is released however this ends.
     let pick = pick.map(|sn| Claim(claimed.clone(), sn));
     let Shared { status, calls, policy, spectrum, quality, known, helper_views, streams, release } = sh;
@@ -819,7 +820,8 @@ fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed
     });
     let channel = |i: usize, ppm: f64, center: i64| ControlChannel::new(center as f64, rate as f64, freq(i), ppm, now_ms(), modulation);
     let mut cc = match channel(0, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
-    let mut rec = Recorder::new(Path::new(&dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
+    let mut log = EventLog::new(settings.event_log_path(), &s.system_name, policy.clone(), now_ms() as u64);
+    let mut rec = Recorder::new(Path::new(&settings.recording_dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
     update(&status, |st| st.state = "running".into());
     let (mut tick, mut tick_valid, mut tick_frames) = (Instant::now(), 0u64, FrameCounts::default());
     let mut last_correction_ms = now_ms();
@@ -887,12 +889,15 @@ fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed
                         // No subscribers is normal (no page open).
                         let _ = calls.send(CallEvent { system: s.system_name.clone(), alias_list: s.list_name().to_string(), at_ms: now, group: g.group, source: g.source, hz: g.hz,
                             encrypted: g.encrypted, emergency: g.emergency });
+                        log.grant(g, now);
                     }
                     ControlEvent::Voice { .. } | ControlEvent::VoiceEnd { .. } => {}
                 }
                 rec.handle(&e, now, &mut follow);
             }
             rec.tick(now, &mut follow);
+            log.live(&rec.live(), now);
+            log.tick(now);
         }
         release_idle(&mut helpers, now);
         let shown: Vec<(String, u64)> = helpers.iter().map(|h| (h.serial.clone(), h.win.center as u64)).collect();
@@ -946,7 +951,7 @@ fn decode(s: System, dir: String, pool: SharedPool, sdrs: Sdrs, claimed: Claimed
                 st.tsbk_per_s = rate;
                 st.dropped = src.dropped();
                 st.recorded = rec.recorded;
-                st.recording_error = rec.last_error.clone();
+                st.recording_error = rec.last_error.clone().or_else(|| log.last_error.clone());
             });
             (tick, tick_valid) = (Instant::now(), cc.valid_tsbk());
         }

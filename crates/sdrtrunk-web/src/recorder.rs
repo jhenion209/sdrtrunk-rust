@@ -309,6 +309,24 @@ mod tests {
     }
 
     #[test]
+    fn event_log_takes_source_and_encryption_from_voice() {
+        let d = dir("event-log");
+        let _ = std::fs::remove_dir_all(&d);
+        let tgs: Arc<Mutex<RecordPolicy>> = Arc::default();
+        let (mut r, mut t) = (Recorder::new(&dir("event-log-rec"), names(), tgs.clone()), FakeTuner::default());
+        let mut log = crate::event_log::EventLog::new(Some(d.clone()), "SGCo", tgs, 1);
+        let start = Local::now().timestamp_millis();
+        let ControlEvent::Call(g) = grant(27, 858_737_500) else { unreachable!() };
+        log.grant(&g, start);
+        r.handle(&grant(27, 858_737_500), start, &mut t);
+        r.handle(&ldu1(Some(lc(27, 711_013, 0x40))), start + 100, &mut t);
+        log.live(&r.live(), start + 100);
+        log.tick(start + 100 + crate::event_log::IDLE_MS + 1);
+        let text = std::fs::read_dir(&d).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect::<String>();
+        assert!(text.contains(",\"711013\",") && text.contains(" ENCRYPTED"), "{text}");
+    }
+
+    #[test]
     fn dropped_channel_forgotten() {
         let (mut r, mut t) = (Recorder::new(&dir("dropped"), names(), Arc::default()), FakeTuner::default());
         r.handle(&grant(1, 859_962_500), 0, &mut t);

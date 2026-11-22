@@ -109,6 +109,11 @@ impl EventLog {
     }
 }
 
+/// A stopping system (stop, failure, panic) writes the calls still open.
+impl Drop for EventLog {
+    fn drop(&mut self) { self.close_all(0); }
+}
+
 fn local(ms: i64) -> chrono::DateTime<Local> { Local.timestamp_millis_opt(ms).single().unwrap_or_else(Local::now) }
 
 fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
@@ -152,7 +157,7 @@ mod tests {
     use chrono::{Local, TimeZone};
     use sdrtrunk_p25::trunk::CallGrant;
     use sdrtrunk_p25::tsbk_msg::Channel;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     const HZ: u64 = 859_737_500;
@@ -175,8 +180,8 @@ mod tests {
     fn g(group: u16, source: u32, hz: u64, encrypted: bool, emergency: bool) -> CallGrant {
         CallGrant { group, source, channel: Channel { band: 0, number: 4054 }, hz, encrypted, emergency }
     }
-    fn log(d: &PathBuf, first_id: u64) -> EventLog { EventLog::new(Some(d.clone()), "SGCo", policy(), first_id) }
-    fn lines(d: &PathBuf, day: &str) -> Vec<String> {
+    fn log(d: &Path, first_id: u64) -> EventLog { EventLog::new(Some(d.to_path_buf()), "SGCo", policy(), first_id) }
+    fn lines(d: &Path, day: &str) -> Vec<String> {
         std::fs::read_to_string(d.join(format!("{day}_SGCo_call_events.log"))).unwrap().lines().map(str::to_string).collect()
     }
     fn call(start_ms: i64, last_ms: i64, group: u16, source: u32, encrypted: bool, emergency: bool) -> OpenCall {
@@ -290,6 +295,15 @@ mod tests {
         l.close_all(t + 10_000);
         assert_eq!(l.last_error, None);
         assert_eq!(lines(&d, "20261120").len(), 2);
+    }
+
+    #[test]
+    fn drop_writes_open_calls() {
+        let d = dir("drop");
+        let mut l = log(&d, 1);
+        l.grant(&g(27, 911, HZ, false, false), ms(2026, 11, 20, 10, 0, 0));
+        drop(l);
+        assert_eq!(lines(&d, "20261120").len(), 2, "a stopping system writes its open calls");
     }
 
     #[test]
