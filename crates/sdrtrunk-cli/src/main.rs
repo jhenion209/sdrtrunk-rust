@@ -21,8 +21,7 @@ fn num<T: std::str::FromStr>(name: &str, default: Option<T>) -> T {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR
-       sdrtrunk-rust reset-password [USERNAME] [--db PATH]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
+    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR\n       sdrtrunk-rust reset-password [USERNAME] [--db PATH]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
     std::process::exit(2)
 }
 
