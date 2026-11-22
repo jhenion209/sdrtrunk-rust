@@ -1,7 +1,7 @@
-//! Call event log: one sdrtrunk-style CSV row per call, appended to a daily `<yyyyMMdd>_<system>_call_events.log`.
-//! A call is keyed by frequency: it opens at its first grant, stays open while grants for the same talkgroup repeat or
-//! the recorder hears it, and is written when another talkgroup takes the frequency, after `IDLE_MS` of quiet, or when
-//! the system stops.
+//! Call event log: one sdrtrunk-style CSV row per transmission, appended to a daily `<yyyyMMdd>_<system>_call_events.log`.
+//! A row is keyed by frequency: it opens at a grant or when the recorder hears a transmission, stays open while grants
+//! for the same talkgroup and radio repeat or the recorder hears the same transmission, and is written when another
+//! talkgroup, radio or transmission takes the frequency, after `IDLE_MS` of quiet, or when the system stops.
 use crate::recorder::RecordPolicy;
 use chrono::{Local, TimeZone};
 use sdrtrunk_p25::trunk::CallGrant;
@@ -16,12 +16,18 @@ pub const IDLE_MS: i64 = 3000;
 
 pub const HEADER: &str = "TIMESTAMP,DURATION_MS,PROTOCOL,EVENT,FROM,TO,CHANNEL_NUMBER,FREQUENCY,TIMESLOT,DETAILS,EVENT_ID";
 
-/// A transmission the recorder hears now (see `Recorder::live`).
+/// A transmission the recorder hears now (see `Recorder::live`). `start_ms` tells one transmission from the next.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Live { pub hz: u64, pub group: u16, pub source: u32, pub encrypted: bool }
+pub struct Live { pub hz: u64, pub group: u16, pub source: u32, pub encrypted: bool, pub channel: Channel, pub start_ms: i64 }
 
 #[derive(Clone, Debug)]
-struct OpenCall { start_ms: i64, last_ms: i64, group: u16, source: u32, channel: Channel, hz: u64, encrypted: bool, emergency: bool }
+struct OpenCall {
+    start_ms: i64, last_ms: i64, group: u16, source: u32, channel: Channel, hz: u64, encrypted: bool, emergency: bool,
+    /// `start_ms` of the recorder's transmission this row follows, once heard.
+    seg: Option<i64>,
+    /// The transmission of the row this one replaced: it may still be heard a moment, and is not this row's.
+    after: Option<i64>,
+}
 
 pub struct EventLog {
     dir: Option<PathBuf>,
@@ -60,8 +66,10 @@ impl EventLog {
 
     pub fn grant(&mut self, g: &CallGrant, now_ms: i64) {
         if self.dir.is_none() { return; }
+        let mut after = None;
         if let Some(c) = self.open.get_mut(&g.hz) {
-            if c.group == g.group {
+            let new_talker = g.source != 0 && c.source != 0 && g.source != c.source;
+            if c.group == g.group && !new_talker {
                 c.last_ms = now_ms;
                 if c.source == 0 { c.source = g.source; }
                 c.encrypted |= g.encrypted;
@@ -69,18 +77,30 @@ impl EventLog {
                 return;
             }
             let ended = self.open.remove(&g.hz).expect("present");
+            after = ended.seg;
             self.write(&ended);
         }
         self.open.insert(g.hz, OpenCall { start_ms: now_ms, last_ms: now_ms, group: g.group, source: g.source, channel: g.channel,
-            hz: g.hz, encrypted: g.encrypted, emergency: g.emergency });
+            hz: g.hz, encrypted: g.encrypted, emergency: g.emergency, seg: None, after });
     }
 
-    /// The recorder's live transmissions keep their calls open and add what the voice says (source, encryption).
+    /// The recorder's live transmissions keep their rows open and add what the voice says (radio, encryption). A
+    /// transmission no open row follows starts its own row.
     pub fn live(&mut self, live: &[Live], now_ms: i64) {
+        if self.dir.is_none() { return; }
         for l in live {
-            let Some(c) = self.open.get_mut(&l.hz).filter(|c| c.group == l.group) else { continue };
+            let open = self.open.get(&l.hz);
+            if open.is_some_and(|c| c.after == Some(l.start_ms)) { continue; }
+            if !open.is_some_and(|c| c.group == l.group && c.seg.is_none_or(|s| s == l.start_ms)) {
+                if let Some(ended) = self.open.remove(&l.hz) { self.write(&ended); }
+                self.open.insert(l.hz, OpenCall { start_ms: l.start_ms, last_ms: now_ms, group: l.group, source: l.source,
+                    channel: l.channel, hz: l.hz, encrypted: l.encrypted, emergency: false, seg: Some(l.start_ms), after: None });
+                continue;
+            }
+            let c = self.open.get_mut(&l.hz).expect("checked");
+            c.seg = Some(l.start_ms);
             c.last_ms = now_ms;
-            if c.source == 0 { c.source = l.source; }
+            if l.source != 0 { c.source = l.source; }
             c.encrypted |= l.encrypted;
         }
     }
@@ -381,7 +401,7 @@ mod tests {
         std::fs::read_to_string(d.join(format!("{day}_SGCo_call_events.log"))).unwrap().lines().map(str::to_string).collect()
     }
     fn call(start_ms: i64, last_ms: i64, group: u16, source: u32, encrypted: bool, emergency: bool) -> OpenCall {
-        OpenCall { start_ms, last_ms, group, source, channel: Channel { band: 0, number: 4054 }, hz: HZ, encrypted, emergency }
+        OpenCall { start_ms, last_ms, group, source, channel: Channel { band: 0, number: 4054 }, hz: HZ, encrypted, emergency, seg: None, after: None }
     }
     const HEADER: &str = "TIMESTAMP,DURATION_MS,PROTOCOL,EVENT,FROM,TO,CHANNEL_NUMBER,FREQUENCY,TIMESLOT,DETAILS,EVENT_ID";
 
@@ -435,13 +455,63 @@ mod tests {
         assert!(f[2].contains(",\"41\","), "{}", f[2]);
     }
 
+    fn on_air(source: u32, start_ms: i64) -> Live {
+        Live { hz: HZ, group: 27, source, encrypted: false, channel: Channel { band: 0, number: 4054 }, start_ms }
+    }
+
+    #[test]
+    fn each_transmission_is_its_own_row() {
+        let d = dir("per-transmission");
+        let mut l = log(&d, 1);
+        let t = ms(2026, 11, 20, 10, 0, 0);
+        l.grant(&g(27, 911, HZ, false, false), t);
+        l.live(&[on_air(911, t)], t + 2000);
+        l.live(&[on_air(711_506, t + 2500)], t + 4000);
+        l.tick(t + 4000 + IDLE_MS + 1);
+        let f = lines(&d, "20261120");
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f[1].starts_with("\"2026:11:20:10:00:00\",\"2000\",") && f[1].contains(",\"911\","), "{}", f[1]);
+        assert!(f[2].starts_with("\"2026:11:20:10:00:02\",\"1500\",") && f[2].contains(",\"711506\","), "{}", f[2]);
+    }
+
+    #[test]
+    fn transmission_after_row_ended_opens_row() {
+        let d = dir("reopen-live");
+        let mut l = log(&d, 1);
+        let t = ms(2026, 11, 20, 10, 0, 0);
+        l.grant(&g(27, 911, HZ, false, false), t);
+        l.tick(t + IDLE_MS + 1);
+        l.live(&[on_air(911, t + 6000)], t + 8000);
+        l.tick(t + 8000 + IDLE_MS + 1);
+        let f = lines(&d, "20261120");
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f[2].starts_with("\"2026:11:20:10:00:06\",\"2000\",") && f[2].contains(",\"911\","), "{}", f[2]);
+    }
+
+    #[test]
+    fn grant_naming_new_talker_starts_row() {
+        let d = dir("new-talker");
+        let mut l = log(&d, 1);
+        let t = ms(2026, 11, 20, 10, 0, 0);
+        l.grant(&g(27, 911, HZ, false, false), t);
+        l.live(&[on_air(911, t)], t + 1000);
+        l.grant(&g(27, 711_506, HZ, false, false), t + 1200);
+        // The first talker's transmission lingers a moment after the grant: it stays on its own row.
+        l.live(&[on_air(911, t)], t + 1300);
+        l.live(&[on_air(711_506, t + 1400)], t + 3000);
+        l.tick(t + 3000 + IDLE_MS + 1);
+        let f = lines(&d, "20261120");
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert!(f[1].contains(",\"911\",") && f[2].starts_with("\"2026:11:20:10:00:01\",\"1800\",") && f[2].contains(",\"711506\","), "{f:?}");
+    }
+
     #[test]
     fn live_transmission_keeps_call_open_and_adds_facts() {
         let d = dir("live");
         let mut l = log(&d, 1);
         let t = ms(2026, 11, 20, 10, 0, 0);
         l.grant(&g(27, 0, HZ, false, false), t);
-        l.live(&[Live { hz: HZ, group: 27, source: 711035, encrypted: true }], t + 4000);
+        l.live(&[Live { encrypted: true, ..on_air(711035, t + 100) }], t + 4000);
         l.tick(t + 4000);
         assert!(!d.join("20261120_SGCo_call_events.log").exists(), "still open");
         l.tick(t + 4000 + IDLE_MS + 1);

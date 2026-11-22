@@ -160,6 +160,7 @@ impl Recorder {
     pub fn live(&self) -> Vec<Live> {
         self.chans.values().filter_map(|c| c.seg.as_ref().map(|s| Live {
             hz: c.grant.hz, group: s.group, source: s.source, encrypted: c.grant.encrypted || s.encrypted == Some(true),
+            channel: c.grant.channel, start_ms: s.start_ms,
         })).collect()
     }
 
@@ -303,7 +304,7 @@ mod tests {
         r.handle(&grant(1, 859_962_500), 0, &mut t);
         assert!(r.live().is_empty(), "granted, nothing heard yet");
         r.handle(&ldu1(Some(lc(1, 711_035, 0x04))), 10, &mut t);
-        assert_eq!(r.live(), vec![Live { hz: 859_962_500, group: 1, source: 711_035, encrypted: false }]);
+        assert_eq!(r.live(), vec![Live { hz: 859_962_500, group: 1, source: 711_035, encrypted: false, channel: Channel { band: 0, number: 4016 }, start_ms: 10 }]);
         r.handle(&ControlEvent::VoiceEnd { id: 1 }, 20, &mut t);
         assert!(r.live().is_empty(), "the transmission ended; the channel stays open for a rekey");
     }
