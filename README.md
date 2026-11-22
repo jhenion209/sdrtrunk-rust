@@ -24,6 +24,9 @@ Calls can also be played live to Icecast streams.
   RadioReference CSV import.
 - Icecast streaming: each stream plays the calls of chosen talkgroups (from any alias list) in order, with silence in
   between, now-playing titles, and import of the streams in an sdrtrunk playlist.
+- Call event log: one row per call (every talkgroup, encrypted calls included) in sdrtrunk's `*_call_events.log` CSV
+  format, a file per system per day, kept 30 days by default (folder and days set on the Recordings page), searchable on
+  the Event Log page by system, call type, encryption, emergency, talkgroups, source radio IDs and time range.
 - Web UI: dashboard with live calls and signal readouts, tuner spectrum and waterfall, per-channel spectrum, signal and
   decode-quality history, user accounts (owner and admins).
 
