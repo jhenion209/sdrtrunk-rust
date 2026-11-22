@@ -2,6 +2,7 @@
 //! ingests them unchanged. Encrypted transmissions (LDU1 link control or LDU2 ESS) and talkgroups set not to record
 //! are never written.
 use crate::db::Talkgroup;
+use crate::event_log::Live;
 use crate::streaming::{title, StreamCall, Streams};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
@@ -155,6 +156,13 @@ impl Recorder {
         }).collect()
     }
 
+    /// Transmissions heard now (channels with an open segment), for the call event log.
+    pub fn live(&self) -> Vec<Live> {
+        self.chans.values().filter_map(|c| c.seg.as_ref().map(|s| Live {
+            hz: c.grant.hz, group: s.group, source: s.source, encrypted: c.grant.encrypted || s.encrypted == Some(true),
+        })).collect()
+    }
+
     pub fn tick(&mut self, now_ms: i64, tuner: &mut dyn Tuner) {
         let ids: Vec<u32> = self.chans.keys().copied().collect();
         for id in ids {
@@ -287,6 +295,17 @@ mod tests {
         assert!(text.contains("27\"Jail 1\"") && text.contains("Frequency:858737500;") && text.contains("Channel:0-4016;"), "{}", &text[..300]);
         assert!(text.contains("System:Sedgwick County;Site:Simulcast;Name:T-Control;Decoder:P25 Phase 1;"));
         assert!(t.closed.is_empty(), "channel kept for a rekey");
+    }
+
+    #[test]
+    fn live_lists_open_transmissions_only() {
+        let (mut r, mut t) = (Recorder::new(&dir("live"), names(), Arc::default()), FakeTuner::default());
+        r.handle(&grant(1, 859_962_500), 0, &mut t);
+        assert!(r.live().is_empty(), "granted, nothing heard yet");
+        r.handle(&ldu1(Some(lc(1, 711_035, 0x04))), 10, &mut t);
+        assert_eq!(r.live(), vec![Live { hz: 859_962_500, group: 1, source: 711_035, encrypted: false }]);
+        r.handle(&ControlEvent::VoiceEnd { id: 1 }, 20, &mut t);
+        assert!(r.live().is_empty(), "the transmission ended; the channel stays open for a rekey");
     }
 
     #[test]
