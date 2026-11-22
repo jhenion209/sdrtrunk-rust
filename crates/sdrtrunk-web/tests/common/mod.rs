@@ -6,7 +6,7 @@ use http_body_util::BodyExt;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use sdrtrunk_web::app::{router, AppState};
-use sdrtrunk_web::auth::{Role, Throttle};
+use sdrtrunk_web::auth::{Function, Role, Throttle};
 use sdrtrunk_web::db::{Db, System};
 use sdrtrunk_web::receiver::{Receivers, Sdrs};
 use sdrtrunk_web::recorder::RecordPolicy;
@@ -56,10 +56,22 @@ pub async fn send(st: &AppState, method: &str, path: &str, cookie: Option<&str>,
 }
 
 /// Creates the user if needed and returns (cookie header, csrf token).
+/// Admins it creates may use every function (the tests written before permissions expect that).
 pub fn login_as(st: &AppState, username: &str, role: Role) -> (String, String) {
-    let user = st.db.users().into_iter().find(|u| u.username == username)
-        .unwrap_or_else(|| st.db.create_user(username, PW, role, 0).unwrap());
+    let user = st.db.users().into_iter().find(|u| u.username == username).unwrap_or_else(|| {
+        let u = st.db.create_user(username, PW, role, 0).unwrap();
+        if role == Role::Admin { st.db.set_allowed(u.id, &Function::ALL).unwrap(); }
+        u
+    });
     let token = st.db.create_session(user.id, sdrtrunk_web::receiver::now_ms());
     let csrf = st.db.session(&token, sdrtrunk_web::receiver::now_ms()).unwrap().csrf;
     (format!("sdrtrunk_rust_session={token}"), csrf)
+}
+
+/// An admin allowed exactly `fs` (created if needed); returns (cookie header, csrf token).
+pub fn login_with(st: &AppState, username: &str, fs: &[Function]) -> (String, String) {
+    let (cookie, csrf) = login_as(st, username, Role::Admin);
+    let id = st.db.users().into_iter().find(|u| u.username == username).unwrap().id;
+    st.db.set_allowed(id, fs).unwrap();
+    (cookie, csrf)
 }

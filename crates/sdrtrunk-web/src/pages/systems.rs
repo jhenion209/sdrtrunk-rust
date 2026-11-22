@@ -1,5 +1,6 @@
 //! Systems: add, edit and delete the trunked systems sdrtrunk-rust follows. Saving one restarts only that system.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, System};
 use crate::pages::layout::{field_error, layout, layout_with, notice, Head};
@@ -200,11 +201,13 @@ fn store(st: &AppState, s: &Session, id: Option<i64>, f: &SystemForm) -> Respons
 }
 
 pub async fn create(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<SystemForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsAdd) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     store(&st, &s, None, &f)
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(f): Form<SystemForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if st.db.system(id).is_none() { return (StatusCode::NOT_FOUND, "No such system.").into_response(); }
     store(&st, &s, Some(id), &f)
@@ -214,6 +217,7 @@ pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Pa
 pub struct CsrfOnly { #[serde(default)] csrf: String }
 
 pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(f): Form<CsrfOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsDelete) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     let Some(sys) = st.db.system(id) else { return (StatusCode::NOT_FOUND, "No such system.").into_response() };
     if let Err(e) = st.db.delete_system(id) {

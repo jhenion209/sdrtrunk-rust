@@ -1,0 +1,96 @@
+mod common;
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use common::*;
+use http_body_util::BodyExt;
+use sdrtrunk_web::app::{router, AppState};
+use sdrtrunk_web::auth::{Function, Role};
+use tower::ServiceExt;
+
+const TUNER: &str = "735863DC-2F67AFE3";
+const REFUSED: &str = "You are not allowed to ";
+
+/// Every covered POST route and the function it needs (the spec's table). `true`: multipart.
+fn routes() -> Vec<(String, Function, bool)> {
+    use Function::*;
+    vec![
+        ("/systems/new".into(), SystemsAdd, false),
+        ("/systems/1".into(), SystemsEdit, false),
+        ("/systems/1/delete".into(), SystemsDelete, false),
+        (format!("/tuners/{TUNER}"), TunersEdit, false),
+        ("/talkgroups".into(), TalkgroupsEdit, false),
+        ("/talkgroups/27/delete".into(), TalkgroupsEdit, false),
+        ("/talkgroups/unlisted".into(), TalkgroupsEdit, false),
+        ("/talkgroups/record".into(), TalkgroupsEdit, false),
+        ("/talkgroups/reviewed".into(), TalkgroupsEdit, false),
+        ("/talkgroups/27/reviewed".into(), TalkgroupsEdit, false),
+        ("/talkgroups/import".into(), TalkgroupsImport, true),
+        ("/talkgroups/import/apply".into(), TalkgroupsImport, false),
+        ("/streams/new".into(), StreamsAdd, false),
+        ("/streams/1".into(), StreamsEdit, false),
+        ("/streams/1/delete".into(), StreamsDelete, false),
+        ("/streams/import".into(), StreamsImport, true),
+        ("/streams/import/apply".into(), StreamsImport, false),
+        ("/recordings".into(), RecordingsEdit, false),
+    ]
+}
+
+/// POSTs an empty multipart body (the handler must refuse before reading it).
+async fn send_multipart(st: &AppState, path: &str, cookie: &str) -> (StatusCode, String) {
+    let req = Request::builder().method("POST").uri(path).header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "multipart/form-data; boundary=X").body(Body::from("--X--\r\n")).unwrap();
+    let res = router(st.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned())
+}
+
+async fn post(st: &AppState, path: &str, multipart: bool, cookie: &str, csrf: &str) -> (StatusCode, String) {
+    if multipart { return send_multipart(st, path, cookie).await; }
+    // recording_dir: /recordings rejects a body without it (422) before the handler runs.
+    let r = send(st, "POST", path, Some(cookie), &[("csrf", csrf), ("system", SYS), ("recording_dir", "/srv/recordings")]).await;
+    (r.status, r.body)
+}
+
+#[tokio::test]
+async fn every_change_route_needs_its_function() {
+    assert_eq!(routes().len(), 18);
+    for (path, f, multipart) in routes() {
+        let st = state();
+        let (cookie, csrf) = login_with(&st, "jordan", &[]);
+        let (status, body) = post(&st, &path, multipart, &cookie, &csrf).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} without {f:?}");
+        assert!(body.contains(&format!("{REFUSED}{}. Ask the owner.", f.label().to_lowercase())), "{path}: {body}");
+        let (cookie, csrf) = login_with(&st, "jordan", &[f]);
+        let (_, body) = post(&st, &path, multipart, &cookie, &csrf).await;
+        assert!(!body.contains(REFUSED), "{path} with {f:?} must not be refused: {body}");
+    }
+}
+
+#[tokio::test]
+async fn owner_is_never_refused() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    for (path, _, multipart) in routes() {
+        let (_, body) = post(&st, &path, multipart, &cookie, &csrf).await;
+        assert!(!body.contains(REFUSED), "{path}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn refused_change_changes_nothing() {
+    let st = state();
+    let (cookie, csrf) = login_with(&st, "jordan", &[Function::SystemsAdd]);
+    let r = send(&st, "POST", "/systems/1", Some(&cookie), &[("csrf", csrf.as_str()), ("enabled", "on"), ("system_name", "Renamed"),
+        ("site_name", "S"), ("channel_name", "C"), ("primary", "852.1125"), ("failover_ms", "1000"), ("modulation", "c4fm")]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(st.db.systems()[0].system_name, SYS);
+}
+
+#[tokio::test]
+async fn account_page_always_allowed() {
+    let st = state();
+    let (cookie, csrf) = login_with(&st, "jordan", &[]);
+    let r = send(&st, "POST", "/account", Some(&cookie), &[("csrf", csrf.as_str()), ("current", PW),
+        ("password", "my new long password"), ("password2", "my new long password")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+}

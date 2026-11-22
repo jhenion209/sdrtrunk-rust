@@ -1,6 +1,7 @@
 //! Tuners: every SDR (connected now, in use, or configured before), its mode, what it is doing, and its settings.
 //! Settings belong to the device (keyed by serial), like sdrtrunk's tuner configuration.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, TunerConfig, TunerMode};
 use crate::pages::layout::{field_error, layout, layout_with, notice, Head};
@@ -251,6 +252,7 @@ pub async fn edit_page(State(st): State<AppState>, Authed(s, _): Authed, Path(id
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<String>, Form(f): Form<TunerForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TunersEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !valid(&id) { return (StatusCode::NOT_FOUND, "No such tuner.").into_response(); }
     let c = match f.to_config(&id, &st.db.tuner(&id)) { Ok(c) => c, Err(errors) => return form_view(&st, &s, &id, &f, &errors).into_response() };

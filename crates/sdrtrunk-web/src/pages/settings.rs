@@ -1,5 +1,6 @@
 //! Recordings page, plus the MHz helpers the Systems page uses.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, Settings};
 use crate::pages::layout::{field_error, layout, notice};
@@ -67,6 +68,7 @@ pub async fn recordings_page(State(st): State<AppState>, Authed(s, _): Authed, Q
 }
 
 pub async fn recordings_submit(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<RecordingsForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::RecordingsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     // An unparsable number becomes 0, which validate rejects with the days message.
     let new = Settings { recording_dir: f.recording_dir.trim().to_string(), event_log_dir: f.event_log_dir.trim().to_string(),

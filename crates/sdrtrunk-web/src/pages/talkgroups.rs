@@ -1,6 +1,7 @@
 //! Talkgroups: names and whether to record, kept in named alias lists (`?list=SGCo`) like sdrtrunk's; each system uses
 //! one list (chosen on the Systems page). Saving an existing number replaces it.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::Talkgroup;
 use crate::pages::layout::{layout, notice};
@@ -198,6 +199,7 @@ fn changed(st: &AppState, s: &Session, action: String) {
 
 /// Batch Record calls: `n` repeated for each selected talkgroup, `record` = "on" or "off".
 pub async fn record_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
     let system = get("list").unwrap_or("");
@@ -219,6 +221,7 @@ fn plural(n: usize, word: &str) -> String { format!("{n} {word}{}", if n == 1 { 
 
 /// RadioReference CSV upload: adds talkgroups the list does not have (marked NEW), then asks about names that differ.
 pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let (mut csrf, mut into, mut new_name, mut text) = (String::new(), String::new(), String::new(), String::new());
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
@@ -287,6 +290,7 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
 
 /// Applies the conflict choices: renames only talkgroups set to RadioReference's name; never adds or deletes.
 pub async fn import_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
     let system = get("list").unwrap_or("");
@@ -316,10 +320,12 @@ pub struct SystemOnly { #[serde(default)] csrf: String, #[serde(default, rename 
 
 /// Clears the NEW mark of one talkgroup (`/talkgroups/{n}/reviewed`) or of all (`/talkgroups/reviewed`).
 pub async fn reviewed_one(State(st): State<AppState>, Authed(s, _): Authed, Path(number): Path<u16>, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     reviewed(&st, &s, Some(number), &f)
 }
 
 pub async fn reviewed_all(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     reviewed(&st, &s, None, &f)
 }
 
@@ -333,6 +339,7 @@ fn reviewed(st: &AppState, s: &Session, number: Option<u16>, f: &SystemOnly) -> 
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<TalkgroupForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     let number = match f.number.trim().parse::<u16>() {
@@ -355,6 +362,7 @@ pub struct UnlistedForm { #[serde(default)] csrf: String, #[serde(default, renam
 
 /// The per-system "record unlisted talkgroups" switch. Applies to the next call; decoders keep running.
 pub async fn unlisted(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<UnlistedForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     let on = f.record_unlisted.is_some();
@@ -366,6 +374,7 @@ pub async fn unlisted(State(st): State<AppState>, Authed(s, _): Authed, Form(f):
 }
 
 pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(number): Path<u16>, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     if let Err(e) = st.db.delete_talkgroup(&f.system, number) {

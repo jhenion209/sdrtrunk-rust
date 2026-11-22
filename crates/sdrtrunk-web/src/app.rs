@@ -1,5 +1,5 @@
 //! Router, shared state, login extractors and the server entry point.
-use crate::auth::{new_setup_code, Role, Session, Throttle};
+use crate::auth::{new_setup_code, Function, Role, Session, Throttle};
 use crate::db::Db;
 use crate::pages;
 use crate::receiver::{now_ms, Receivers, Sdrs};
@@ -75,6 +75,15 @@ impl FromRequestParts<AppState> for ClientAddr {
     async fn from_request_parts(parts: &mut Parts, _: &AppState) -> Result<Self, Self::Rejection> {
         Ok(ClientAddr(parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string()).unwrap_or_else(|| "local".into())))
     }
+}
+
+/// The refusal (403 page) of a change the signed-in admin is not allowed; None when allowed (the owner always is).
+pub fn require(st: &AppState, s: &Session, f: Function) -> Option<Response> {
+    if st.db.may(&s.user, f) { return None; }
+    let page = crate::pages::layout::layout("Not allowed", Some(&s.user), &s.csrf, maud::html! {
+        p { "You are not allowed to " (f.label().to_lowercase()) ". Ask the owner." }
+    });
+    Some((StatusCode::FORBIDDEN, page).into_response())
 }
 
 pub fn check_csrf(session: &Session, form_csrf: &str) -> Result<(), StatusCode> {

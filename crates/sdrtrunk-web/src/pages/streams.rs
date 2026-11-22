@@ -1,6 +1,7 @@
 //! Streams: the Icecast streams that play talkgroups live (from any alias lists), their connection state, and an
 //! import of the streams in an sdrtrunk playlist. Passwords are stored but never shown again.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::FieldError;
 use crate::pages::layout::{field_error, layout, layout_with, notice, Head};
@@ -261,12 +262,14 @@ fn store(st: &AppState, s: &Session, id: Option<i64>, f: &StreamForm) -> Respons
 }
 
 pub async fn create(State(st): State<AppState>, Authed(s, _): Authed, Form(pairs): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::StreamsAdd) { return r; }
     let f = StreamForm::parse(&pairs);
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     store(&st, &s, None, &f)
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(pairs): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::StreamsEdit) { return r; }
     let f = StreamForm::parse(&pairs);
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if st.db.stream(id).is_none() { return (StatusCode::NOT_FOUND, "No such stream.").into_response(); }
@@ -277,6 +280,7 @@ pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Pa
 pub struct CsrfOnly { #[serde(default)] csrf: String }
 
 pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(f): Form<CsrfOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::StreamsDelete) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     let Some(c) = st.db.stream(id) else { return (StatusCode::NOT_FOUND, "No such stream.").into_response() };
     if let Err(e) = st.db.delete_stream(id) {
@@ -297,6 +301,7 @@ fn existing(st: &AppState, c: &StreamConfig) -> Option<StreamConfig> {
 /// Reads an uploaded playlist and shows what would be imported, with a choice of our alias list for each sdrtrunk
 /// alias list; nothing is saved until confirmed.
 pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::StreamsImport) { return r; }
     let (mut csrf, mut text) = (String::new(), String::new());
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
@@ -355,6 +360,7 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
 /// Saves the streams the user last previewed, their talkgroups moved to the chosen alias lists (streams left without
 /// talkgroups are skipped).
 pub async fn import_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(pairs): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::StreamsImport) { return r; }
     let csrf = pairs.iter().find(|(k, _)| k == "csrf").map(|(_, v)| v.as_str()).unwrap_or_default();
     if let Err(code) = check_csrf(&s, csrf) { return code.into_response(); }
     let Some(found) = st.receivers.streams.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&s.user.username) else {
