@@ -1,9 +1,10 @@
 //! Talkgroups: names and whether to record, kept in named alias lists (`?list=SGCo`) like sdrtrunk's; each system uses
 //! one list (chosen on the Systems page). Saving an existing number replaces it.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::Talkgroup;
-use crate::pages::layout::{layout, notice};
+use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
 use crate::rr_csv;
 use axum::extract::{Multipart, Path, Query, State};
@@ -101,7 +102,9 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
     rows.sort_by_key(|t| !fresh.contains(&t.number));
     let unlisted = st.db.record_unlisted(system);
     let home = url(system, "");
+    let can = st.db.may(&s.user, Function::TalkgroupsEdit);
     layout("Talkgroups", Some(&s.user), &s.csrf, html! {
+        @if !can { (read_only(Function::TalkgroupsEdit)) }
         @if names.len() > 1 {
             p { "Alias list: " @for n in &names { @if n == system { strong { (n) } } @else { a href=(url(n, "")) { (n) } } " " } }
         } @else { p { "Alias list: " strong { (system) } } }
@@ -109,58 +112,62 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
             @else { "Used by " (users.join(", ")) "." } }
         form method="post" action="/talkgroups/unlisted" {
             (hidden(s, system))
-            label.check { input type="checkbox" name="record_unlisted" checked[unlisted]; "Record talkgroups not listed here" }
-            button { "Save" }
+            fieldset.lock disabled[!can] {
+                label.check { input type="checkbox" name="record_unlisted" checked[unlisted]; "Record talkgroups not listed here" }
+            }
+            @if can { button { "Save" } }
         }
         p.muted { @if unlisted { "Talkgroups not listed here show as numbers and are recorded." }
             @else { "Only listed talkgroups with “Record calls” ticked are recorded." } }
         (notice(error, info))
-        h2 { @if editing { "Edit talkgroup " (f.number.trim()) } @else { "Add talkgroup" } }
-        form method="post" action="/talkgroups" {
-            (hidden(s, system))
-            label { "Number" input name="number" type="number" min="1" max="65535" value=(f.number) required; }
-            label { "Name" input name="name" maxlength="64" value=(f.name) required; }
-            label.check { input type="checkbox" name="record" checked[f.record.is_some() || f.number.is_empty()]; "Record calls" }
-            button { "Save talkgroup" }
-            @if editing { " " a href=(home) { "Cancel" } }
+        @if can {
+            h2 { @if editing { "Edit talkgroup " (f.number.trim()) } @else { "Add talkgroup" } }
+            form method="post" action="/talkgroups" {
+                (hidden(s, system))
+                label { "Number" input name="number" type="number" min="1" max="65535" value=(f.number) required; }
+                label { "Name" input name="name" maxlength="64" value=(f.name) required; }
+                label.check { input type="checkbox" name="record" checked[f.record.is_some() || f.number.is_empty()]; "Record calls" }
+                button { "Save talkgroup" }
+                @if editing { " " a href=(home) { "Cancel" } }
+            }
         }
-        (import_form(s, Some(system), &names))
+        @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(s, Some(system), &names)) }
         h2 { "Listed talkgroups" }
-        @if !fresh.is_empty() {
+        @if can && !fresh.is_empty() {
             form method="post" action="/talkgroups/reviewed" {
                 (hidden(s, system))
                 (fresh.len()) " new from an import. " button.plain { "Mark all reviewed" }
             }
         }
         @if rows.is_empty() { p.muted { "None yet." } } @else {
-            form #batch method="post" action="/talkgroups/record" {
+            @if can { form #batch method="post" action="/talkgroups/record" {
                 (hidden(s, system))
                 "Selected talkgroups: "
                 button name="record" value="on" { "Record selected" } " "
                 button name="record" value="off" { "Don't record selected" }
-            }
+            } }
             table {
                 thead { tr {
-                    th { input #select-all type="checkbox" title="Select all"; }
+                    th { @if can { input #select-all type="checkbox" title="Select all"; } }
                     th { a href=(sort.link(system, "number")) { "Talkgroup ID" (sort.arrow("number")) } }
                     th { a href=(sort.link(system, "name")) { "Talkgroup Name" (sort.arrow("name")) } }
                     th { a href=(sort.link(system, "record")) { "Record" (sort.arrow("record")) } }
                     th {} th {}
                 } }
                 tbody { @for t in &rows { tr {
-                    td { input type="checkbox" name="n" value=(t.number) form="batch" aria-label={ "Select talkgroup " (t.number) }; }
+                    td { @if can { input type="checkbox" name="n" value=(t.number) form="batch" aria-label={ "Select talkgroup " (t.number) }; } }
                     td { (t.number) }
-                    td { (t.name) @if fresh.contains(&t.number) { " " span.tag { "NEW" } " "
+                    td { (t.name) @if fresh.contains(&t.number) { " " span.tag { "NEW" } } @if can && fresh.contains(&t.number) { " "
                         form.inline method="post" action={ "/talkgroups/" (t.number) "/reviewed" } {
                             (hidden(s, system))
                             button.plain { "Mark reviewed" }
                         } } }
                     td { @if t.record { "yes" } @else { span.muted { "no" } } }
-                    td { a href=(url(system, &format!("&edit={}", t.number))) { "Edit" } }
-                    td { form method="post" action={ "/talkgroups/" (t.number) "/delete" } {
+                    td { @if can { a href=(url(system, &format!("&edit={}", t.number))) { "Edit" } } }
+                    td { @if can { form method="post" action={ "/talkgroups/" (t.number) "/delete" } {
                         (hidden(s, system))
                         button.danger { "Delete" }
-                    } }
+                    } } }
                 } } }
             }
         }
@@ -177,8 +184,9 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
     let first_system = st.db.systems().first().map(|x| x.list_name().to_string()).filter(|n| names.contains(n));
     let Some(system) = q.system.filter(|n| names.contains(n)).or(first_system).or_else(|| names.first().cloned()) else {
         return layout("Talkgroups", Some(&s.user), &s.csrf, html! {
-            p.muted { "No alias lists yet. Import one from RadioReference, or " a href="/systems/new" { "add a system" } " (it gets a list named after it)." }
-            (import_form(&s, None, &names))
+            p.muted { "No alias lists yet. Import one from RadioReference"
+                @if st.db.may(&s.user, Function::SystemsAdd) { ", or " a href="/systems/new" { "add a system" } " (it gets a list named after it)" } "." }
+            @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(&s, None, &names)) }
         });
     };
     let f = q.edit.and_then(|n| st.db.talkgroups(&system).into_iter().find(|t| t.number == n)).map_or_else(TalkgroupForm::default, |t| TalkgroupForm {
@@ -198,6 +206,7 @@ fn changed(st: &AppState, s: &Session, action: String) {
 
 /// Batch Record calls: `n` repeated for each selected talkgroup, `record` = "on" or "off".
 pub async fn record_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
     let system = get("list").unwrap_or("");
@@ -219,6 +228,7 @@ fn plural(n: usize, word: &str) -> String { format!("{n} {word}{}", if n == 1 { 
 
 /// RadioReference CSV upload: adds talkgroups the list does not have (marked NEW), then asks about names that differ.
 pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let (mut csrf, mut into, mut new_name, mut text) = (String::new(), String::new(), String::new(), String::new());
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
@@ -287,6 +297,7 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
 
 /// Applies the conflict choices: renames only talkgroups set to RadioReference's name; never adds or deletes.
 pub async fn import_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
     let system = get("list").unwrap_or("");
@@ -316,10 +327,12 @@ pub struct SystemOnly { #[serde(default)] csrf: String, #[serde(default, rename 
 
 /// Clears the NEW mark of one talkgroup (`/talkgroups/{n}/reviewed`) or of all (`/talkgroups/reviewed`).
 pub async fn reviewed_one(State(st): State<AppState>, Authed(s, _): Authed, Path(number): Path<u16>, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     reviewed(&st, &s, Some(number), &f)
 }
 
 pub async fn reviewed_all(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     reviewed(&st, &s, None, &f)
 }
 
@@ -333,6 +346,7 @@ fn reviewed(st: &AppState, s: &Session, number: Option<u16>, f: &SystemOnly) -> 
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<TalkgroupForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     let number = match f.number.trim().parse::<u16>() {
@@ -355,6 +369,7 @@ pub struct UnlistedForm { #[serde(default)] csrf: String, #[serde(default, renam
 
 /// The per-system "record unlisted talkgroups" switch. Applies to the next call; decoders keep running.
 pub async fn unlisted(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<UnlistedForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     let on = f.record_unlisted.is_some();
@@ -366,6 +381,7 @@ pub async fn unlisted(State(st): State<AppState>, Authed(s, _): Authed, Form(f):
 }
 
 pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(number): Path<u16>, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
     if let Err(e) = st.db.delete_talkgroup(&f.system, number) {

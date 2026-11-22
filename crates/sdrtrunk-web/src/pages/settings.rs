@@ -1,8 +1,9 @@
 //! Recordings page, plus the MHz helpers the Systems page uses.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, Settings};
-use crate::pages::layout::{field_error, layout, notice};
+use crate::pages::layout::{field_error, layout, notice, read_only};
 use crate::receiver::now_ms;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -38,14 +39,17 @@ pub struct RecordingsForm {
     #[serde(default)] event_log_days: String,
 }
 
-fn recordings_view(s: &Session, f: &RecordingsForm, errors: &[FieldError], saved: bool) -> Markup {
+/// `can`: the signed-in admin may change these settings (else the form is shown locked).
+fn recordings_view(s: &Session, f: &RecordingsForm, errors: &[FieldError], saved: bool, can: bool) -> Markup {
     layout("Recordings", Some(&s.user), &s.csrf, html! {
         (notice(None, saved.then_some("Saved. Every system restarted.")))
         (field_error(errors, "form"))
         p.muted { "Each clear call from every system is saved here as an MP3 for ScannerPulse, named and tagged like sdrtrunk's. "
             "File names use each system's System, Site and Channel names (set on the " a href="/systems" { "Systems" } " page)." }
+        @if !can { (read_only(Function::RecordingsEdit)) }
         form method="post" action="/recordings" {
             input type="hidden" name="csrf" value=(s.csrf);
+            fieldset.lock disabled[!can] {
             label { "Folder on this computer" input name="recording_dir" value=(f.recording_dir); }
             (field_error(errors, "recording_dir"))
             p.muted { "Every call each system hears is also logged, one line per call, to a daily CSV file in sdrtrunk's call event "
@@ -54,7 +58,8 @@ fn recordings_view(s: &Session, f: &RecordingsForm, errors: &[FieldError], saved
             (field_error(errors, "event_log_dir"))
             label { "Keep call event logs for (days)" input type="number" name="event_log_days" min="1" max="3650" value=(f.event_log_days); }
             (field_error(errors, "event_log_days"))
-            button { "Save and restart all systems" }
+            }
+            @if can { button { "Save and restart all systems" } }
         }
     })
 }
@@ -63,17 +68,18 @@ pub async fn recordings_page(State(st): State<AppState>, Authed(s, _): Authed, Q
     let cur = st.db.settings();
     let f = RecordingsForm { csrf: String::new(), recording_dir: cur.recording_dir, event_log_dir: cur.event_log_dir,
         event_log_days: cur.event_log_days.to_string() };
-    recordings_view(&s, &f, &[], q.saved.is_some())
+    recordings_view(&s, &f, &[], q.saved.is_some(), st.db.may(&s.user, Function::RecordingsEdit))
 }
 
 pub async fn recordings_submit(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<RecordingsForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::RecordingsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     // An unparsable number becomes 0, which validate rejects with the days message.
     let new = Settings { recording_dir: f.recording_dir.trim().to_string(), event_log_dir: f.event_log_dir.trim().to_string(),
         event_log_days: f.event_log_days.trim().parse().unwrap_or(0) };
-    if let Err(errors) = new.validate() { return recordings_view(&s, &f, &errors, false).into_response(); }
+    if let Err(errors) = new.validate() { return recordings_view(&s, &f, &errors, false, true).into_response(); }
     if let Err(e) = st.db.save_settings(&new) {
-        return recordings_view(&s, &f, &[FieldError { field: "form", message: format!("Could not save: {e}") }], false).into_response();
+        return recordings_view(&s, &f, &[FieldError { field: "form", message: format!("Could not save: {e}") }], false, true).into_response();
     }
     // ponytail: restarts join every decoder thread (up to ~200 ms each) on this request; fine for a settings form.
     st.receivers.restart_all(&st.db);

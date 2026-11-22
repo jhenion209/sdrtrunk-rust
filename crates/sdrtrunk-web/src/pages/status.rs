@@ -1,5 +1,6 @@
 //! Dashboard: everything at a glance (a summary strip, one panel per system with its live readouts and the last
 //! hour's decode quality, the live call feed, and the tuners) and the live event stream behind it.
+use crate::auth::Function;
 use crate::app::{AppState, Authed};
 use crate::pages::layout::{layout_with, pill, Head};
 use crate::db::TunerMode;
@@ -130,7 +131,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed) -> Markup {
     let tuners = tuner_rows(&st);
     let head = Head {
         subtitle: Some(html! { "Live receivers, calls and tuners." }),
-        actions: Some(html! { a.button href="/systems/new" { "Add a system" } }),
+        actions: st.db.may(&s.user, Function::SystemsAdd).then(|| html! { a.button href="/systems/new" { "Add a system" } }),
     };
     layout_with("Dashboard", head, Some(&s.user), &s.csrf, html! {
         div.summary {
@@ -150,7 +151,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed) -> Markup {
                 div.systems {
                     @if systems.is_empty() {
                         section.panel.empty { h2 { "No systems yet" } p { "Add a system to start receiving: its control channel, "
-                            "modulation and which SDR to use." } a.button href="/systems/new" { "Add a system" } }
+                            "modulation and which SDR to use." } @if st.db.may(&s.user, Function::SystemsAdd) { a.button href="/systems/new" { "Add a system" } } }
                     }
                     @for sys in &systems { (system_panel(&st, sys, now)) }
                 }

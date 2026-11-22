@@ -1,5 +1,5 @@
 //! Router, shared state, login extractors and the server entry point.
-use crate::auth::{new_setup_code, Role, Session, Throttle};
+use crate::auth::{new_setup_code, Function, Role, Session, Throttle};
 use crate::db::Db;
 use crate::pages;
 use crate::receiver::{now_ms, Receivers, Sdrs};
@@ -77,6 +77,15 @@ impl FromRequestParts<AppState> for ClientAddr {
     }
 }
 
+/// The refusal (403 page) of a change the signed-in admin is not allowed; None when allowed (the owner always is).
+pub fn require(st: &AppState, s: &Session, f: Function) -> Option<Response> {
+    if st.db.may(&s.user, f) { return None; }
+    let page = crate::pages::layout::layout("Not allowed", Some(&s.user), &s.csrf, maud::html! {
+        p { "You are not allowed to " (f.label().to_lowercase()) ". Ask the owner." }
+    });
+    Some((StatusCode::FORBIDDEN, page).into_response())
+}
+
 pub fn check_csrf(session: &Session, form_csrf: &str) -> Result<(), StatusCode> {
     if !form_csrf.is_empty() && session.csrf == form_csrf { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
 }
@@ -118,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route("/users", get(pages::users::page).post(pages::users::add))
         .route("/users/{id}/password", post(pages::users::reset_password))
         .route("/users/{id}/delete", post(pages::users::remove))
+        .route("/users/{id}/allowed", post(pages::users::set_allowed))
         .route("/account", get(pages::account::page).post(pages::account::submit))
         .route("/login", get(pages::login::page).post(pages::login::submit))
         .route("/logout", post(pages::login::logout))

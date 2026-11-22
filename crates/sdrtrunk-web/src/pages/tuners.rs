@@ -1,9 +1,10 @@
 //! Tuners: every SDR (connected now, in use, or configured before), its mode, what it is doing, and its settings.
 //! Settings belong to the device (keyed by serial), like sdrtrunk's tuner configuration.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, TunerConfig, TunerMode};
-use crate::pages::layout::{field_error, layout, layout_with, notice, Head};
+use crate::pages::layout::{field_error, layout, layout_with, notice, Head, read_only};
 use crate::pages::settings::{format_mhz, parse_mhz, Saved};
 use crate::receiver::{now_ms, Status};
 use axum::extract::{Path, Query, State};
@@ -172,6 +173,7 @@ impl TunerForm {
 fn form_view(st: &AppState, s: &Session, id: &str, f: &TunerForm, errors: &[FieldError]) -> Markup {
     let row = rows(st).into_iter().find(|r| r.id == id);
     let in_use = row.as_ref().is_some_and(|r| r.user.is_some());
+    let can = st.db.may(&s.user, Function::TunersEdit);
     let head = Head {
         subtitle: Some(html! { "Mode, tuning, frequency correction and gain of this SDR." }),
         actions: in_use.then(|| html! { a.button href={ "/tuners/" (id) "/spectrum" } { "Spectrum" } }),
@@ -191,8 +193,10 @@ fn form_view(st: &AppState, s: &Session, id: &str, f: &TunerForm, errors: &[Fiel
                 }
             }
         }
+        @if !can { (read_only(Function::TunersEdit)) }
         form method="post" action={ "/tuners/" (id) } {
             input type="hidden" name="csrf" value=(s.csrf);
+            fieldset.lock disabled[!can] {
             fieldset {
                 legend { "Mode" }
                 label.check { input type="radio" name="mode" value="live" checked[f.mode == "live" || f.mode.is_empty()]; "Live: systems may use this SDR" }
@@ -237,7 +241,8 @@ fn form_view(st: &AppState, s: &Session, id: &str, f: &TunerForm, errors: &[Fiel
                 }
                 (field_error(errors, "rate_hz"))
             }
-            div.form-actions { button { "Save" } a.button.quiet href="/tuners" { "Cancel" } }
+            }
+            div.form-actions { @if can { button { "Save" } } a.button.quiet href="/tuners" { "Cancel" } }
         }
     })
 }
@@ -251,6 +256,7 @@ pub async fn edit_page(State(st): State<AppState>, Authed(s, _): Authed, Path(id
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<String>, Form(f): Form<TunerForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TunersEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if !valid(&id) { return (StatusCode::NOT_FOUND, "No such tuner.").into_response(); }
     let c = match f.to_config(&id, &st.db.tuner(&id)) { Ok(c) => c, Err(errors) => return form_view(&st, &s, &id, &f, &errors).into_response() };

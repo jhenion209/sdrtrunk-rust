@@ -1,8 +1,9 @@
 //! Systems: add, edit and delete the trunked systems sdrtrunk-rust follows. Saving one restarts only that system.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, require, AppState, Authed};
+use crate::auth::Function;
 use crate::auth::Session;
 use crate::db::{FieldError, System};
-use crate::pages::layout::{field_error, layout, layout_with, notice, Head};
+use crate::pages::layout::{field_error, layout, layout_with, notice, Head, read_only};
 use crate::pages::settings::{format_mhz, parse_mhz, Saved};
 use crate::receiver::now_ms;
 use axum::extract::{Path, Query, State};
@@ -85,7 +86,7 @@ pub async fn list(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
     let systems = st.db.systems();
     let head = Head {
         subtitle: Some(html! { "Each system is one trunked site: its control channel, SDR and recording names." }),
-        actions: Some(html! { a.button href="/systems/new" { "Add a system" } }),
+        actions: st.db.may(&s.user, Function::SystemsAdd).then(|| html! { a.button href="/systems/new" { "Add a system" } }),
     };
     layout_with("Systems", head, Some(&s.user), &s.csrf, html! {
         (notice(None, q.saved.is_some().then_some("Saved. That system restarted.")))
@@ -114,10 +115,15 @@ fn form_view(st: &AppState, s: &Session, id: Option<i64>, f: &SystemForm, errors
     let example = format!("20261113_210324_{}_{}_{}__TO_23_FROM_703313.mp3", dash(&f.system_name), dash(&f.site_name), dash(&f.channel_name));
     let action = id.map_or("/systems/new".to_string(), |id| format!("/systems/{id}"));
     let title = if id.is_some() { "Edit system" } else { "Add system" };
+    let need = if id.is_some() { Function::SystemsEdit } else { Function::SystemsAdd };
+    let can = st.db.may(&s.user, need);
+    if id.is_none() && !can { return layout(title, Some(&s.user), &s.csrf, read_only(need)); }
     layout(title, Some(&s.user), &s.csrf, html! {
         (field_error(errors, "form"))
+        @if !can { (read_only(need)) }
         form method="post" action=(action) {
             input type="hidden" name="csrf" value=(s.csrf);
+            fieldset.lock disabled[!can] {
             label.check { input type="checkbox" name="enabled" checked[f.enabled.is_some()]; "Receive this system" }
             h2 { "Names" }
             label { "System name" input name="system_name" value=(f.system_name) required; }
@@ -163,9 +169,10 @@ fn form_view(st: &AppState, s: &Session, id: Option<i64>, f: &SystemForm, errors
                 "channels outside that are not recorded." }
             (field_error(errors, "tuner"))
             p.muted { "Gain, frequency correction and sample rate belong to the SDR: set them on the " a href="/tuners" { "Tuners" } " page." }
-            button { "Save and restart this system" } " " a href="/systems" { "Cancel" }
+            }
+            @if can { button { "Save and restart this system" } " " } a href="/systems" { "Cancel" }
         }
-        @if let Some(id) = id {
+        @if let Some(id) = id.filter(|_| st.db.may(&s.user, Function::SystemsDelete)) {
             h2 { "Delete" }
             form method="post" action={ "/systems/" (id) "/delete" } {
                 input type="hidden" name="csrf" value=(s.csrf);
@@ -200,11 +207,13 @@ fn store(st: &AppState, s: &Session, id: Option<i64>, f: &SystemForm) -> Respons
 }
 
 pub async fn create(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<SystemForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsAdd) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     store(&st, &s, None, &f)
 }
 
 pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(f): Form<SystemForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if st.db.system(id).is_none() { return (StatusCode::NOT_FOUND, "No such system.").into_response(); }
     store(&st, &s, Some(id), &f)
@@ -214,6 +223,7 @@ pub async fn save(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Pa
 pub struct CsrfOnly { #[serde(default)] csrf: String }
 
 pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(id): Path<i64>, Form(f): Form<CsrfOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::SystemsDelete) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     let Some(sys) = st.db.system(id) else { return (StatusCode::NOT_FOUND, "No such system.").into_response() };
     if let Err(e) = st.db.delete_system(id) {
