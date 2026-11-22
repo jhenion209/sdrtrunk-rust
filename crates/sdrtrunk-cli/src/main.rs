@@ -21,7 +21,8 @@ fn num<T: std::str::FromStr>(name: &str, default: Option<T>) -> T {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
+    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR
+       sdrtrunk-rust reset-password [USERNAME] [--db PATH]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
     std::process::exit(2)
 }
 
@@ -68,8 +69,31 @@ fn record() -> ! {
     }
 }
 
+/// `sdrtrunk-rust reset-password [USERNAME] [--db PATH]`: prints a new random password for USERNAME (signing them out
+/// everywhere); without USERNAME, lists the accounts. Run it as the service's user so the database is writable.
+fn reset_password() -> ! {
+    let db_path = arg("--db").map(std::path::PathBuf::from).unwrap_or_else(default_db);
+    let db = sdrtrunk_web::db::Db::open(&db_path).unwrap_or_else(|e| die(&format!("{}: {e}", db_path.display())));
+    let name = std::env::args().skip(2).take_while(|a| a != "--db").next();
+    let Some(name) = name else {
+        println!("accounts in {}:", db_path.display());
+        for u in db.users() { println!("  {} ({:?})", u.username, u.role); }
+        println!("usage: sdrtrunk-rust reset-password USERNAME [--db PATH]");
+        std::process::exit(2)
+    };
+    match db.reset_password(&name) {
+        Ok(pw) => {
+            println!("New password for {name}: {pw}");
+            println!("Sign in with it, then change it on the Account page. {name} was signed out everywhere.");
+            std::process::exit(0)
+        }
+        Err(e) => die(&format!("reset-password {name}: {e:?}")),
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("serve") { serve(); }
+    if std::env::args().nth(1).as_deref() == Some("reset-password") { reset_password(); }
     if std::env::args().nth(1).as_deref() == Some("record") { record(); }
     let freq: i64 = num("--freq", None);
     let ppm: f64 = num("--ppm", Some(0.0));
