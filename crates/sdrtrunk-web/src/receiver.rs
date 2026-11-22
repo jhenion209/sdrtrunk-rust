@@ -37,6 +37,9 @@ pub struct Status {
     pub tsbk_per_s: f64,
     pub dropped: u64,
     pub started_ms: i64,
+    /// Last second a valid control channel message arrived (`started_ms` until the first), and when the last error began.
+    pub last_control_ms: i64,
+    pub error_ms: i64,
     /// Tuner correction in use (moves with Automatic PPM) and the measured frequency error of the control channel.
     pub ppm: f64,
     pub auto_ppm: bool,
@@ -405,7 +408,7 @@ impl Receiver {
         let main = pick.as_ref().ok().cloned();
         let shared = Shared {
             status: Arc::new(Mutex::new(Status {
-                state: "starting".into(), control_hz: system.control_hz.first().copied(), started_ms: now_ms(), ..Status::default()
+                state: "starting".into(), control_hz: system.control_hz.first().copied(), started_ms: now_ms(), last_control_ms: now_ms(), ..Status::default()
             })),
             calls,
             policy: Arc::new(Mutex::new(policy)),
@@ -437,7 +440,7 @@ pub struct SetupRun { pub status: Arc<Mutex<Status>>, pub spectrum: Arc<Mutex<Sp
 
 impl SetupRun {
     fn start(id: String, cfg: TunerConfig, sdrs: Sdrs, claimed: Claimed) -> SetupRun {
-        let status = Arc::new(Mutex::new(Status { state: "starting".into(), started_ms: now_ms(), ..Status::default() }));
+        let status = Arc::new(Mutex::new(Status { state: "starting".into(), started_ms: now_ms(), last_control_ms: now_ms(), ..Status::default() }));
         let spectrum: Arc<Mutex<SpectrumView>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (st, sp, flag) = (status.clone(), spectrum.clone(), stop.clone());
@@ -756,7 +759,7 @@ fn update(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) { f(&mut status.l
 
 fn fail(status: &Mutex<Status>, msg: String) {
     eprintln!("decoder: {msg}");
-    update(status, |s| { s.state = "error".into(); s.error = Some(msg); });
+    update(status, |s| { s.state = "error".into(); s.error = Some(msg); s.error_ms = now_ms(); });
 }
 
 /// Marks the status as an error if the decoder thread unwinds, so the Status page never shows a dead decoder as running.
@@ -949,6 +952,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
             let rate = (cc.valid_tsbk() - tick_valid) as f64 / tick.elapsed().as_secs_f64();
             update(&status, |st| {
                 st.tsbk_per_s = rate;
+                if rate > 0.0 { st.last_control_ms = now; }
                 st.dropped = src.dropped();
                 st.recorded = rec.recorded;
                 st.recording_error = rec.last_error.clone().or_else(|| log.last_error.clone());
