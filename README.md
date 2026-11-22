@@ -28,7 +28,7 @@ Calls can also be played live to Icecast streams.
   format, a file per system per day, kept 30 days by default (folder and days set on the Recordings page), searchable on
   the Event Log page by system, call type, encryption, emergency, talkgroups, source radio IDs and time range.
 - Web UI: dashboard with live calls and signal readouts, tuner spectrum and waterfall, per-channel spectrum, signal and
-  decode-quality history, user accounts (owner and admins).
+  decode-quality history, user accounts (owner and admins; the owner allows each admin's changes function by function, and new admins start with none).
 
 Not supported: P25 Phase 2 (TDMA), DMR, NXDN, analog, and decryption.
 
