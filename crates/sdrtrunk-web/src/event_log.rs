@@ -209,8 +209,18 @@ pub struct Found {
     pub skipped: usize,
 }
 
-/// Reads the files of the days `f.from`..=`f.to` and returns page `page` (0-based) of the matching calls.
-/// A missing folder is an empty result.
+/// Deepest page served: memory stays bounded by `(MAX_PAGE + 1) * per_page` kept rows however wide the search.
+pub const MAX_PAGE: usize = 49;
+
+/// A row ranked newest first for the bounded heap in `search`.
+struct Ranked(Entry);
+impl PartialEq for Ranked { fn eq(&self, o: &Self) -> bool { self.cmp(o).is_eq() } }
+impl Eq for Ranked {}
+impl PartialOrd for Ranked { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
+impl Ord for Ranked { fn cmp(&self, o: &Self) -> std::cmp::Ordering { (self.0.start, self.0.id).cmp(&(o.0.start, o.0.id)) } }
+
+/// Reads the files of the days `f.from`..=`f.to` and returns page `page` (0-based) of the matching calls; pages past
+/// `MAX_PAGE` are empty (the totals still count every match). A missing folder is an empty result.
 // ponytail: scans the CSV files of the date range per request (~120 MB at 30 days); index them in SQLite if 30-day
 // searches get slow.
 pub fn search(dir: &Path, f: &Filter, page: usize, per_page: usize) -> std::io::Result<Found> {
@@ -221,15 +231,21 @@ pub fn search(dir: &Path, f: &Filter, page: usize, per_page: usize) -> std::io::
         Err(e) => return Err(e),
     };
     let want_system = f.system.as_deref().map(safe_name);
-    let (mut matches, mut events, mut radios) = (Vec::new(), std::collections::BTreeSet::new(), std::collections::HashSet::new());
+    // Only the newest `cap` matches are held (a min-heap drops the oldest), so a 30-day search does not hold 30 days.
+    let cap = if page > MAX_PAGE { 0 } else { (page + 1) * per_page };
+    let mut newest: std::collections::BinaryHeap<std::cmp::Reverse<Ranked>> = std::collections::BinaryHeap::new();
+    let (mut events, mut radios) = (std::collections::BTreeSet::new(), std::collections::HashSet::new());
     for entry in read {
         let entry = entry?;
         let Ok(file) = entry.file_name().into_string() else { continue };
         let Some(date) = log_date(&file) else { continue };
         if date < f.from.date() || date > f.to.date() { continue; }
+        if !entry.file_type()?.is_file() { continue; }
         let system = file[9..file.len() - "_call_events.log".len()].to_string();
         if want_system.as_ref().is_some_and(|w| *w != system) { continue; }
-        for line in std::fs::read_to_string(entry.path())?.lines() {
+        // Lossy: a row torn by a full disk must not hide the rest of the day.
+        let bytes = std::fs::read(entry.path())?;
+        for line in String::from_utf8_lossy(&bytes).lines() {
             if line.is_empty() || line == HEADER { continue; }
             let Some(e) = parse_row(&system, line) else { found.skipped += 1; continue };
             if e.start < f.from || e.start > f.to { continue; }
@@ -244,14 +260,17 @@ pub fn search(dir: &Path, f: &Filter, page: usize, per_page: usize) -> std::io::
             found.emergency += e.emergency as usize;
             found.air_ms += e.duration_ms;
             if let Some(r) = e.from { radios.insert(r); }
-            matches.push(e);
+            found.total += 1;
+            if cap > 0 {
+                newest.push(std::cmp::Reverse(Ranked(e)));
+                if newest.len() > cap { newest.pop(); }
+            }
         }
     }
-    matches.sort_by(|a, b| b.start.cmp(&a.start).then(b.id.cmp(&a.id)));
-    found.total = matches.len();
     found.radios = radios.len();
     found.events = events.into_iter().collect();
-    found.rows = matches.into_iter().skip(page * per_page).take(per_page).collect();
+    // into_sorted_vec of Reverse: newest first.
+    found.rows = newest.into_sorted_vec().into_iter().map(|r| r.0 .0).skip(page.saturating_mul(per_page)).take(per_page).collect();
     Ok(found)
 }
 
@@ -356,7 +375,8 @@ mod tests {
     fn g(group: u16, source: u32, hz: u64, encrypted: bool, emergency: bool) -> CallGrant {
         CallGrant { group, source, channel: Channel { band: 0, number: 4054 }, hz, encrypted, emergency }
     }
-    fn log(d: &Path, first_id: u64) -> EventLog { EventLog::new(Some(d.to_path_buf()), "SGCo", policy(), first_id, 30) }
+    // keep_days 3650: the fixed 2026-11 dates must not age out (prune runs on the real date).
+    fn log(d: &Path, first_id: u64) -> EventLog { EventLog::new(Some(d.to_path_buf()), "SGCo", policy(), first_id, 3650) }
     fn lines(d: &Path, day: &str) -> Vec<String> {
         std::fs::read_to_string(d.join(format!("{day}_SGCo_call_events.log"))).unwrap().lines().map(str::to_string).collect()
     }
@@ -603,6 +623,25 @@ mod tests {
         assert!(parse_ids::<u32>("  ").unwrap().is_empty());
         assert_eq!(parse_ids::<u32>("91a").unwrap_err(), "Use numbers separated by commas or spaces.");
         assert!(parse_ids::<u16>("70000").is_err(), "talkgroups are 16-bit");
+    }
+
+    #[test]
+    fn search_huge_page_is_empty() {
+        let d = sample("huge-page");
+        let r = search(&d, &day_filter(), usize::MAX, 200).unwrap();
+        assert_eq!((r.total, r.rows.len()), (5, 0));
+    }
+
+    #[test]
+    fn search_survives_a_torn_file() {
+        let d = sample("torn");
+        let f = d.join("20261120_SGCo_call_events.log");
+        let mut bytes = std::fs::read(&f).unwrap();
+        bytes.extend_from_slice(b"\"2026:11:20:11:00:00\",\"0\",\"APCO-25\",\"Group Call\",\"\",\"[Caf\xc3");
+        std::fs::write(&f, bytes).unwrap();
+        std::fs::create_dir(d.join("20261120_DIR_call_events.log")).unwrap();
+        let r = search(&d, &day_filter(), 0, 200).unwrap();
+        assert_eq!((r.total, r.skipped), (5, 1));
     }
 
     #[test]

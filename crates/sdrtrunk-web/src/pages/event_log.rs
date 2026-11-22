@@ -1,7 +1,7 @@
 //! Event Log page: the call event log files searched with filters, newest first.
 use crate::app::{AppState, Authed};
 use crate::db::FieldError;
-use crate::event_log::{parse_ids, search, Filter, Found};
+use crate::event_log::{parse_ids, search, Filter, Found, MAX_PAGE};
 use crate::pages::layout::{field_error, layout, notice};
 use crate::pages::settings::format_mhz;
 use axum::extract::{Query, State};
@@ -23,8 +23,11 @@ pub struct EventLogQuery {
     #[serde(default)] radios: String,
     #[serde(default)] from: String,
     #[serde(default)] to: String,
-    #[serde(default)] page: usize,
+    #[serde(default)] page: String,
 }
+
+/// The page number asked for; anything unreadable is the first page.
+fn page_no(q: &EventLogQuery) -> usize { q.page.trim().parse().unwrap_or(0) }
 
 fn err(field: &'static str, message: &str) -> FieldError { FieldError { field, message: message.into() } }
 
@@ -36,7 +39,8 @@ fn filter(q: &EventLogQuery, keep_days: u32, now: NaiveDateTime) -> Result<Filte
         NaiveDateTime::parse_from_str(s, INPUT).unwrap_or_else(|_| { errors.push(err(field, "Use a date and time.")); default })
     };
     let from = time(&q.from, now.date().and_hms_opt(0, 0, 0).expect("midnight"), "from", &mut errors);
-    let to = time(&q.to, now, "to", &mut errors);
+    // To covers its whole minute (the input has no seconds).
+    let to = if q.to.is_empty() { now } else { time(&q.to, now, "to", &mut errors) + chrono::Duration::seconds(59) };
     if to < from { errors.push(err("to", "To must be after From.")); }
     else if (to.date() - from.date()).num_days() >= keep_days as i64 {
         errors.push(err("from", &format!("Logs are kept for {keep_days} day{}.", if keep_days == 1 { "" } else { "s" })));
@@ -69,7 +73,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(mut q)
         Ok(f) => {
             if q.from.is_empty() { q.from = f.from.format(INPUT).to_string(); }
             if q.to.is_empty() { q.to = f.to.format(INPUT).to_string(); }
-            let page = q.page;
+            let page = page_no(&q);
             match tokio::task::spawn_blocking(move || search(&dir, &f, page, PER_PAGE)).await {
                 Ok(Ok(found)) => Ok(found),
                 Ok(Err(e)) => Err(vec![err("form", &format!("Could not read the event logs: {e}"))]),
@@ -85,7 +89,9 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(mut q)
 fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], result: &Result<Found, Vec<FieldError>>) -> Markup {
     let errors: &[FieldError] = result.as_ref().err().map(Vec::as_slice).unwrap_or(&[]);
     let events: &[String] = result.as_ref().map(|f| f.events.as_slice()).unwrap_or(&[]);
-    let link = |page: usize| format!("/event-log?{}", serde_urlencoded::to_string(EventLogQuery { page, ..q.clone() }).unwrap_or_default());
+    let page = page_no(q);
+    let link = |page: usize| format!("/event-log?{}",
+        serde_urlencoded::to_string(EventLogQuery { page: page.to_string(), ..q.clone() }).unwrap_or_default());
     layout("Event Log", Some(&s.user), &s.csrf, html! {
         (notice(errors.iter().find(|e| e.field == "form").map(|e| e.message.as_str()), None))
         form method="get" action="/event-log" {
@@ -138,8 +144,9 @@ fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], result:
                 } } }
             }
             p {
-                @if q.page > 0 { a href=(link(q.page - 1)) { "Newer" } " " }
-                @if (q.page + 1) * PER_PAGE < f.total { a href=(link(q.page + 1)) { "Older" } }
+                @if page > 0 && page <= MAX_PAGE + 1 { a href=(link(page - 1)) { "Newer" } " " }
+                @if page < MAX_PAGE && (page + 1) * PER_PAGE < f.total { a href=(link(page + 1)) { "Older" } }
+                @if page >= MAX_PAGE && f.total > (MAX_PAGE + 1) * PER_PAGE { " Narrow the search to see older calls." }
             }
         }
     })

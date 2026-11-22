@@ -68,3 +68,30 @@ async fn event_log_page_says_when_off() {
     let r = send(&st, "GET", "/event-log", Some(&cookie), &[]).await;
     assert!(r.body.contains("The call event log is off.") && r.body.contains("href=\"/recordings\""), "{}", r.body);
 }
+
+#[tokio::test]
+async fn event_log_page_to_includes_its_whole_minute() {
+    let st = state();
+    with_calls(&st, "minute");
+    let d = std::path::PathBuf::from(st.db.settings().event_log_dir);
+    let mut l = EventLog::new(Some(d), SYS, Arc::default(), 10, 3650);
+    let t = ms(11, 0) + 30_000;
+    l.grant(&CallGrant { group: 27, source: 4242, channel: Channel { band: 0, number: 4054 }, hz: 859_262_500, encrypted: false, emergency: false }, t);
+    l.close_all(t);
+    let (cookie, _) = login_as(&st, "admin", Role::Admin);
+    let r = send(&st, "GET", "/event-log?from=2026-11-20T11%3A00&to=2026-11-20T11%3A00", Some(&cookie), &[]).await;
+    assert!(r.body.contains("1 call,") && r.body.contains("4242"), "a call at 11:00:30 is within To 11:00: {}", r.body);
+}
+
+#[tokio::test]
+async fn event_log_page_bad_page_number_is_first_page() {
+    let st = state();
+    with_calls(&st, "page");
+    let (cookie, _) = login_as(&st, "admin", Role::Admin);
+    let r = send(&st, "GET", &format!("/event-log?{DAY}&page=abc"), Some(&cookie), &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("2 calls"), "{}", r.body);
+    let r = send(&st, "GET", &format!("/event-log?{DAY}&page=18446744073709551615"), Some(&cookie), &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("2 calls") && !r.body.contains("Older"), "{}", r.body);
+}
