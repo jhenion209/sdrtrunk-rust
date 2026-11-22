@@ -52,8 +52,11 @@ fn view(st: &AppState, s: &Session, error: Option<&str>) -> Markup {
                 @let allowed = st.db.allowed(u.id);
                 tr { td colspan="4" { form method="post" action={ "/users/" (u.id) "/allowed" } {
                     input type="hidden" name="csrf" value=(s.csrf);
-                    @for f in Function::ALL {
-                        label { input type="checkbox" name="function" value=(f.id()) checked[allowed.contains(&f)]; " " (f.label()) }
+                    fieldset {
+                        legend { "Permissions of " (u.username) }
+                        @for f in Function::ALL {
+                            label { input type="checkbox" name="function" value=(f.id()) checked[allowed.contains(&f)]; " " (f.label()) }
+                        }
                     }
                     button.plain { "Save permissions" }
                 } } }

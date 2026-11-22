@@ -184,7 +184,8 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
     let first_system = st.db.systems().first().map(|x| x.list_name().to_string()).filter(|n| names.contains(n));
     let Some(system) = q.system.filter(|n| names.contains(n)).or(first_system).or_else(|| names.first().cloned()) else {
         return layout("Talkgroups", Some(&s.user), &s.csrf, html! {
-            p.muted { "No alias lists yet. Import one from RadioReference, or " a href="/systems/new" { "add a system" } " (it gets a list named after it)." }
+            p.muted { "No alias lists yet. Import one from RadioReference"
+                @if st.db.may(&s.user, Function::SystemsAdd) { ", or " a href="/systems/new" { "add a system" } " (it gets a list named after it)" } "." }
             @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(&s, None, &names)) }
         });
     };

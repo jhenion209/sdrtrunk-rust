@@ -111,6 +111,7 @@ async fn owner_saves_permissions() {
     let page = send(&st, "GET", "/users", Some(&cookie), &[]).await.body;
     assert_eq!(page.matches(" checked").count(), 2, "exactly jordan's two boxes are checked: {page}");
     assert!(page.contains("value=\"systems.edit\" checked") && page.contains("value=\"tuners.edit\" checked"), "{page}");
+    assert!(page.contains("<legend>Permissions of jordan</legend>"), "checkboxes are named for their admin: {page}");
 }
 
 #[tokio::test]
@@ -150,6 +151,8 @@ async fn pages_show_limits() {
     let st = state();
     let (cookie, _) = login_with(&st, "jordan", &[Function::SystemsEdit]);
     let get = |path: &'static str, cookie: String| { let st = st.clone(); async move { send(&st, "GET", path, Some(&cookie), &[]).await.body } };
+    let dash = get("/", cookie.clone()).await;
+    assert!(!dash.contains("href=\"/systems/new\""), "dashboard: {dash}");
     let systems = get("/systems", cookie.clone()).await;
     assert!(!systems.contains("href=\"/systems/new\""), "{systems}");
     let new = get("/systems/new", cookie.clone()).await;

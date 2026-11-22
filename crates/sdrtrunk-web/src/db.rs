@@ -525,10 +525,9 @@ fn tuner_from_json(j: &str) -> Option<TunerConfig> {
     Some(if disabled { TunerConfig { mode: TunerMode::Disabled, ..t } } else { t })
 }
 
-/// Databases from before multiple systems: the one settings row becomes system 1 and its talkgroups move under its
-/// System name. Runs once (the old talkgroups table has no `system` column); all or nothing.
 /// Creates `user_allowed`. Only when it is new (an upgrade), admins that already exist are allowed every function, so
-/// the upgrade changes nothing; admins added later start with none.
+/// the upgrade changes nothing; admins added later start with none. `SCHEMA` must never create this table, or existing
+/// admins would silently lose the one-time grant.
 fn migrate_permissions(c: &mut Connection) -> rusqlite::Result<()> {
     if c.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_allowed'")?.exists([])? { return Ok(()); }
     let tx = c.transaction()?;
@@ -539,6 +538,8 @@ fn migrate_permissions(c: &mut Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// Databases from before multiple systems: the one settings row becomes system 1 and its talkgroups move under its
+/// System name. Runs once (the old talkgroups table has no `system` column); all or nothing.
 fn migrate_to_systems(c: &mut Connection) -> rusqlite::Result<()> {
     let old_table = c.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'talkgroups'")?.exists([])?;
     let has_system = c.prepare("SELECT 1 FROM pragma_table_info('talkgroups') WHERE name = 'system'")?.exists([])?;
