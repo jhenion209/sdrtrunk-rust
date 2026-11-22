@@ -44,15 +44,34 @@ CREATE TABLE IF NOT EXISTS unlisted (system TEXT PRIMARY KEY, record INTEGER NOT
 /// Settings shared by all systems.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Settings { pub recording_dir: String }
+pub struct Settings {
+    pub recording_dir: String,
+    /// Folder of the daily call event logs; empty: no event log.
+    pub event_log_dir: String,
+    /// Daily event log files older than this many days are deleted.
+    pub event_log_days: u32,
+}
 
 impl Default for Settings {
-    fn default() -> Self { Settings { recording_dir: "/var/lib/sdrtrunk-rust/recordings".into() } }
+    fn default() -> Self {
+        Settings { recording_dir: "/var/lib/sdrtrunk-rust/recordings".into(), event_log_dir: "/var/lib/sdrtrunk-rust/event_logs".into(), event_log_days: 30 }
+    }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), Vec<FieldError>> {
-        if self.recording_dir.starts_with('/') { Ok(()) } else { Err(vec![err("recording_dir", "Use a full path starting with /.")]) }
+        let mut e = Vec::new();
+        if !self.recording_dir.starts_with('/') { e.push(err("recording_dir", "Use a full path starting with /.")); }
+        if !self.event_log_dir.is_empty() && !self.event_log_dir.starts_with('/') {
+            e.push(err("event_log_dir", "Use a full path starting with /, or leave it empty."));
+        }
+        if !(1..=3650).contains(&self.event_log_days) { e.push(err("event_log_days", "Use 1 to 3650 days.")); }
+        if e.is_empty() { Ok(()) } else { Err(e) }
+    }
+
+    /// The event log folder, None when the event log is off.
+    pub fn event_log_path(&self) -> Option<std::path::PathBuf> {
+        (!self.event_log_dir.is_empty()).then(|| self.event_log_dir.clone().into())
     }
 }
 
@@ -544,6 +563,29 @@ mod tests {
     }
 
     #[test]
+    fn settings_event_log_default_and_old_json() {
+        let d = Settings::default();
+        assert_eq!((d.event_log_dir.as_str(), d.event_log_days), ("/var/lib/sdrtrunk-rust/event_logs", 30));
+        let old: Settings = serde_json::from_str(r#"{"recording_dir":"/srv/recordings"}"#).unwrap();
+        assert_eq!((old.recording_dir.as_str(), old.event_log_dir.as_str(), old.event_log_days), ("/srv/recordings", "/var/lib/sdrtrunk-rust/event_logs", 30));
+    }
+
+    #[test]
+    fn settings_event_log_validate() {
+        let with = |dir: &str, days: u32| Settings { event_log_dir: dir.into(), event_log_days: days, ..Settings::default() };
+        assert!(with("", 30).validate().is_ok());
+        assert_eq!(with("", 30).event_log_path(), None);
+        assert_eq!(with("/x", 1).event_log_path(), Some(std::path::PathBuf::from("/x")));
+        assert!(with("/x", 3650).validate().is_ok());
+        let e = with("logs", 30).validate().unwrap_err();
+        assert_eq!((e[0].field, e[0].message.as_str()), ("event_log_dir", "Use a full path starting with /, or leave it empty."));
+        for days in [0, 3651] {
+            let e = with("/x", days).validate().unwrap_err();
+            assert_eq!((e[0].field, e[0].message.as_str()), ("event_log_days", "Use 1 to 3650 days."));
+        }
+    }
+
+    #[test]
     fn systems_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.systems().is_empty(), "a fresh database has no systems");
@@ -576,7 +618,7 @@ mod tests {
         assert_eq!(fields(&System { site_name: " ".into(), ..d() }), vec!["names"]);
         assert_eq!(fields(&System { system_name: "x".repeat(61), ..d() }), vec!["names"]);
         assert_eq!(fields(&System { tuner: "not a serial".into(), ..d() }), vec!["tuner"]);
-        assert!(Settings { recording_dir: "rec".into() }.validate().is_err());
+        assert!(Settings { recording_dir: "rec".into(), ..Settings::default() }.validate().is_err());
         let t = TunerConfig::default;
         let tf = |c: TunerConfig| c.validate().err().unwrap_or_default().iter().map(|e| e.field).collect::<Vec<_>>();
         assert!(t().validate().is_ok());

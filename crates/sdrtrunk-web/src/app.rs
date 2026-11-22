@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/streams/import/apply", post(pages::streams::import_apply))
         .route("/streams/{id}", get(pages::streams::edit_page).post(pages::streams::save))
         .route("/streams/{id}/delete", post(pages::streams::delete))
+        .route("/event-log", get(pages::event_log::page))
         .route("/recordings", get(pages::settings::recordings_page).post(pages::settings::recordings_submit))
         .route("/talkgroups", get(pages::talkgroups::page).post(pages::talkgroups::save))
         .route("/talkgroups/{number}/delete", post(pages::talkgroups::delete))
@@ -170,5 +171,26 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, secure_cookies: bool, s
     });
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("SDRTrunk-Rust web UI on http://{listen}");
-    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await
+    let receivers = state.receivers.clone();
+    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal()).await?;
+    // Stopping joins every decoder, so open recordings and call event log rows are written before the process exits.
+    eprintln!("stopping systems");
+    let _ = tokio::task::spawn_blocking(move || receivers.stop_all()).await;
+    Ok(())
+}
+
+/// SIGTERM (systemctl stop/restart) or Ctrl-C.
+async fn shutdown_signal() {
+    let ctrl_c = async { let _ = tokio::signal::ctrl_c().await; };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => { s.recv().await; }
+            Err(e) => { eprintln!("cannot listen for SIGTERM: {e}"); std::future::pending::<()>().await }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }

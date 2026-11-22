@@ -122,6 +122,14 @@ impl Db {
         Ok(())
     }
 
+    /// Gives `username` a new random password (for `sdrtrunk-rust reset-password`) and signs them out everywhere.
+    pub fn reset_password(&self, username: &str) -> Result<String, AuthError> {
+        let user = self.users().into_iter().find(|u| u.username == username).ok_or(AuthError::NotFound)?;
+        let password = random_hex(10);
+        self.set_password(user.id, &password)?;
+        Ok(password)
+    }
+
     pub fn remove_user(&self, user_id: i64) -> Result<(), AuthError> {
         let c = self.conn();
         let role: Option<String> = c.query_row("SELECT role FROM users WHERE id = ?1", [user_id], |r| r.get(0)).optional().ok().flatten();
@@ -229,6 +237,19 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         assert!(matches!(db.create_user("a", "12345678901", Role::Owner, 0), Err(AuthError::WeakPassword)));
         assert_eq!(db.user_count(), 0);
+    }
+
+    #[test]
+    fn reset_password_gives_a_working_one() {
+        let (db, u) = db_with_owner();
+        let token = db.create_session(u.id, 0);
+        let new = db.reset_password("owner").unwrap();
+        assert!(new.chars().count() >= MIN_PASSWORD, "{new}");
+        assert_eq!(db.verify_login("owner", &new).unwrap().id, u.id);
+        assert!(matches!(db.verify_login("owner", PW), Err(AuthError::BadCredentials)), "old password no longer works");
+        assert!(db.session(&token, 0).is_none(), "signed out everywhere");
+        assert!(matches!(db.reset_password("nobody"), Err(AuthError::NotFound)));
+        assert_ne!(db.reset_password("owner").unwrap(), new, "random each time");
     }
 
     #[test]

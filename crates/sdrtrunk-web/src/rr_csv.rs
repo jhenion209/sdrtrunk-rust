@@ -37,7 +37,7 @@ pub fn parse(text: &str) -> Result<(Vec<RrTalkgroup>, Vec<String>), String> {
 }
 
 /// One CSV record split into fields (RFC 4180: quoted fields, `""` inside quotes is a quote).
-fn fields(line: &str) -> Vec<String> {
+pub(crate) fn fields(line: &str) -> Vec<String> {
     let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {

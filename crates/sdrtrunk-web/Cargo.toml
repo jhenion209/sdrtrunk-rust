@@ -12,7 +12,7 @@ serde_json = "1"
 argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "net", "time", "signal"] }
 sdrtrunk-p25 = { path = "../sdrtrunk-p25" }
 sdrtrunk-source = { path = "../sdrtrunk-source" }
 axum = { version = "0.8", features = ["multipart"] }
