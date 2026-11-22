@@ -820,7 +820,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
     });
     let channel = |i: usize, ppm: f64, center: i64| ControlChannel::new(center as f64, rate as f64, freq(i), ppm, now_ms(), modulation);
     let mut cc = match channel(0, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
-    let mut log = EventLog::new(settings.event_log_path(), &s.system_name, policy.clone(), now_ms() as u64);
+    let mut log = EventLog::new(settings.event_log_path(), &s.system_name, policy.clone(), now_ms() as u64, settings.event_log_days);
     let mut rec = Recorder::new(Path::new(&settings.recording_dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
     update(&status, |st| st.state = "running".into());
     let (mut tick, mut tick_valid, mut tick_frames) = (Instant::now(), 0u64, FrameCounts::default());

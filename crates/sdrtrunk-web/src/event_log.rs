@@ -8,7 +8,7 @@ use sdrtrunk_p25::trunk::CallGrant;
 use sdrtrunk_p25::tsbk_msg::Channel;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// A call ends this long after its last grant or voice frame (ms).
@@ -29,14 +29,33 @@ pub struct EventLog {
     policy: Arc<Mutex<RecordPolicy>>,
     next_id: u64,
     open: HashMap<u64, OpenCall>,
+    keep_days: u32,
+    /// Date of the last file written; a new date prunes old files.
+    last_day: Option<String>,
     pub last_error: Option<String>,
 }
 
 impl EventLog {
     /// `dir` None: logging is off and every method does nothing. `first_id` is the first EVENT_ID (the caller passes the
-    /// current time in ms, so IDs keep growing across restarts).
-    pub fn new(dir: Option<PathBuf>, system: &str, policy: Arc<Mutex<RecordPolicy>>, first_id: u64) -> EventLog {
-        EventLog { dir, system: system.into(), policy, next_id: first_id, open: HashMap::new(), last_error: None }
+    /// current time in ms, so IDs keep growing across restarts). Daily files older than `keep_days` are deleted now and
+    /// whenever a new day's file is written.
+    pub fn new(dir: Option<PathBuf>, system: &str, policy: Arc<Mutex<RecordPolicy>>, first_id: u64, keep_days: u32) -> EventLog {
+        let mut l = EventLog { dir, system: system.into(), policy, next_id: first_id, open: HashMap::new(), keep_days, last_day: None,
+            last_error: None };
+        l.prune_now();
+        l
+    }
+
+    fn prune_now(&mut self) {
+        let Some(dir) = self.dir.as_deref() else { return };
+        if let Err(e) = prune(dir, Local::now().date_naive(), self.keep_days) {
+            if e.kind() != std::io::ErrorKind::NotFound { self.fail(format!("event log: cannot delete old files in {}: {e}", dir.display())); }
+        }
+    }
+
+    fn fail(&mut self, msg: String) {
+        eprintln!("{msg}");
+        self.last_error = Some(msg);
     }
 
     pub fn grant(&mut self, g: &CallGrant, now_ms: i64) {
@@ -90,7 +109,8 @@ impl EventLog {
         };
         let line = row(c, name.as_deref(), self.next_id);
         self.next_id += 1;
-        let path = dir.join(file_name(&self.system, c.start_ms));
+        let name_on_disk = file_name(&self.system, c.start_ms);
+        let path = dir.join(&name_on_disk);
         let result = std::fs::create_dir_all(&dir).and_then(|_| {
             let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
             let mut out = String::new();
@@ -100,11 +120,15 @@ impl EventLog {
             f.flush()
         });
         match result {
-            Ok(()) => self.last_error = None,
-            Err(e) => {
-                eprintln!("event log: {}: {e}", path.display());
-                self.last_error = Some(format!("event log: {}: {e}", path.display()));
+            Ok(()) => {
+                self.last_error = None;
+                let day = name_on_disk[..8].to_string();
+                if self.last_day.as_ref() != Some(&day) {
+                    self.last_day = Some(day);
+                    self.prune_now();
+                }
             }
+            Err(e) => self.fail(format!("event log: {}: {e}", path.display())),
         }
     }
 }
@@ -112,6 +136,31 @@ impl EventLog {
 /// A stopping system (stop, failure, panic) writes the calls still open.
 impl Drop for EventLog {
     fn drop(&mut self) { self.close_all(0); }
+}
+
+/// Deletes `<yyyyMMdd>_<system>_call_events.log` files (any system) dated before `today - keep_days`; returns how many.
+/// Other files, and names whose date is not a real date, are left alone.
+pub fn prune(dir: &Path, today: chrono::NaiveDate, keep_days: u32) -> std::io::Result<usize> {
+    let cutoff = today - chrono::Days::new(keep_days as u64);
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Some(date) = log_date(&name) else { continue };
+        if date < cutoff && entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path())?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// The date of a daily event log file name, None for any other name.
+pub fn log_date(name: &str) -> Option<chrono::NaiveDate> {
+    let (date, rest) = (name.get(..8)?, name.get(8..)?);
+    let system = rest.strip_prefix('_')?.strip_suffix("_call_events.log")?;
+    if !date.bytes().all(|b| b.is_ascii_digit()) || system.is_empty() { return None; }
+    chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()
 }
 
 fn local(ms: i64) -> chrono::DateTime<Local> { Local.timestamp_millis_opt(ms).single().unwrap_or_else(Local::now) }
@@ -180,7 +229,7 @@ mod tests {
     fn g(group: u16, source: u32, hz: u64, encrypted: bool, emergency: bool) -> CallGrant {
         CallGrant { group, source, channel: Channel { band: 0, number: 4054 }, hz, encrypted, emergency }
     }
-    fn log(d: &Path, first_id: u64) -> EventLog { EventLog::new(Some(d.to_path_buf()), "SGCo", policy(), first_id) }
+    fn log(d: &Path, first_id: u64) -> EventLog { EventLog::new(Some(d.to_path_buf()), "SGCo", policy(), first_id, 30) }
     fn lines(d: &Path, day: &str) -> Vec<String> {
         std::fs::read_to_string(d.join(format!("{day}_SGCo_call_events.log"))).unwrap().lines().map(str::to_string).collect()
     }
@@ -306,10 +355,52 @@ mod tests {
         assert_eq!(lines(&d, "20261120").len(), 2, "a stopping system writes its open calls");
     }
 
+    fn touch(d: &Path, names: &[&str]) {
+        std::fs::create_dir_all(d).unwrap();
+        for n in names { std::fs::write(d.join(n), b"x").unwrap(); }
+    }
+    fn present(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        v.sort();
+        v
+    }
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate { chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap() }
+
+    #[test]
+    fn prune_keeps_window() {
+        let d = dir("prune-window");
+        touch(&d, &["20261120_SGCo_call_events.log", "20261121_SGCo_call_events.log", "20261121_KSICS_call_events.log",
+            "notes.txt", "20261340_SGCo_call_events.log"]);
+        assert_eq!(prune(&d, day(2026, 12, 21), 30).unwrap(), 1);
+        assert_eq!(present(&d), vec!["20261121_KSICS_call_events.log", "20261121_SGCo_call_events.log", "20261340_SGCo_call_events.log", "notes.txt"]);
+    }
+
+    #[test]
+    fn prune_keep_one_day() {
+        let d = dir("prune-one");
+        touch(&d, &["20261119_SGCo_call_events.log", "20261120_SGCo_call_events.log", "20261121_SGCo_call_events.log"]);
+        assert_eq!(prune(&d, day(2026, 11, 21), 1).unwrap(), 1);
+        assert_eq!(present(&d), vec!["20261120_SGCo_call_events.log", "20261121_SGCo_call_events.log"]);
+    }
+
+    #[test]
+    fn new_day_prunes() {
+        let d = dir("prune-new");
+        touch(&d, &["20200101_X_call_events.log"]);
+        let _l = EventLog::new(Some(d.clone()), "SGCo", policy(), 1, 1);
+        assert!(present(&d).is_empty(), "an old day's file is deleted when the system starts");
+        let mut l = EventLog::new(Some(d.clone()), "SGCo", policy(), 1, 1);
+        touch(&d, &["20200102_X_call_events.log"]);
+        let t = Local::now().timestamp_millis();
+        l.grant(&g(27, 911, HZ, false, false), t);
+        l.close_all(t);
+        assert!(!d.join("20200102_X_call_events.log").exists(), "and when a new day's file is opened");
+    }
+
     #[test]
     fn off_does_nothing() {
         let d = dir("off");
-        let mut l = EventLog::new(None, "SGCo", policy(), 1);
+        let mut l = EventLog::new(None, "SGCo", policy(), 1, 30);
         let t = ms(2026, 11, 20, 10, 0, 0);
         l.grant(&g(27, 911, HZ, false, false), t);
         l.close_all(t);

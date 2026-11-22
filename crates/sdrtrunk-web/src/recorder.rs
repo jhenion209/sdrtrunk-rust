@@ -314,7 +314,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         let tgs: Arc<Mutex<RecordPolicy>> = Arc::default();
         let (mut r, mut t) = (Recorder::new(&dir("event-log-rec"), names(), tgs.clone()), FakeTuner::default());
-        let mut log = crate::event_log::EventLog::new(Some(d.clone()), "SGCo", tgs, 1);
+        let mut log = crate::event_log::EventLog::new(Some(d.clone()), "SGCo", tgs, 1, 30);
         let start = Local::now().timestamp_millis();
         let ControlEvent::Call(g) = grant(27, 858_737_500) else { unreachable!() };
         log.grant(&g, start);
