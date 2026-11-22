@@ -25,6 +25,21 @@ pub struct Facts<'a> {
     pub failures: usize,
 }
 
+/// `text` with every tuner id this system knows of replaced by "tuner": the page needs no login, so no serials.
+fn scrub(text: &str, f: &Facts, st: &Status) -> String {
+    let mut ids: Vec<&str> = f.connected.iter().map(String::as_str).chain(f.configured_tuner.as_deref()).chain(st.tuner.as_deref())
+        .chain(st.helpers.iter().map(|(id, _)| id.as_str()))
+        .flat_map(|id| [id, id.strip_prefix("rtl:").unwrap_or(id)]).filter(|id| !id.is_empty()).collect();
+    ids.sort_unstable();
+    // Whole words only (letters, digits, '-', ':'), so a short id never eats part of another word.
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == ':';
+    text.split_inclusive(|c: char| !word(c)).map(|piece| {
+        let end = piece.trim_end_matches(|c: char| !word(c));
+        let tail = &piece[end.len()..];
+        if ids.binary_search(&end).is_ok() { format!("tuner{tail}") } else { piece.to_string() }
+    }).collect()
+}
+
 /// The system's problems, in a fixed order; empty when healthy.
 pub fn problems(now_ms: i64, f: &Facts) -> Vec<String> {
     let mut out = Vec::new();
@@ -35,8 +50,13 @@ pub fn problems(now_ms: i64, f: &Facts) -> Vec<String> {
             "error" => (st.error_ms, DOWN_MS),
             _ => (st.started_ms, DOWN_MS),
         };
+        // Restarts that retry a failed system do not restart its grace.
+        let (since, grace) = match st.down_since_ms { Some(d) => (d.min(since), DOWN_MS), None => (since, grace) };
         if now_ms - since > grace {
-            out.push(match &st.error { Some(e) => format!("not running ({}: {e})", st.state), None => format!("not running ({})", st.state) });
+            out.push(match &st.error {
+                Some(e) => format!("not running ({}: {})", st.state, scrub(e, f, st)),
+                None => format!("not running ({})", st.state),
+            });
         }
     } else if now_ms - st.last_control_ms > DOWN_MS {
         out.push(format!("control channel lost for {} s", (now_ms - st.last_control_ms) / 1000));
@@ -93,6 +113,27 @@ mod tests {
         assert_eq!(problems(NOW, &facts(Some(&st), &[], &c)), vec!["not running (error: airspy: no device)"]);
         st.error_ms = NOW - 29_000;
         assert!(problems(NOW, &facts(Some(&st), &[], &c)).is_empty());
+    }
+
+    #[test]
+    fn error_text_names_no_tuner_serial() {
+        let mut st = status("error", 0, NOW - 31_000, 0);
+        st.error = Some("Airspy 0000000A-0000000B not found; RTL-SDR 00000042 is used by another system".into());
+        let c = conn(&["rtl:00000042"]);
+        let f = Facts { configured_tuner: Some("0000000A-0000000B".into()), ..facts(Some(&st), &[], &c) };
+        let p = problems(NOW, &f);
+        assert_eq!(p[0], "not running (error: Airspy tuner not found; RTL-SDR tuner is used by another system)");
+        assert!(!p.join(" ").contains("0000000A") && !p.join(" ").contains("00000042"), "{p:?}");
+    }
+
+    #[test]
+    fn down_since_survives_restarts() {
+        let mut st = status("error", 0, NOW - 5_000, 0);
+        st.down_since_ms = Some(NOW - 40_000);
+        assert_eq!(problems(NOW, &facts(Some(&st), &[], &conn(&["A"]))), vec!["not running (error)"]);
+        st.state = "starting".into();
+        st.started_ms = NOW - 5_000;
+        assert_eq!(problems(NOW, &facts(Some(&st), &[], &conn(&["A"]))), vec!["not running (starting)"]);
     }
 
     #[test]

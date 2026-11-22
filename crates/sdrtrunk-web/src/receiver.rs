@@ -40,6 +40,8 @@ pub struct Status {
     /// Last second a valid control channel message arrived (`started_ms` until the first), and when the last error began.
     pub last_control_ms: i64,
     pub error_ms: i64,
+    /// When the system first failed, carried over the restarts that retry it; None once it runs.
+    pub down_since_ms: Option<i64>,
     /// Tuner correction in use (moves with Automatic PPM) and the measured frequency error of the control channel.
     pub ppm: f64,
     pub auto_ppm: bool,
@@ -620,8 +622,19 @@ impl Receivers {
         let mut run = self.running.lock().unwrap_or_else(|p| p.into_inner());
         let mut again: Vec<i64> = ids.to_vec();
         again.extend(run.iter().filter(|(sys, r)| !ids.contains(sys) && r.state() == "error").map(|(&sys, _)| sys));
-        for sys in &again { if let Some(r) = run.remove(sys) { r.stop(); } }
+        // A failed system stays down since its first failure across the restarts that retry it (see `health`).
+        let mut down: Vec<(i64, i64)> = Vec::new();
+        for sys in &again {
+            if let Some(r) = run.remove(sys) {
+                let st = r.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if st.state == "error" { down.push((*sys, st.down_since_ms.unwrap_or(st.error_ms))); }
+                r.stop();
+            }
+        }
         self.start_many(db, all.iter().filter(|s| s.enabled && again.contains(&s.id)), &mut run);
+        for (sys, since) in down {
+            if let Some(r) = run.get(&sys) { update(&r.status, |st| st.down_since_ms = Some(since)); }
+        }
     }
 
     /// After tuner `id`'s settings changed: stops its Setup run, releases it if a system holds it as a helper (that
@@ -667,12 +680,13 @@ impl Receivers {
             p.seen = now;
             added
         };
-        let failed: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
-            .filter(|(_, r)| r.state() == "error").map(|(&id, _)| id).collect();
+        // A failed system that held a tuner dropped it; one whose restart found no tuner did not drop again.
+        let failed: Vec<(i64, bool)> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|(_, r)| r.state() == "error").map(|(&id, r)| (id, r.main.is_some())).collect();
         if !failed.is_empty() {
             let now = now_ms();
             let mut f = self.failed.lock().unwrap_or_else(|p| p.into_inner());
-            for id in failed {
+            for id in failed.into_iter().filter(|(_, held)| *held).map(|(id, _)| id) {
                 let times = f.entry(id).or_default();
                 times.push_back(now);
                 while times.front().is_some_and(|&t| now - t > crate::health::FLAP_WINDOW_MS) { times.pop_front(); }
@@ -845,7 +859,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
     let mut cc = match channel(0, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
     let mut log = EventLog::new(settings.event_log_path(), &s.system_name, policy.clone(), now_ms() as u64, settings.event_log_days);
     let mut rec = Recorder::new(Path::new(&settings.recording_dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
-    update(&status, |st| st.state = "running".into());
+    update(&status, |st| { st.state = "running".into(); st.down_since_ms = None; });
     let (mut tick, mut tick_valid, mut tick_frames) = (Instant::now(), 0u64, FrameCounts::default());
     let mut last_correction_ms = now_ms();
     let mut events = Vec::new();
@@ -1534,13 +1548,19 @@ mod tests {
         let l = list.clone();
         let rx = Receivers::new(Sdrs { list: Arc::new(move || l.lock().unwrap().clone()), open: Arc::new(|_, _, _| Err("gone".into())) });
         rx.restart_all(&db);
-        for plugged in [vec![], vec![A.to_string()]] {
+        let first_error = Arc::new(Mutex::new(0));
+        // Unplugged, back, unplugged again: two drops. The scan that sees it back restarts a system that never got a
+        // tuner (not a drop of its own), and the error time carries over the restarts.
+        for (i, plugged) in [vec![], vec![A.to_string()], vec![]].into_iter().enumerate() {
             assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+            if i == 0 { *first_error.lock().unwrap() = rx.status(id).unwrap().error_ms; }
             *list.lock().unwrap() = plugged;
             rx.rescan(&db);
         }
-        assert_eq!(rx.failures(id, 0), 2, "each restart of a failed system counts");
+        assert_eq!(rx.failures(id, 0), 2, "each drop counts once");
         assert_eq!(rx.failures(id, now_ms() + 1), 0, "only failures since the given time");
+        assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+        assert_eq!(rx.status(id).unwrap().down_since_ms, Some(*first_error.lock().unwrap()), "down since the first error");
     }
 
     struct Boom;
