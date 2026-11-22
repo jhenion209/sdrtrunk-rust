@@ -70,6 +70,11 @@ pub fn pill(state: &str, id: Option<String>) -> Markup {
 }
 
 /// Error text for one form field, if any.
+/// Shown above a form the signed-in admin may not submit.
+pub fn read_only(f: crate::auth::Function) -> Markup {
+    html! { p.muted { "Read only: ask the owner to allow " (f.label().to_lowercase()) "." } }
+}
+
 pub fn field_error(errors: &[FieldError], field: &str) -> Markup {
     html! { @for e in errors.iter().filter(|e| e.field == field) { p.error { (e.message) } } }
 }

@@ -144,3 +144,34 @@ async fn change_applies_next_request() {
     let pairs: Vec<(&str, &str)> = form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
     assert_eq!(send(&st, "POST", "/systems/1", Some(&jordan), &pairs).await.status, StatusCode::FORBIDDEN, "same session, now refused");
 }
+
+#[tokio::test]
+async fn pages_show_limits() {
+    let st = state();
+    let (cookie, _) = login_with(&st, "jordan", &[Function::SystemsEdit]);
+    let get = |path: &'static str, cookie: String| { let st = st.clone(); async move { send(&st, "GET", path, Some(&cookie), &[]).await.body } };
+    let systems = get("/systems", cookie.clone()).await;
+    assert!(!systems.contains("href=\"/systems/new\""), "{systems}");
+    let new = get("/systems/new", cookie.clone()).await;
+    assert!(new.contains("Read only: ask the owner to allow add systems.") && !new.contains("<form method=\"post\" action=\"/systems/new\""), "{new}");
+    let edit = get("/systems/1", cookie.clone()).await;
+    assert!(!edit.contains("Read only") && edit.contains("Save and restart this system"), "edit allowed: {edit}");
+    assert!(!edit.contains("Delete this system"), "delete not allowed: {edit}");
+    let tuner = send(&st, "GET", &format!("/tuners/{TUNER}"), Some(&cookie), &[]).await.body;
+    assert!(tuner.contains("Read only: ask the owner to allow edit tuners.") && tuner.contains("<fieldset class=\"lock\" disabled>"), "{tuner}");
+    assert!(!tuner.contains(">Save</button>"), "{tuner}");
+    let tgs = get("/talkgroups", cookie.clone()).await;
+    assert!(tgs.contains("allow edit talkgroups") && !tgs.contains("action=\"/talkgroups/import\""), "{tgs}");
+    assert!(!tgs.contains("Save talkgroup"), "{tgs}");
+    let streams = get("/streams", cookie.clone()).await;
+    assert!(!streams.contains("href=\"/streams/new\"") && !streams.contains("action=\"/streams/import\""), "{streams}");
+    let rec = get("/recordings", cookie.clone()).await;
+    assert!(rec.contains("allow recordings and event log settings") && !rec.contains("Save and restart all systems"), "{rec}");
+    let (owner, _) = login_as(&st, "owner", Role::Owner);
+    for path in ["/systems", "/systems/new", "/systems/1", "/talkgroups", "/streams", "/recordings"] {
+        let body = get(path, owner.clone()).await;
+        assert!(!body.contains("Read only"), "{path}: {body}");
+    }
+    let tuner = send(&st, "GET", &format!("/tuners/{TUNER}"), Some(&owner), &[]).await.body;
+    assert!(!tuner.contains("Read only") && tuner.contains(">Save</button>"), "{tuner}");
+}
