@@ -234,6 +234,7 @@ impl Db {
 
     fn init(mut c: Connection) -> rusqlite::Result<Db> {
         c.execute_batch(SCHEMA)?;
+        migrate_permissions(&mut c)?;
         migrate_to_systems(&mut c)?;
         c.execute_batch(TALKGROUP_TABLES)?;
         // Lists that existed before the alias_lists table: every list with talkgroups or a switch, and every system's.
@@ -526,6 +527,18 @@ fn tuner_from_json(j: &str) -> Option<TunerConfig> {
 
 /// Databases from before multiple systems: the one settings row becomes system 1 and its talkgroups move under its
 /// System name. Runs once (the old talkgroups table has no `system` column); all or nothing.
+/// Creates `user_allowed`. Only when it is new (an upgrade), admins that already exist are allowed every function, so
+/// the upgrade changes nothing; admins added later start with none.
+fn migrate_permissions(c: &mut Connection) -> rusqlite::Result<()> {
+    if c.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_allowed'")?.exists([])? { return Ok(()); }
+    let tx = c.transaction()?;
+    tx.execute_batch("CREATE TABLE user_allowed (user_id INTEGER NOT NULL, function TEXT NOT NULL, PRIMARY KEY (user_id, function));")?;
+    for f in crate::auth::Function::ALL {
+        tx.execute("INSERT INTO user_allowed (user_id, function) SELECT id, ?1 FROM users WHERE role = 'admin'", [f.id()])?;
+    }
+    tx.commit()
+}
+
 fn migrate_to_systems(c: &mut Connection) -> rusqlite::Result<()> {
     let old_table = c.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'talkgroups'")?.exists([])?;
     let has_system = c.prepare("SELECT 1 FROM pragma_table_info('talkgroups') WHERE name = 'system'")?.exists([])?;

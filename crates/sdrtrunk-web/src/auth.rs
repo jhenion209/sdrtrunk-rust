@@ -22,6 +22,41 @@ impl Role {
     fn parse(s: &str) -> Role { if s == "owner" { Role::Owner } else { Role::Admin } }
 }
 
+/// A change an admin may be allowed to make. The owner may always make every change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Function {
+    SystemsAdd, SystemsEdit, SystemsDelete, TunersEdit, TalkgroupsEdit, TalkgroupsImport,
+    StreamsAdd, StreamsEdit, StreamsDelete, StreamsImport, RecordingsEdit,
+}
+
+impl Function {
+    pub const ALL: [Function; 11] = [
+        Function::SystemsAdd, Function::SystemsEdit, Function::SystemsDelete, Function::TunersEdit, Function::TalkgroupsEdit,
+        Function::TalkgroupsImport, Function::StreamsAdd, Function::StreamsEdit, Function::StreamsDelete,
+        Function::StreamsImport, Function::RecordingsEdit,
+    ];
+
+    /// (id stored in the database and sent by the Users form, label shown).
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Function::SystemsAdd => ("systems.add", "Add systems"),
+            Function::SystemsEdit => ("systems.edit", "Edit systems"),
+            Function::SystemsDelete => ("systems.delete", "Delete systems"),
+            Function::TunersEdit => ("tuners.edit", "Edit tuners"),
+            Function::TalkgroupsEdit => ("talkgroups.edit", "Edit talkgroups"),
+            Function::TalkgroupsImport => ("talkgroups.import", "Import talkgroups"),
+            Function::StreamsAdd => ("streams.add", "Add streams"),
+            Function::StreamsEdit => ("streams.edit", "Edit streams"),
+            Function::StreamsDelete => ("streams.delete", "Delete streams"),
+            Function::StreamsImport => ("streams.import", "Import streams"),
+            Function::RecordingsEdit => ("recordings.edit", "Recordings and event log settings"),
+        }
+    }
+    pub fn id(self) -> &'static str { self.names().0 }
+    pub fn label(self) -> &'static str { self.names().1 }
+    pub fn parse(id: &str) -> Option<Function> { Function::ALL.into_iter().find(|f| f.id() == id) }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct User { pub id: i64, pub username: String, pub role: Role }
 
@@ -130,6 +165,37 @@ impl Db {
         Ok(password)
     }
 
+    /// The functions admin `user_id` may use, in `Function::ALL` order (unknown stored ids ignored).
+    pub fn allowed(&self, user_id: i64) -> Vec<Function> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT function FROM user_allowed WHERE user_id = ?1").expect("query");
+        let ids: Vec<String> = st.query_map([user_id], |r| r.get(0)).expect("query").filter_map(Result::ok).collect();
+        Function::ALL.into_iter().filter(|f| ids.iter().any(|i| i == f.id())).collect()
+    }
+
+    /// Whether `user` may use `f`; the owner may use everything.
+    pub fn may(&self, user: &User, f: Function) -> bool {
+        user.role == Role::Owner || self.allowed(user.id).contains(&f)
+    }
+
+    /// Replaces what admin `user_id` may use.
+    pub fn set_allowed(&self, user_id: i64, fs: &[Function]) -> Result<(), AuthError> {
+        let mut c = self.conn();
+        let role: Option<String> = c.query_row("SELECT role FROM users WHERE id = ?1", [user_id], |r| r.get(0)).optional().ok().flatten();
+        match role.as_deref() {
+            None => return Err(AuthError::NotFound),
+            Some("owner") => return Err(AuthError::OwnerProtected),
+            Some(_) => {}
+        }
+        let tx = c.transaction().map_err(|_| AuthError::NotFound)?;
+        tx.execute("DELETE FROM user_allowed WHERE user_id = ?1", [user_id]).map_err(|_| AuthError::NotFound)?;
+        for f in fs {
+            tx.execute("INSERT OR IGNORE INTO user_allowed (user_id, function) VALUES (?1, ?2)", params![user_id, f.id()])
+                .map_err(|_| AuthError::NotFound)?;
+        }
+        tx.commit().map_err(|_| AuthError::NotFound)
+    }
+
     pub fn remove_user(&self, user_id: i64) -> Result<(), AuthError> {
         let c = self.conn();
         let role: Option<String> = c.query_row("SELECT role FROM users WHERE id = ?1", [user_id], |r| r.get(0)).optional().ok().flatten();
@@ -138,6 +204,7 @@ impl Db {
             Some("owner") => Err(AuthError::OwnerProtected),
             Some(_) => {
                 c.execute("DELETE FROM sessions WHERE user_id = ?1", [user_id]).ok();
+                c.execute("DELETE FROM user_allowed WHERE user_id = ?1", [user_id]).ok();
                 c.execute("DELETE FROM users WHERE id = ?1", [user_id]).ok();
                 Ok(())
             }
@@ -230,6 +297,68 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let u = db.create_user("owner", PW, Role::Owner, 0).unwrap();
         (db, u)
+    }
+
+    fn owner_and_admin() -> (Db, User, User) {
+        let (db, owner) = db_with_owner();
+        let admin = db.create_user("jordan", PW, Role::Admin, 0).unwrap();
+        (db, owner, admin)
+    }
+
+    #[test]
+    fn function_ids_round_trip() {
+        for f in Function::ALL { assert_eq!(Function::parse(f.id()), Some(f)); }
+        assert_eq!(Function::ALL[0].id(), "systems.add");
+        assert_eq!(Function::ALL[10].label(), "Recordings and event log settings");
+        assert_eq!(Function::parse("nope"), None);
+    }
+
+    #[test]
+    fn new_admin_has_nothing_owner_has_all() {
+        let (db, owner, admin) = owner_and_admin();
+        assert!(db.allowed(admin.id).is_empty());
+        assert!(!db.may(&admin, Function::SystemsAdd));
+        assert!(Function::ALL.iter().all(|&f| db.may(&owner, f)));
+    }
+
+    #[test]
+    fn set_allowed_replaces() {
+        let (db, owner, admin) = owner_and_admin();
+        db.set_allowed(admin.id, &[Function::TunersEdit, Function::SystemsEdit]).unwrap();
+        assert_eq!(db.allowed(admin.id), vec![Function::SystemsEdit, Function::TunersEdit]);
+        assert!(db.may(&admin, Function::TunersEdit) && !db.may(&admin, Function::SystemsAdd));
+        db.set_allowed(admin.id, &[]).unwrap();
+        assert!(db.allowed(admin.id).is_empty());
+        assert!(matches!(db.set_allowed(owner.id, &[]), Err(AuthError::OwnerProtected)));
+        assert!(matches!(db.set_allowed(999, &[]), Err(AuthError::NotFound)));
+    }
+
+    #[test]
+    fn removed_user_leaves_no_permissions() {
+        let (db, _, admin) = owner_and_admin();
+        db.set_allowed(admin.id, &Function::ALL).unwrap();
+        db.remove_user(admin.id).unwrap();
+        let again = db.create_user("jordan", PW, Role::Admin, 0).unwrap();
+        assert!(db.allowed(again.id).is_empty());
+    }
+
+    #[test]
+    fn backfill_runs_once() {
+        let dir = std::env::temp_dir().join(format!("sdrtrunk-perm-backfill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let a = {
+            let db = Db::open(&path).unwrap();
+            let a = db.create_user("a-admin", PW, Role::Admin, 0).unwrap();
+            db.conn().execute_batch("DROP TABLE user_allowed").unwrap();
+            a
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.allowed(a.id), Function::ALL.to_vec(), "an admin from before the upgrade keeps everything");
+        db.set_allowed(a.id, &[]).unwrap();
+        drop(db);
+        assert!(Db::open(&path).unwrap().allowed(a.id).is_empty(), "not granted again on the next start");
     }
 
     #[test]
