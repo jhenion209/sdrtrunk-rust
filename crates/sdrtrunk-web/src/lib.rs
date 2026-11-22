@@ -1,5 +1,6 @@
 //! SDRTrunk-Rust web UI: receiver management behind owner/admin login.
 pub mod db;
+pub mod event_log;
 pub mod auth;
 pub mod quality;
 pub mod receiver;
