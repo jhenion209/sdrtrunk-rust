@@ -496,6 +496,8 @@ pub struct Receivers {
     setups: Mutex<BTreeMap<String, Arc<SetupRun>>>,
     /// The Icecast streams; every system hands them the calls they carry.
     pub streams: Arc<Streams>,
+    /// When `rescan` restarted each system after it failed (the last `health::FLAP_WINDOW_MS`).
+    failed: Mutex<std::collections::HashMap<i64, std::collections::VecDeque<i64>>>,
 }
 
 fn policy_for(db: &Db, system: &str) -> RecordPolicy {
@@ -513,6 +515,7 @@ impl Receivers {
         Receivers {
             pool: Arc::new(Mutex::new(Pool { seen, ..Pool::default() })), last_free: Mutex::new(None), sdrs, claimed: Arc::default(), calls: broadcast::channel(256).0, running: Mutex::new(BTreeMap::new()),
             setups: Mutex::new(BTreeMap::new()), streams: Arc::new(Streams::new(std::time::Duration::from_secs(30))),
+            failed: Mutex::default(),
         }
     }
 
@@ -664,7 +667,19 @@ impl Receivers {
             p.seen = now;
             added
         };
-        if self.running.lock().unwrap_or_else(|p| p.into_inner()).values().any(|r| r.state() == "error") { self.restart(db, &[]); }
+        let failed: Vec<i64> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|(_, r)| r.state() == "error").map(|(&id, _)| id).collect();
+        if !failed.is_empty() {
+            let now = now_ms();
+            let mut f = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+            for id in failed {
+                let times = f.entry(id).or_default();
+                times.push_back(now);
+                while times.front().is_some_and(|&t| now - t > crate::health::FLAP_WINDOW_MS) { times.pop_front(); }
+            }
+            drop(f);
+            self.restart(db, &[]);
+        }
         for id in added { self.apply_setup(db, &id); }
     }
 
@@ -705,6 +720,11 @@ impl Receivers {
     pub fn on_tuner(&self, id: &str) -> Option<Arc<Receiver>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner()).values()
             .find(|r| r.status.lock().unwrap_or_else(|p| p.into_inner()).tuner.as_deref() == Some(id)).cloned()
+    }
+
+    /// How often `rescan` restarted system `id` after it failed, since `since_ms` (up to `health::FLAP_WINDOW_MS` back).
+    pub fn failures(&self, id: i64, since_ms: i64) -> usize {
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map_or(0, |t| t.iter().filter(|&&t| t >= since_ms).count())
     }
 
     pub fn get(&self, id: i64) -> Option<Arc<Receiver>> { self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned() }
@@ -1504,6 +1524,23 @@ mod tests {
         assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
         assert_eq!(rx.status(id).unwrap().error.as_deref(), Some("airspy_open_sn failed with libairspy code -5"));
         assert!(wait_for(Duration::from_secs(1), || rx.claimed.lock().unwrap().is_empty()), "a failed open releases the tuner");
+    }
+
+    #[test]
+    fn rescan_counts_failures() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.save_system(&sys("SGCo", "")).unwrap();
+        let list = Arc::new(Mutex::new(vec![A.to_string()]));
+        let l = list.clone();
+        let rx = Receivers::new(Sdrs { list: Arc::new(move || l.lock().unwrap().clone()), open: Arc::new(|_, _, _| Err("gone".into())) });
+        rx.restart_all(&db);
+        for plugged in [vec![], vec![A.to_string()]] {
+            assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+            *list.lock().unwrap() = plugged;
+            rx.rescan(&db);
+        }
+        assert_eq!(rx.failures(id, 0), 2, "each restart of a failed system counts");
+        assert_eq!(rx.failures(id, now_ms() + 1), 0, "only failures since the given time");
     }
 
     struct Boom;
