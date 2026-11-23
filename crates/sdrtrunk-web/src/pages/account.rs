@@ -1,5 +1,5 @@
 //! Change your own password. Every session of the account ends; this browser is signed in again.
-use crate::app::{check_csrf, AppState, Authed};
+use crate::app::{check_csrf, AppState, Authed, Secure};
 use crate::auth::Session;
 use crate::pages::layout::{layout, notice};
 use crate::receiver::now_ms;
@@ -32,7 +32,7 @@ pub async fn page(Authed(s, _): Authed, Query(q): Query<Saved>) -> Markup { view
 #[derive(Deserialize)]
 pub struct AccountForm { #[serde(default)] csrf: String, current: String, password: String, password2: String }
 
-pub async fn submit(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<AccountForm>) -> Response {
+pub async fn submit(State(st): State<AppState>, Authed(s, _): Authed, Secure(secure): Secure, Form(f): Form<AccountForm>) -> Response {
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     if st.db.verify_login(&s.user.username, &f.current).is_err() {
         return view(&s, Some("Current password is wrong."), false).into_response();
@@ -42,5 +42,5 @@ pub async fn submit(State(st): State<AppState>, Authed(s, _): Authed, Form(f): F
     let now = now_ms();
     st.db.audit(now, &s.user.username, "changed own password");
     let token = st.db.create_session(s.user.id, now);
-    ([(SET_COOKIE, st.session_cookie(&token))], Redirect::to("/account?saved=1")).into_response()
+    ([(SET_COOKIE, st.session_cookie(&token, secure))], Redirect::to("/account?saved=1")).into_response()
 }

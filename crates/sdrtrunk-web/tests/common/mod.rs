@@ -27,7 +27,7 @@ pub fn state_with(sdrs: Sdrs) -> AppState {
         receivers: Arc::new(receivers),
         throttle: Arc::new(Throttle::default()),
         setup_code: Arc::new(Mutex::new(Some("ABCD-EFGH".into()))),
-        secure_cookies: false,
+        trusted: Arc::default(),
     }
 }
 
@@ -48,7 +48,13 @@ pub async fn send(st: &AppState, method: &str, path: &str, cookie: Option<&str>,
         req = req.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
         Body::from(serde_urlencoded::to_string(form).unwrap())
     } else { Body::empty() };
-    let res = router(st.clone()).oneshot(req.body(body).unwrap()).await.unwrap();
+    send_req(st, req.body(body).unwrap()).await
+}
+
+/// Sends a request built by the test (extensions, headers) through the router.
+#[allow(dead_code)]
+pub async fn send_req(st: &AppState, req: Request<Body>) -> Resp {
+    let res = router(st.clone()).oneshot(req).await.unwrap();
     let h = |n| res.headers().get(n).map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_string());
     let (status, location, cookie) = (res.status(), h(header::LOCATION), h(header::SET_COOKIE));
     let body = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned();

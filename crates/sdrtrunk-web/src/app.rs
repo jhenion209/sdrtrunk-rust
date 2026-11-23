@@ -3,6 +3,7 @@ use crate::auth::{new_setup_code, Function, Role, Session, Throttle};
 use crate::db::Db;
 use crate::pages;
 use crate::receiver::{now_ms, Receivers, Sdrs};
+use crate::web_config::Proxy;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -24,16 +25,42 @@ pub struct AppState {
     pub throttle: Arc<Throttle>,
     /// One-time first-run code; None once the owner exists.
     pub setup_code: Arc<Mutex<Option<String>>>,
-    pub secure_cookies: bool,
+    /// Reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` are believed (`SDRTRUNK_TRUSTED_PROXIES`).
+    pub trusted: Arc<Vec<Proxy>>,
 }
 
 impl AppState {
-    pub fn session_cookie(&self, token: &str) -> String {
-        format!("{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MAX_AGE_S}{}", if self.secure_cookies { "; Secure" } else { "" })
+    /// The session cookie; `Secure` when the request came over HTTPS (see `Secure`).
+    pub fn session_cookie(&self, token: &str, secure: bool) -> String {
+        format!("{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MAX_AGE_S}{}", if secure { "; Secure" } else { "" })
     }
-    pub fn clear_cookie(&self) -> String {
-        format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}", if self.secure_cookies { "; Secure" } else { "" })
+    pub fn clear_cookie(&self, secure: bool) -> String {
+        format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}", if secure { "; Secure" } else { "" })
     }
+}
+
+/// Marks a request that arrived on the HTTPS listener (a request extension the HTTPS server adds).
+#[derive(Clone, Copy, Debug)]
+pub struct Https;
+
+/// True when the visitor's connection is HTTPS: it arrived on the HTTPS listener, or a trusted proxy says
+/// `X-Forwarded-Proto: https`. A cookie marked `Secure` over plain HTTP would never come back, so sign-in needs this.
+pub struct Secure(pub bool);
+
+impl FromRequestParts<AppState> for Secure {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<Https>().is_some() { return Ok(Secure(true)); }
+        let from_proxy = peer(parts).is_some_and(|p| st.trusted.iter().any(|t| t.contains(p)));
+        let says_https = parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"));
+        Ok(Secure(from_proxy && says_https))
+    }
+}
+
+/// The address the connection came from (None in tests that set none).
+fn peer(parts: &Parts) -> Option<std::net::IpAddr> {
+    parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())
 }
 
 fn cookie_token(headers: &HeaderMap) -> Option<String> {
@@ -66,14 +93,15 @@ impl FromRequestParts<AppState> for OwnerOnly {
     }
 }
 
-/// Client address for throttling ("local" when unknown, e.g. in tests).
-// ponytail: behind a reverse proxy every client shares the proxy's address; forwarded headers are not trusted.
+/// The visitor's address ("local" when unknown, e.g. in tests): the connection's, or behind a trusted proxy, the
+/// one it forwards (`client::address`). Used for sign-in throttling and on the Connected hosts page.
 pub struct ClientAddr(pub String);
 
 impl FromRequestParts<AppState> for ClientAddr {
     type Rejection = std::convert::Infallible;
-    async fn from_request_parts(parts: &mut Parts, _: &AppState) -> Result<Self, Self::Rejection> {
-        Ok(ClientAddr(parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_string()).unwrap_or_else(|| "local".into())))
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Self::Rejection> {
+        Ok(ClientAddr(peer(parts).map(|p| crate::client::address(p, &parts.headers, &st.trusted).to_string())
+            .unwrap_or_else(|| "local".into())))
     }
 }
 
@@ -147,7 +175,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Opens the database, starts the decoder with the saved settings and serves the UI until the process ends.
-pub async fn serve(db_path: PathBuf, listen: SocketAddr, secure_cookies: bool, sdrs: Sdrs) -> std::io::Result<()> {
+pub async fn serve(db_path: PathBuf, listen: SocketAddr, _secure_cookies: bool, sdrs: Sdrs) -> std::io::Result<()> {
     let db = Db::open(&db_path).map_err(|e| std::io::Error::other(format!("{}: {e}", db_path.display())))?;
     let setup_code = (db.user_count() == 0).then(|| {
         let c = new_setup_code();
@@ -161,7 +189,7 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, secure_cookies: bool, s
     receivers.apply_streams(&db);
     let state = AppState {
         db: Arc::new(db), receivers: Arc::new(receivers), throttle: Arc::default(),
-        setup_code: Arc::new(Mutex::new(setup_code)), secure_cookies,
+        setup_code: Arc::new(Mutex::new(setup_code)), trusted: Arc::default(),
     };
     // Once a minute: signal and decode quality history, and PPM moved by Automatic PPM.
     let (db, receivers) = (state.db.clone(), state.receivers.clone());

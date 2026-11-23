@@ -1,5 +1,5 @@
 //! Sign in and sign out.
-use crate::app::{check_csrf, AppState, Authed, ClientAddr};
+use crate::app::{check_csrf, AppState, Authed, ClientAddr, Secure};
 use crate::pages::layout::{layout, notice};
 use crate::receiver::now_ms;
 use axum::extract::State;
@@ -25,7 +25,7 @@ pub async fn page() -> Markup { form(None) }
 #[derive(Deserialize)]
 pub struct LoginForm { username: String, password: String }
 
-pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Form(f): Form<LoginForm>) -> Response {
+pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Secure(secure): Secure, Form(f): Form<LoginForm>) -> Response {
     let now = now_ms();
     // A name no account can have is a failed attempt for the address only; never store arbitrary input as a key.
     let ku = if crate::auth::valid_username(&f.username) { format!("user:{}", f.username) } else { String::new() };
@@ -38,7 +38,7 @@ pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Form
             st.throttle.succeeded(keys);
             let token = st.db.create_session(user.id, now);
             st.db.audit(now, &user.username, "login");
-            ([(SET_COOKIE, st.session_cookie(&token))], Redirect::to("/")).into_response()
+            ([(SET_COOKIE, st.session_cookie(&token, secure))], Redirect::to("/")).into_response()
         }
         Err(e) => {
             st.throttle.failed(keys, now);
@@ -50,9 +50,9 @@ pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Form
 #[derive(Deserialize)]
 pub struct CsrfForm { #[serde(default)] pub csrf: String }
 
-pub async fn logout(State(st): State<AppState>, Authed(s, token): Authed, Form(f): Form<CsrfForm>) -> Response {
+pub async fn logout(State(st): State<AppState>, Authed(s, token): Authed, Secure(secure): Secure, Form(f): Form<CsrfForm>) -> Response {
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
     st.db.end_session(&token);
     st.db.audit(now_ms(), &s.user.username, "logout");
-    ([(SET_COOKIE, st.clear_cookie())], Redirect::to("/login")).into_response()
+    ([(SET_COOKIE, st.clear_cookie(secure))], Redirect::to("/login")).into_response()
 }

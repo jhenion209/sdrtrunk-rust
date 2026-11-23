@@ -68,13 +68,62 @@ async fn bad_password_rejected() {
     assert!(r.body.contains("Wrong username or password"));
 }
 
+/// A sign-in request (the owner's name and password) with whatever the test adds.
+fn sign_in() -> axum::http::request::Builder {
+    axum::http::Request::builder().method("POST").uri("/login")
+        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+}
+fn sign_in_body() -> axum::body::Body { axum::body::Body::from(format!("username=owner&password={}", PW.replace(' ', "+"))) }
+fn peer(ip: &str) -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo(std::net::SocketAddr::new(ip.parse().unwrap(), 50000))
+}
+
 #[tokio::test]
-async fn secure_cookie_flag() {
-    let mut st = state();
-    st.secure_cookies = true;
+async fn login_cookie_is_secure_over_https() {
+    let st = state();
+    st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
+    let r = send_req(&st, sign_in().extension(sdrtrunk_web::app::Https).body(sign_in_body()).unwrap()).await;
+    assert!(r.cookie.unwrap().contains("; Secure"));
+}
+
+#[tokio::test]
+async fn login_cookie_is_plain_over_http() {
+    let st = state();
     st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
     let r = send(&st, "POST", "/login", None, &[("username", "owner"), ("password", PW)]).await;
-    assert!(r.cookie.unwrap().contains("Secure"));
+    assert!(!r.cookie.unwrap().contains("Secure"));
+}
+
+#[tokio::test]
+async fn trusted_proxy_says_https() {
+    let mut st = state();
+    st.trusted = std::sync::Arc::new(vec![sdrtrunk_web::web_config::Proxy::parse("192.168.104.0/24").unwrap()]);
+    st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
+    let r = send_req(&st, sign_in().extension(peer("192.168.104.7")).header("x-forwarded-proto", "https")
+        .body(sign_in_body()).unwrap()).await;
+    assert!(r.cookie.unwrap().contains("; Secure"));
+}
+
+#[tokio::test]
+async fn untrusted_proxy_header_is_ignored() {
+    let mut st = state();
+    st.trusted = std::sync::Arc::new(vec![sdrtrunk_web::web_config::Proxy::parse("192.168.104.0/24").unwrap()]);
+    st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
+    let r = send_req(&st, sign_in().extension(peer("203.0.113.1")).header("x-forwarded-proto", "https")
+        .body(sign_in_body()).unwrap()).await;
+    assert!(!r.cookie.unwrap().contains("Secure"));
+}
+
+#[tokio::test]
+async fn sign_out_over_https_clears_a_secure_cookie() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    let r = send_req(&st, axum::http::Request::builder().method("POST").uri("/logout").extension(sdrtrunk_web::app::Https)
+        .header(axum::http::header::COOKIE, &cookie)
+        .header(axum::http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!("csrf={csrf}"))).unwrap()).await;
+    let c = r.cookie.unwrap();
+    assert!(c.contains("Max-Age=0") && c.contains("; Secure"), "{c}");
 }
 
 #[tokio::test]

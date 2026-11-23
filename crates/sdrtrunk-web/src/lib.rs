@@ -14,5 +14,6 @@ pub mod web_config;
 pub mod acme;
 pub mod app;
 pub mod cert;
+pub mod client;
 pub mod cloudflare;
 pub mod pages;
