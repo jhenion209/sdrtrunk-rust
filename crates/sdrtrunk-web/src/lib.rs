@@ -10,5 +10,8 @@ pub mod radio_names;
 pub mod rr_csv;
 pub mod streaming;
 pub mod tuning;
+pub mod acme;
 pub mod app;
+pub mod cert;
+pub mod cloudflare;
 pub mod pages;
