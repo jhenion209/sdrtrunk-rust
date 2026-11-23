@@ -154,3 +154,21 @@ async fn sign_in_keeps_address_and_browser() {
     let rows = st.db.sessions(sdrtrunk_web::receiver::now_ms());
     assert_eq!((rows[0].ip.as_str(), rows[0].agent.as_str()), ("192.168.1.20", "Mozilla/5.0 Firefox/140.0"));
 }
+
+/// A browser keeps a Secure cookie from HTTPS and will not let plain HTTP replace it; with its own name over HTTPS
+/// (`__Host-`), signing in over plain HTTP on the same host still works.
+#[tokio::test]
+async fn https_and_http_cookies_have_different_names() {
+    let st = state();
+    st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
+    let https = send_req(&st, sign_in().extension(sdrtrunk_web::app::Https).body(sign_in_body()).unwrap()).await.cookie.unwrap();
+    assert!(https.starts_with("__Host-sdrtrunk_rust_session="), "{https}");
+    let http = send(&st, "POST", "/login", None, &[("username", "owner"), ("password", PW)]).await.cookie.unwrap();
+    assert!(http.starts_with("sdrtrunk_rust_session="), "{http}");
+    // The HTTPS cookie signs in.
+    let token = https.split(';').next().unwrap();
+    assert_eq!(send(&st, "GET", "/", Some(token), &[]).await.status, StatusCode::OK);
+    // Over HTTPS a browser sends both; a stale plain one does not hide the valid HTTPS one.
+    let both = format!("sdrtrunk_rust_session=stale; {token}");
+    assert_eq!(send(&st, "GET", "/", Some(&both), &[]).await.status, StatusCode::OK);
+}

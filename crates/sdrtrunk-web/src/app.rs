@@ -18,6 +18,10 @@ use std::sync::{Arc, Mutex};
 pub use crate::pages::layout::layout;
 
 pub const COOKIE: &str = "sdrtrunk_rust_session";
+/// The session cookie's name over HTTPS. A browser will not let plain HTTP replace a Secure cookie of the same name,
+/// so the two have different names and signing in over plain HTTP on the same host still works. (`__Host-`: the
+/// browser takes it only when Secure, for `Path=/`, without a domain.)
+pub const SECURE_COOKIE: &str = "__Host-sdrtrunk_rust_session";
 const MAX_AGE_S: i64 = crate::auth::MAX_MS / 1000;
 
 #[derive(Clone)]
@@ -38,10 +42,12 @@ pub struct AppState {
 impl AppState {
     /// The session cookie; `Secure` when the request came over HTTPS (see `Secure`).
     pub fn session_cookie(&self, token: &str, secure: bool) -> String {
-        format!("{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MAX_AGE_S}{}", if secure { "; Secure" } else { "" })
+        if secure { format!("{SECURE_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MAX_AGE_S}; Secure") }
+        else { format!("{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MAX_AGE_S}") }
     }
     pub fn clear_cookie(&self, secure: bool) -> String {
-        format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}", if secure { "; Secure" } else { "" })
+        if secure { format!("{SECURE_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure") }
+        else { format!("{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0") }
     }
 }
 
@@ -69,11 +75,13 @@ fn peer(parts: &Parts) -> Option<std::net::IpAddr> {
     parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())
 }
 
+/// The session token from the request's cookies: the HTTPS one (`SECURE_COOKIE`) when sent, else the plain one.
 pub fn cookie_token(headers: &HeaderMap) -> Option<String> {
-    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok())
+    let named = |name: &str| headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(COOKIE).and_then(|r| r.strip_prefix('=')).map(str::to_string))
-        .filter(|t| !t.is_empty())
+        .find_map(|c| c.trim().strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
+        .filter(|t| !t.is_empty());
+    named(SECURE_COOKIE).or_else(|| named(COOKIE))
 }
 
 /// A signed-in user (any role). Without a valid session: 303 to /login.
