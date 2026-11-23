@@ -119,3 +119,17 @@ async fn import_into_new_alias_list() {
     assert_eq!(upload_into(&st, &cookie, &csrf, CSV, "Nope", "").await.0, StatusCode::BAD_REQUEST);
     assert_eq!(st.db.alias_lists().len(), 2, "nothing else created");
 }
+
+#[tokio::test]
+async fn import_needs_a_chosen_list() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "admin", Role::Admin);
+    let page = send(&st, "GET", "/talkgroups", Some(&cookie), &[]).await.body;
+    let form = &page[page.find("/talkgroups/import").unwrap()..];
+    assert!(form.contains(r#"<select name="into" required><option value="" selected>Choose Alias List...</option>"#), "{form}");
+    assert_eq!(form[..form.find("</select>").unwrap()].matches(" selected").count(), 1, "only the placeholder is selected");
+    let (status, _, body) = upload_into(&st, &cookie, &csrf, CSV, "", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Choose an alias list to import into."), "{body}");
+    assert!(st.db.talkgroups(SYS).is_empty(), "nothing imported");
+}

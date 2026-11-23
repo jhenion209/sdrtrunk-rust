@@ -114,9 +114,9 @@ async fn import_form_requires_choosing_the_list() {
     let st = state();
     let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
     let page = send(&st, "GET", "/talkgroups", Some(&cookie), &[]).await.body;
-    assert!(page.contains(r#"<option value="" selected>Choose a list…</option>"#) && page.contains(r#"name="into" required"#), "{page}");
+    assert!(page.contains(r#"<option value="" selected>Choose Alias List...</option>"#) && page.contains(r#"name="into" required"#), "{page}");
     let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", "")], Some(PLAYLIST)).await;
-    assert!(body.contains("Choose the list to import into."), "{body}");
+    assert!(body.contains("Choose an alias list to import into."), "{body}");
     assert!(st.db.radio_names(SYS).is_empty());
 }
 
@@ -126,11 +126,11 @@ async fn upload_asks_which_playlist_list_then_imports_it() {
     let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
     let (status, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS)], Some(PLAYLIST)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains(r#"<option value="" selected>Choose…</option>"#) && body.contains("P25 Sim (2 radios)") && body.contains("Other (1 radio)"), "{body}");
+    assert!(body.contains(r#"<option value="" selected>Choose Alias List...</option>"#) && body.contains("P25 Sim (2 radios)") && body.contains("Other (1 radio)"), "{body}");
     assert!(st.db.radio_names(SYS).is_empty(), "nothing stored before the choice");
     // Continue: the playlist comes back as a hidden field, not a second upload.
     let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", ""), ("xml", PLAYLIST)], None).await;
-    assert!(body.contains("Choose the playlist list to import."), "{body}");
+    assert!(body.contains("Choose the playlist's alias list to import."), "{body}");
     let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "Missing"), ("xml", PLAYLIST)], None).await;
     assert!(body.contains("class=\"error\""), "{body}");
     upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "Other"), ("xml", PLAYLIST)], None).await;

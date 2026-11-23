@@ -33,20 +33,25 @@ fn url(list: &str, extra: &str) -> String {
 /// Changes must name an alias list that exists (page views fall back to the first list instead).
 fn known(st: &AppState, list: &str) -> bool { st.db.alias_lists().iter().any(|n| n == list) }
 
+/// The import dropdowns start here; importing without choosing fails.
+const CHOOSE_LIST: &str = "Choose Alias List...";
+const NO_LIST_CHOSEN: &str = "Choose an alias list to import into.";
+
 /// Value of the "Import into" choice that creates a list.
 const NEW_LIST: &str = "+new";
 
 /// The RadioReference import form: into this list, another list, or a new one.
-fn import_form(s: &Session, current: Option<&str>, lists: &[String]) -> Markup {
+fn import_form(s: &Session, lists: &[String]) -> Markup {
     html! {
         h2 { "Import from RadioReference" }
         form method="post" action="/talkgroups/import" enctype="multipart/form-data" {
             input type="hidden" name="csrf" value=(s.csrf);
             label { "Talkgroup CSV downloaded from RadioReference" input type="file" name="file" accept=".csv,text/csv" required; }
             label { "Import into"
-                select name="into" {
-                    @for l in lists { option value=(l) selected[Some(l.as_str()) == current] { "Alias list: " (l) } }
-                    option value=(NEW_LIST) selected[current.is_none()] { "New alias list…" }
+                select name="into" required {
+                    option value="" selected { (CHOOSE_LIST) }
+                    @for l in lists { option value=(l) { "Alias list: " (l) } }
+                    option value=(NEW_LIST) { "New alias list…" }
                 }
             }
             label { "Name for a new alias list" input name="new_name" maxlength="60" placeholder="e.g. KSICS"; }
@@ -132,7 +137,7 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
                 @if editing { " " a href=(home) { "Cancel" } }
             }
         }
-        @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(s, Some(system), &names)) }
+        @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(s, &names)) }
         h2 { "Listed talkgroups" }
         @if can && !fresh.is_empty() {
             form method="post" action="/talkgroups/reviewed" {
@@ -195,7 +200,7 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
                 input type="hidden" name="csrf" value=(s.csrf);
                 label { "Import into"
                     select name="into" required {
-                        option value="" selected { "Choose a list…" }
+                        option value="" selected { (CHOOSE_LIST) }
                         @for l in st.db.alias_lists() { option value=(l) { "Alias list: " (l) } }
                     }
                 }
@@ -271,7 +276,7 @@ pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut
     let error_page = |msg: &str| layout("Talkgroups", Some(&s.user), &s.csrf, html! {
         p.error { (msg) } p { a href="/talkgroups#radios" { "Back to Talkgroups" } }
     }).into_response();
-    if list.is_empty() { return error_page("Choose the list to import into."); }
+    if list.is_empty() { return error_page(NO_LIST_CHOSEN); }
     if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
     let parsed = match radio_names::parse(&text) { Ok(p) => p, Err(e) => return error_page(&e) };
     if parsed.by_list.is_empty() { return error_page("This playlist has no radio names."); }
@@ -279,7 +284,7 @@ pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut
         return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, None)).into_response();
     };
     let Some(uniq) = parsed.by_list.get(&source).cloned() else {
-        let msg = if source.is_empty() { "Choose the playlist list to import." } else { "That list is not in this playlist." };
+        let msg = if source.is_empty() { "Choose the playlist's alias list to import." } else { "That list is not in this playlist." };
         return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, Some(msg))).into_response();
     };
     let c = radio_names::compare(&st.db.radio_names(&list), &uniq);
@@ -324,7 +329,7 @@ fn choose_source(s: &Session, list: &str, parsed: &radio_names::Parsed, xml: &st
             input type="hidden" name="xml" value=(xml);
             label { "Playlist list to import"
                 select name="source" required {
-                    option value="" selected { "Choose…" }
+                    option value="" selected { (CHOOSE_LIST) }
                     @for (l, rs) in &parsed.by_list { option value=(l) { (l) " (" (plural(rs.len(), "radio")) ")" } }
                 }
             }
@@ -384,7 +389,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
         return layout("Talkgroups", Some(&s.user), &s.csrf, html! {
             p.muted { "No alias lists yet. Import one from RadioReference"
                 @if st.db.may(&s.user, Function::SystemsAdd) { ", or " a href="/systems/new" { "add a system" } " (it gets a list named after it)" } "." }
-            @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(&s, None, &names)) }
+            @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(&s, &names)) }
         });
     };
     let f = q.edit.and_then(|n| st.db.talkgroups(&system).into_iter().find(|t| t.number == n)).map_or_else(TalkgroupForm::default, |t| TalkgroupForm {
@@ -442,8 +447,9 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
     // Errors before anything is stored go back to the list page (or the empty page when there is no list yet).
     let refuse = |msg: &str| match lists.first() {
         Some(first) => view(&st, &s, if lists.contains(&into) { &into } else { first }, &TalkgroupForm::default(), Some(msg)).into_response(),
-        None => layout("Talkgroups", Some(&s.user), &s.csrf, html! { p.error { (msg) } (import_form(&s, None, &lists)) }).into_response(),
+        None => layout("Talkgroups", Some(&s.user), &s.csrf, html! { p.error { (msg) } (import_form(&s, &lists)) }).into_response(),
     };
+    if into.is_empty() { return refuse(NO_LIST_CHOSEN); }
     let creating = into == NEW_LIST;
     let system = if creating {
         let name = new_name.trim();
