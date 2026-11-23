@@ -373,6 +373,7 @@ mod tests {
         r.handle(&ldu1(Some(lc(27, 711_013, 0x40))), start + 100, &mut t);
         log.live(&r.live(), start + 100);
         log.tick(start + 100 + crate::event_log::IDLE_MS + 1);
+        log.sync();
         let text = std::fs::read_dir(&d).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect::<String>();
         assert!(text.contains(",\"711013\",") && text.contains(" ENCRYPTED"), "{text}");
     }
