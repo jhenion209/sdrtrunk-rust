@@ -191,12 +191,31 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, secure_cookies: bool, s
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("SDRTrunk-Rust web UI on http://{listen}");
     let receivers = state.receivers.clone();
-    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal()).await?;
+    serve_until(listener, router(state), shutdown_signal(), SHUTDOWN_GRACE).await?;
     // Stopping joins every decoder, so open recordings and call event log rows are written before the process exits.
     eprintln!("stopping systems");
     let _ = tokio::task::spawn_blocking(move || receivers.stop_all()).await;
     Ok(())
+}
+
+/// After the stop signal, how long open connections get to finish before serving ends anyway.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Serves `app` until `signal`, then lets open connections finish for at most `grace`: a dashboard's event stream
+/// never finishes, and waiting for it kept the systems from stopping (systemd then killed the process, losing open
+/// recordings and call event log rows).
+pub async fn serve_until(listener: tokio::net::TcpListener, app: Router, signal: impl std::future::Future<Output = ()> + Send + 'static,
+                         grace: std::time::Duration) -> std::io::Result<()> {
+    let (tx, mut rx) = tokio::sync::watch::channel(false);
+    let signalled = async move { signal.await; let _ = tx.send(true); };
+    let server = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(signalled);
+    tokio::select! {
+        r = server => r,
+        _ = async { if rx.wait_for(|s| *s).await.is_ok() { tokio::time::sleep(grace).await } else { std::future::pending().await } } => {
+            eprintln!("connections still open {grace:?} after the stop signal (an open dashboard): stopping anyway");
+            Ok(())
+        }
+    }
 }
 
 /// SIGTERM (systemctl stop/restart) or Ctrl-C.
