@@ -997,7 +997,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
                 if rate > 0.0 { st.last_control_ms = now; }
                 st.dropped = src.dropped();
                 st.recorded = rec.recorded;
-                st.recording_error = rec.last_error.clone().or_else(|| log.last_error.clone());
+                st.recording_error = rec.last_error.clone().or_else(|| log.last_error());
             });
             (tick, tick_valid) = (Instant::now(), cc.valid_tsbk());
         }

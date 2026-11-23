@@ -35,10 +35,76 @@ pub struct EventLog {
     policy: Arc<Mutex<RecordPolicy>>,
     next_id: u64,
     open: HashMap<u64, OpenCall>,
-    keep_days: u32,
-    /// Date of the last file written; a new date prunes old files.
-    last_day: Option<String>,
-    pub last_error: Option<String>,
+    /// Writes the files on a thread of its own (None when logging is off).
+    writer: Option<Writer>,
+}
+
+/// What the writer thread does, in order.
+enum Job { Row { path: PathBuf, line: String }, Sync(std::sync::mpsc::Sender<()>) }
+
+/// The file side of the log: the decoder hands rows over and goes on, so a folder that is slow or stops answering
+/// (a hung network mount) holds up only this thread.
+struct Writer {
+    tx: Option<std::sync::mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl Writer {
+    fn start(dir: PathBuf, keep_days: u32) -> Writer {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let error = Arc::new(Mutex::new(None::<String>));
+        let err = error.clone();
+        let set = move |e: Option<String>| {
+            if let Some(m) = &e { eprintln!("{m}"); }
+            *err.lock().unwrap_or_else(|p| p.into_inner()) = e;
+        };
+        let thread = std::thread::Builder::new().name("event-log".into()).spawn(move || {
+            let prune_now = |set: &dyn Fn(Option<String>)| {
+                if let Err(e) = prune(&dir, Local::now().date_naive(), keep_days) {
+                    if e.kind() != std::io::ErrorKind::NotFound { set(Some(format!("event log: cannot delete old files in {}: {e}", dir.display()))); }
+                }
+            };
+            prune_now(&set);
+            // Date of the last file written; a new date prunes old files.
+            let mut last_day: Option<String> = None;
+            for job in rx {
+                match job {
+                    Job::Row { path, line } => {
+                        let result = std::fs::create_dir_all(&dir).and_then(|_| {
+                            let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
+                            let mut out = String::new();
+                            if f.metadata()?.len() == 0 { out.push_str(HEADER); out.push('\n'); }
+                            out.push_str(&line);
+                            f.write_all(out.as_bytes())?;
+                            f.flush()
+                        });
+                        match result {
+                            Ok(()) => {
+                                set(None);
+                                let day = path.file_name().and_then(|n| n.to_str()).map(|n| n[..8].to_string());
+                                if day.is_some() && last_day != day { last_day = day; prune_now(&set); }
+                            }
+                            Err(e) => set(Some(format!("event log: {}: {e}", path.display()))),
+                        }
+                    }
+                    Job::Sync(done) => { let _ = done.send(()); }
+                }
+            }
+        }).expect("start the event log's writer thread");
+        Writer { tx: Some(tx), thread: Some(thread), error }
+    }
+
+    fn send(&self, job: Job) { if let Some(tx) = &self.tx { let _ = tx.send(job); } }
+}
+
+/// The rows handed over are written before the thread ends.
+// ponytail: a folder that never answers keeps a stopping system waiting here; a timed join if that ever matters.
+impl Drop for Writer {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+    }
 }
 
 impl EventLog {
@@ -46,22 +112,21 @@ impl EventLog {
     /// current time in ms, so IDs keep growing across restarts). Daily files older than `keep_days` are deleted now and
     /// whenever a new day's file is written.
     pub fn new(dir: Option<PathBuf>, system: &str, policy: Arc<Mutex<RecordPolicy>>, first_id: u64, keep_days: u32) -> EventLog {
-        let mut l = EventLog { dir, system: system.into(), policy, next_id: first_id, open: HashMap::new(), keep_days, last_day: None,
-            last_error: None };
-        l.prune_now();
-        l
+        let writer = dir.clone().map(|d| Writer::start(d, keep_days));
+        EventLog { dir, system: system.into(), policy, next_id: first_id, open: HashMap::new(), writer }
     }
 
-    fn prune_now(&mut self) {
-        let Some(dir) = self.dir.as_deref() else { return };
-        if let Err(e) = prune(dir, Local::now().date_naive(), self.keep_days) {
-            if e.kind() != std::io::ErrorKind::NotFound { self.fail(format!("event log: cannot delete old files in {}: {e}", dir.display())); }
-        }
+    /// The last write's problem (None once a write works again), as the writer thread last saw it.
+    pub fn last_error(&self) -> Option<String> {
+        self.writer.as_ref().and_then(|w| w.error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
-    fn fail(&mut self, msg: String) {
-        eprintln!("{msg}");
-        self.last_error = Some(msg);
+    /// Waits until every row handed over so far is written (or failed).
+    pub fn sync(&self) {
+        let Some(w) = &self.writer else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        w.send(Job::Sync(tx));
+        let _ = rx.recv();
     }
 
     pub fn grant(&mut self, g: &CallGrant, now_ms: i64) {
@@ -129,27 +194,8 @@ impl EventLog {
         };
         let line = row(c, name.as_deref(), self.next_id);
         self.next_id += 1;
-        let name_on_disk = file_name(&self.system, c.start_ms);
-        let path = dir.join(&name_on_disk);
-        let result = std::fs::create_dir_all(&dir).and_then(|_| {
-            let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&path)?;
-            let mut out = String::new();
-            if f.metadata()?.len() == 0 { out.push_str(HEADER); out.push('\n'); }
-            out.push_str(&line);
-            f.write_all(out.as_bytes())?;
-            f.flush()
-        });
-        match result {
-            Ok(()) => {
-                self.last_error = None;
-                let day = name_on_disk[..8].to_string();
-                if self.last_day.as_ref() != Some(&day) {
-                    self.last_day = Some(day);
-                    self.prune_now();
-                }
-            }
-            Err(e) => self.fail(format!("event log: {}: {e}", path.display())),
-        }
+        let path = dir.join(file_name(&self.system, c.start_ms));
+        if let Some(w) = &self.writer { w.send(Job::Row { path, line }); }
     }
 }
 
@@ -432,6 +478,7 @@ mod tests {
         l.tick(t + 2000 + IDLE_MS);
         assert!(!d.join("20261120_SGCo_call_events.log").exists(), "not ended before IDLE_MS has passed");
         l.tick(t + 2000 + IDLE_MS + 1);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 2);
         assert_eq!(f[0], HEADER);
@@ -446,10 +493,12 @@ mod tests {
         l.grant(&g(27, 911, HZ, false, false), t);
         l.grant(&g(27, 911, HZ, false, false), t + 300);
         l.grant(&g(41, 911, HZ, false, false), t + 500);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 2);
         assert!(f[1].contains("\"300\"") && f[1].contains("(27)"), "{}", f[1]);
         l.close_all(t + 600);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 3);
         assert!(f[2].contains(",\"41\","), "{}", f[2]);
@@ -468,6 +517,7 @@ mod tests {
         l.live(&[on_air(911, t)], t + 2000);
         l.live(&[on_air(711_506, t + 2500)], t + 4000);
         l.tick(t + 4000 + IDLE_MS + 1);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 3, "{f:?}");
         assert!(f[1].starts_with("\"2026:11:20:10:00:00\",\"2000\",") && f[1].contains(",\"911\","), "{}", f[1]);
@@ -483,6 +533,7 @@ mod tests {
         l.tick(t + IDLE_MS + 1);
         l.live(&[on_air(911, t + 6000)], t + 8000);
         l.tick(t + 8000 + IDLE_MS + 1);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 3, "{f:?}");
         assert!(f[2].starts_with("\"2026:11:20:10:00:06\",\"2000\",") && f[2].contains(",\"911\","), "{}", f[2]);
@@ -500,6 +551,7 @@ mod tests {
         l.live(&[on_air(911, t)], t + 1300);
         l.live(&[on_air(711_506, t + 1400)], t + 3000);
         l.tick(t + 3000 + IDLE_MS + 1);
+        l.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.len(), 3, "{f:?}");
         assert!(f[1].contains(",\"911\",") && f[2].starts_with("\"2026:11:20:10:00:01\",\"1800\",") && f[2].contains(",\"711506\","), "{f:?}");
@@ -515,6 +567,7 @@ mod tests {
         l.tick(t + 4000);
         assert!(!d.join("20261120_SGCo_call_events.log").exists(), "still open");
         l.tick(t + 4000 + IDLE_MS + 1);
+        l.sync();
         let f = lines(&d, "20261120");
         assert!(f[1].contains(",\"711035\",") && f[1].contains(",\"4000\",") && f[1].contains(" ENCRYPTED"), "{}", f[1]);
     }
@@ -527,6 +580,7 @@ mod tests {
         l.grant(&g(27, 911, HZ, false, false), t);
         l.grant(&g(27, 911, HZ, false, false), t + 3000);
         l.close_all(t + 3000);
+        l.sync();
         assert_eq!(lines(&d, "20261120").len(), 2);
         assert!(!d.join("20261121_SGCo_call_events.log").exists());
     }
@@ -542,6 +596,7 @@ mod tests {
         let mut b = log(&d, 200);
         b.grant(&g(27, 911, HZ, false, false), t + 60_000);
         b.close_all(t + 60_000);
+        b.sync();
         let f = lines(&d, "20261120");
         assert_eq!(f.iter().filter(|x| x.as_str() == HEADER).count(), 1);
         assert!(f[1].ends_with(",\"100\"") && f[2].ends_with(",\"200\""), "{f:?}");
@@ -555,12 +610,44 @@ mod tests {
         let t = ms(2026, 11, 20, 10, 0, 0);
         l.grant(&g(27, 911, HZ, false, false), t);
         l.close_all(t);
-        assert!(l.last_error.as_deref().is_some_and(|e| e.starts_with("event log: ")), "{:?}", l.last_error);
+        l.sync();
+        assert!(l.last_error().as_deref().is_some_and(|e| e.starts_with("event log: ")), "{:?}", l.last_error());
         std::fs::remove_file(&d).unwrap();
         l.grant(&g(27, 911, HZ, false, false), t + 10_000);
         l.close_all(t + 10_000);
-        assert_eq!(l.last_error, None);
+        l.sync();
+        assert_eq!(l.last_error(), None);
         assert_eq!(lines(&d, "20261120").len(), 2);
+    }
+
+    /// A folder that stops answering (a hung network mount) must not hold up decoding: the file is written apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_file_does_not_stall_the_decoder() {
+        let d = dir("hung");
+        std::fs::create_dir_all(&d).unwrap();
+        // Opening a named pipe to write blocks until someone reads it, as a hung mount blocks.
+        let pipe = d.join("20261120_SGCo_call_events.log");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+        let mut l = log(&d, 1);
+        let t = ms(2026, 11, 20, 10, 0, 0);
+        let at = std::time::Instant::now();
+        for i in 0..3 {
+            l.grant(&g(27, 911, HZ, false, false), t + i * 10_000);
+            l.close_all(t + i * 10_000);
+        }
+        assert!(at.elapsed() < std::time::Duration::from_millis(200), "the decoder waited {:?}", at.elapsed());
+        // Once it answers, every row is written, in order.
+        // Each row opens the file anew (and, a pipe being always empty, heads it): read until the three rows are in.
+        let rows = |t: &str| t.lines().filter(|x| *x != HEADER).count();
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            while rows(&text) < 3 { text.push_str(&std::fs::read_to_string(&pipe).unwrap()); }
+            text
+        });
+        drop(l);
+        let text = reader.join().unwrap();
+        assert_eq!(rows(&text), 3, "{text}");
     }
 
     #[test]
@@ -604,13 +691,15 @@ mod tests {
     fn new_day_prunes() {
         let d = dir("prune-new");
         touch(&d, &["20200101_X_call_events.log"]);
-        let _l = EventLog::new(Some(d.clone()), "SGCo", policy(), 1, 1);
+        let first = EventLog::new(Some(d.clone()), "SGCo", policy(), 1, 1);
+        first.sync();
         assert!(present(&d).is_empty(), "an old day's file is deleted when the system starts");
         let mut l = EventLog::new(Some(d.clone()), "SGCo", policy(), 1, 1);
         touch(&d, &["20200102_X_call_events.log"]);
         let t = Local::now().timestamp_millis();
         l.grant(&g(27, 911, HZ, false, false), t);
         l.close_all(t);
+        l.sync();
         assert!(!d.join("20200102_X_call_events.log").exists(), "and when a new day's file is opened");
     }
 
@@ -618,6 +707,7 @@ mod tests {
         l.grant(&g(group, source, HZ, enc, emer), start);
         if dur > 0 { l.grant(&g(group, source, HZ, enc, emer), start + dur); }
         l.close_all(start + dur);
+        l.sync();
     }
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime { day(y, mo, d).and_hms_opt(h, mi, 0).unwrap() }
     fn sample(name: &str) -> PathBuf {
@@ -722,6 +812,6 @@ mod tests {
         l.grant(&g(27, 911, HZ, false, false), t);
         l.close_all(t);
         assert!(!d.exists());
-        assert_eq!(l.last_error, None);
+        assert_eq!(l.last_error(), None);
     }
 }
