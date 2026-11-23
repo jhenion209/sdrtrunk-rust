@@ -33,6 +33,8 @@ Calls can also be played live to Icecast streams.
 - Health for Uptime Kuma: `GET /health` (all enabled systems) and `GET /health/<system name>` answer `200` when healthy
   and `503` with the reasons (stopped, control channel lost, decode quality, recording errors, tuner missing or
   dropping). No login: keep the web UI on the LAN.
+- HTTPS by default (its own certificate, yours, or Let's Encrypt's), plain HTTP only when asked, reverse proxies
+  trusted by address; a Connected hosts page for the owner.
 - Web UI: dashboard with live calls and signal readouts, tuner spectrum and waterfall, per-channel spectrum, signal and
   decode-quality history, user accounts (owner and admins; the owner allows each admin's changes function by function, and new admins start with none).
 
@@ -91,12 +93,53 @@ As a service (the database lives in `/var/lib/sdrtrunk-rust`):
     sudo systemctl enable --now sdrtrunk-rust
     journalctl -u sdrtrunk-rust | grep "setup code"
 
-Open `http://<host>:8080/setup`, enter the setup code from the log and create the owner account. Then add a system
+Open `https://<host>/setup` (the browser warns once about the certificate the program made for itself), enter the
+setup code from the log and create the owner account. Then add a system
 (control channel frequency, modulation, names used in file names) on the Systems page, check the SDR's frequency
 correction on the Tuners page, and choose a recordings folder.
 
-Options: `sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies]` (use `--secure-cookies`
-behind an HTTPS reverse proxy). `sdrtrunk-rust --freq HZ ...` runs a console monitor without the web UI.
+Options: `sdrtrunk-rust serve [--db PATH] [--replay DIR]`. `sdrtrunk-rust --freq HZ ...` runs a console monitor
+without the web UI.
+
+### HTTPS, ports and reverse proxies
+
+With no settings the web UI serves HTTPS on port 443 and nothing else (no plain HTTP, nothing on 80). The unit reads
+these optional variables from `/etc/sdrtrunk-rust/sdrtrunk-rust.env` (make it root-owned, mode 600):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SDRTRUNK_HTTPS` | `0.0.0.0:443` | HTTPS address and port; `off` turns HTTPS off |
+| `SDRTRUNK_HTTP` | off | plain HTTP address and port, e.g. `0.0.0.0:8080`, or `127.0.0.1:8080` for a proxy on this machine |
+| `SDRTRUNK_TLS_CERT`, `SDRTRUNK_TLS_KEY` | | your PEM certificate (with its chain) and key; both or neither |
+| `SDRTRUNK_ACME` | | `web` or `dns-cloudflare`: get and renew Let's Encrypt's certificate |
+| `SDRTRUNK_ACME_NAMES` | | the names for Let's Encrypt, comma-separated |
+| `SDRTRUNK_CLOUDFLARE_TOKEN` | | API token with Zone, DNS, Edit on the names' zone (for `dns-cloudflare`) |
+| `SDRTRUNK_ACME_DIRECTORY` | Let's Encrypt | another ACME directory, such as Let's Encrypt's staging one for a trial |
+| `SDRTRUNK_TRUSTED_PROXIES` | | proxy addresses or ranges (`192.168.104.0/24`), comma-separated |
+
+Certificates: without settings the program makes its own (5 years, for the host name, `localhost` and the machine's
+addresses) in `/var/lib/sdrtrunk-rust/tls/`; delete both files there and restart to make a new one. Your own pair
+is checked at start (that the key belongs to the certificate and its dates). Let's Encrypt's is kept in
+`/var/lib/sdrtrunk-rust/acme/` and renewed a third of the way before its end; `web` needs port 443 reached from the
+internet under each name (a router may forward it), `dns-cloudflare` writes and removes a TXT record and works on a
+LAN-only machine. Until it arrives the program serves its own. The Connected hosts page shows which is served.
+
+Behind a reverse proxy: list the proxy's own addresses in `SDRTRUNK_TRUSTED_PROXIES`. HAProxy connects from each
+node's address, not from a shared (virtual) address, so list the nodes or their range. Only from those does the
+program believe `X-Forwarded-For` (the visitor's address, for sign-in limits and the Connected hosts page) and
+`X-Forwarded-Proto` (sign-in cookies marked Secure). HAProxy:
+
+    backend sdrtrunk
+        option forwardfor
+        http-request set-header X-Forwarded-Proto https
+        server pi 192.168.101.6:443 ssl verify none   # or the plain HTTP port, with SDRTRUNK_HTTP set
+
+Uptime Kuma: monitor `https://<host>/health`, with "Ignore TLS/SSL errors" while the program's own certificate is
+served.
+
+Upgrading from a version before HTTPS: `--listen` and `--secure-cookies` are gone (the program stops and says what
+replaces them), and nothing answers on 8080 unless `SDRTRUNK_HTTP` says so. Install the new unit file (it adds the
+settings file and the right to bind port 443), run `systemctl daemon-reload`, then restart.
 
 ## License
 

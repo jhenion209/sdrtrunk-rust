@@ -44,7 +44,7 @@ pub fn make(names: &[String], cert: &Path, key: &Path) -> Result<(), String> {
 }
 
 /// An IP address, or a host name of letters, digits and inner hyphens, dot-separated (a leading `*.` allowed).
-fn host_or_address(name: &str) -> bool {
+pub fn host_or_address(name: &str) -> bool {
     if name.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }

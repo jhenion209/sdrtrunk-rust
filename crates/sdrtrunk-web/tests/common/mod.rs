@@ -28,6 +28,7 @@ pub fn state_with(sdrs: Sdrs) -> AppState {
         throttle: Arc::new(Throttle::default()),
         setup_code: Arc::new(Mutex::new(Some("ABCD-EFGH".into()))),
         trusted: Arc::default(),
+        web: Arc::default(),
     }
 }
 

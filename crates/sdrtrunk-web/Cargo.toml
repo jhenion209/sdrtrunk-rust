@@ -29,6 +29,8 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 x509-parser = "0.18"
+# This machine's host name and addresses, for the certificate it makes itself.
+libc = "0.2"
 serde_urlencoded = "0.7"
 # Reads sdrtrunk playlists (default.xml) for the stream import; small, no dependencies of its own.
 roxmltree = "0.20"

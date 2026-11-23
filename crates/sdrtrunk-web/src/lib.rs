@@ -2,6 +2,7 @@
 pub mod db;
 pub mod event_log;
 pub mod health;
+pub mod https;
 pub mod auth;
 pub mod quality;
 pub mod receiver;

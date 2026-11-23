@@ -21,23 +21,29 @@ fn num<T: std::str::FromStr>(name: &str, default: Option<T>) -> T {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--listen 0.0.0.0:8080] [--db PATH] [--secure-cookies] [--replay DIR]\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR\n       sdrtrunk-rust reset-password [USERNAME] [--db PATH]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
+    eprintln!("{msg}\nusage: sdrtrunk-rust serve [--db PATH] [--replay DIR]   (web settings: SDRTRUNK_* in /etc/sdrtrunk-rust/sdrtrunk-rust.env)\n       sdrtrunk-rust record --db PATH --tuner ID --center HZ --seconds N --out DIR\n       sdrtrunk-rust reset-password [USERNAME] [--db PATH]\n       sdrtrunk-rust --freq HZ [--ppm F] [--gain 0-21] [--rate HZ] [--modulation c4fm|lsm] [--file IQ.bin --center HZ]");
     std::process::exit(2)
 }
 
-/// `sdrtrunk-rust serve [--listen ADDR] [--db PATH] [--secure-cookies] [--replay DIR]`: web UI plus decoder.
+/// `sdrtrunk-rust serve [--db PATH] [--replay DIR]`: web UI plus decoder. Where the web UI listens and its certificate
+/// come from the `SDRTRUNK_*` variables (`web_config`): HTTPS on 0.0.0.0:443 with none set.
 /// `--replay DIR` uses the baseband recordings in DIR as tuners instead of the SDRs.
 fn serve() -> ! {
-    let listen: std::net::SocketAddr = num("--listen", Some("0.0.0.0:8080".parse().unwrap()));
+    if std::env::args().any(|a| a == "--listen") {
+        die("--listen is gone: set SDRTRUNK_HTTP (plain HTTP) or SDRTRUNK_HTTPS in /etc/sdrtrunk-rust/sdrtrunk-rust.env");
+    }
+    if std::env::args().any(|a| a == "--secure-cookies") {
+        die("--secure-cookies is gone: cookies are Secure over HTTPS by themselves");
+    }
+    let web = sdrtrunk_web::web_config::WebConfig::from_env().unwrap_or_else(|e| die(&e));
     let db = arg("--db").map(std::path::PathBuf::from).unwrap_or_else(default_db);
-    let secure = std::env::args().any(|a| a == "--secure-cookies");
     let sdrs = match arg("--replay") {
         Some(dir) => sdrtrunk_web::receiver::replay_sdrs(std::path::Path::new(&dir)).unwrap_or_else(|e| die(&format!("replay: {e}"))),
         None => sdrtrunk_web::receiver::sdrs(),
     };
     eprintln!("database {}", db.display());
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| die(&format!("runtime: {e}")));
-    match rt.block_on(sdrtrunk_web::app::serve(db, listen, secure, sdrs)) {
+    match rt.block_on(sdrtrunk_web::app::serve(db, web, sdrs, sdrtrunk_web::app::shutdown_signal())) {
         Ok(()) => std::process::exit(0),
         Err(e) => die(&format!("serve: {e}")),
     }

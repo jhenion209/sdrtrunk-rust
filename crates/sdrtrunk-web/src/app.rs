@@ -3,7 +3,9 @@ use crate::auth::{new_setup_code, Function, Role, Session, Throttle};
 use crate::db::Db;
 use crate::pages;
 use crate::receiver::{now_ms, Receivers, Sdrs};
-use crate::web_config::Proxy;
+use crate::https::WebStatus;
+pub use crate::https::{own_certificate, serve_https};
+use crate::web_config::{CertSource, Proxy, WebConfig};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -27,6 +29,8 @@ pub struct AppState {
     pub setup_code: Arc<Mutex<Option<String>>>,
     /// Reverse proxies whose `X-Forwarded-For` and `X-Forwarded-Proto` are believed (`SDRTRUNK_TRUSTED_PROXIES`).
     pub trusted: Arc<Vec<Proxy>>,
+    /// Where the web UI listens and which certificate it serves (the Connected hosts page shows it).
+    pub web: Arc<WebStatus>,
 }
 
 impl AppState {
@@ -174,8 +178,31 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Opens the database, starts the decoder with the saved settings and serves the UI until the process ends.
-pub async fn serve(db_path: PathBuf, listen: SocketAddr, _secure_cookies: bool, sdrs: Sdrs) -> std::io::Result<()> {
+/// Opens the database, starts the decoder with the saved settings and serves the UI (HTTPS, plain HTTP, or both, as
+/// `web` says) until `signal`. The certificate and the listening addresses are settled first, so a bad setting or a
+/// held port stops the start before any system is.
+pub async fn serve(db_path: PathBuf, web: WebConfig, sdrs: Sdrs, signal: impl std::future::Future<Output = ()> + Send + 'static)
+                   -> std::io::Result<()> {
+    crate::https::provider();
+    let other = std::io::Error::other;
+    let data_dir = db_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new(".")).to_path_buf();
+    let (first, source, acme) = match (web.https, web.cert) {
+        (None, _) => (None, "", None),
+        (Some(_), CertSource::Own) => (Some(own_certificate(&data_dir).map_err(other)?), "own", None),
+        (Some(_), CertSource::Files { cert, key }) => {
+            crate::cert::check(&cert, &key).map_err(other)?;
+            (Some(crate::cert::certified(&cert, &key).map_err(other)?), "yours", None)
+        }
+        // The own certificate is served until Let's Encrypt's arrives (or the one kept from before, at once).
+        (Some(_), CertSource::Acme(a)) => (Some(own_certificate(&data_dir).map_err(other)?), "Let's Encrypt", Some(a)),
+    };
+    let certs = first.map(|c| Arc::new(crate::acme::Certs::new(Arc::new(c))));
+    let bind = |addr: SocketAddr| {
+        std::net::TcpListener::bind(addr).and_then(|l| l.set_nonblocking(true).map(|()| l))
+            .map_err(|e| other(format!("cannot listen on {addr}: {e}")))
+    };
+    let https_listener = web.https.map(bind).transpose()?;
+    let http_listener = web.http.map(bind).transpose()?;
     let db = Db::open(&db_path).map_err(|e| std::io::Error::other(format!("{}: {e}", db_path.display())))?;
     let setup_code = (db.user_count() == 0).then(|| {
         let c = new_setup_code();
@@ -189,8 +216,18 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, _secure_cookies: bool, 
     receivers.apply_streams(&db);
     let state = AppState {
         db: Arc::new(db), receivers: Arc::new(receivers), throttle: Arc::default(),
-        setup_code: Arc::new(Mutex::new(setup_code)), trusted: Arc::default(),
+        setup_code: Arc::new(Mutex::new(setup_code)), trusted: Arc::new(web.trusted),
+        web: Arc::new(WebStatus { https: web.https, http: web.http, source, certs: certs.clone(), renewal: Arc::default() }),
     };
+    if let (Some(settings), Some(certs)) = (acme, &certs) {
+        crate::acme::start(settings, data_dir.join("acme"), certs.clone(), state.web.renewal.clone(), std::future::ready(()));
+    }
+    if let Some(certs) = &certs {
+        match crate::cert::found(&certs.current()) {
+            Ok(f) => eprintln!("HTTPS certificate ({source}) for {} until {}", f.names.join(", "), f.not_after.format("%Y-%m-%d")),
+            Err(e) => eprintln!("HTTPS certificate ({source}): {e}"),
+        }
+    }
     // Once a minute: signal and decode quality history, and PPM moved by Automatic PPM.
     let (db, receivers) = (state.db.clone(), state.receivers.clone());
     tokio::spawn(async move {
@@ -216,10 +253,23 @@ pub async fn serve(db_path: PathBuf, listen: SocketAddr, _secure_cookies: bool, 
             let _ = tokio::task::spawn_blocking(move || receivers.rescan(&db)).await;
         }
     });
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    eprintln!("SDRTrunk-Rust web UI on http://{listen}");
+    // One stop signal for both servers.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move { signal.await; let _ = stop.send(true); });
+    let stopped = move || { let mut rx = stopped.clone(); async move { let _ = rx.wait_for(|s| *s).await; } };
     let receivers = state.receivers.clone();
-    serve_until(listener, router(state), shutdown_signal(), SHUTDOWN_GRACE).await?;
+    let app = router(state);
+    let https = async {
+        let (Some(l), Some(certs)) = (https_listener, certs) else { return Ok(()) };
+        eprintln!("SDRTrunk-Rust web UI on https://{}", l.local_addr()?);
+        serve_https(l, app.clone(), certs, stopped(), SHUTDOWN_GRACE).await
+    };
+    let http = async {
+        let Some(l) = http_listener else { return Ok(()) };
+        eprintln!("SDRTrunk-Rust web UI on http://{}", l.local_addr()?);
+        serve_until(tokio::net::TcpListener::from_std(l)?, app.clone(), stopped(), SHUTDOWN_GRACE).await
+    };
+    tokio::try_join!(https, http)?;
     // Stopping joins every decoder, so open recordings and call event log rows are written before the process exits.
     eprintln!("stopping systems");
     let _ = tokio::task::spawn_blocking(move || receivers.stop_all()).await;
@@ -247,7 +297,7 @@ pub async fn serve_until(listener: tokio::net::TcpListener, app: Router, signal:
 }
 
 /// SIGTERM (systemctl stop/restart) or Ctrl-C.
-async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     let ctrl_c = async { let _ = tokio::signal::ctrl_c().await; };
     #[cfg(unix)]
     let term = async {
