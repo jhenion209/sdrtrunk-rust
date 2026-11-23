@@ -507,7 +507,8 @@ fn policy_for(db: &Db, system: &str) -> RecordPolicy {
         .filter(|m| m.list == system).map(|m| m.group).collect();
     streamed.sort_unstable();
     streamed.dedup();
-    RecordPolicy { record_unlisted: db.record_unlisted(system), talkgroups: db.talkgroups(system), streamed }
+    RecordPolicy { record_unlisted: db.record_unlisted(system), talkgroups: db.talkgroups(system), streamed,
+        radios: db.radio_names(system).into_iter().map(|r| (r.radio, r.name)).collect() }
 }
 
 impl Receivers {
@@ -1296,6 +1297,14 @@ fn setup(id: String, cfg: TunerConfig, sdrs: Sdrs, claimed: Claimed, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn radio_names_follow_the_systems_list() {
+        let db = Db::open_in_memory().unwrap();
+        db.save_radio_name("A", &crate::db::RadioName { radio: 733_730, name: "K315".into() }).unwrap();
+        assert_eq!(policy_for(&db, "A").radios.get(&733_730).map(String::as_str), Some("K315"));
+        assert!(policy_for(&db, "B").radios.is_empty());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 

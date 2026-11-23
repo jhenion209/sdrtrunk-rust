@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS talkgroups (system TEXT NOT NULL, number INTEGER NOT 
 CREATE TABLE IF NOT EXISTS new_talkgroups (system TEXT NOT NULL, number INTEGER NOT NULL, PRIMARY KEY (system, number));
 -- Record talkgroups not on the list; a system without a row records them.
 CREATE TABLE IF NOT EXISTS unlisted (system TEXT PRIMARY KEY, record INTEGER NOT NULL);
+-- Names of single radio IDs (the call's source), per alias list like its talkgroups.
+CREATE TABLE IF NOT EXISTS radio_names (system TEXT NOT NULL, radio INTEGER NOT NULL, name TEXT NOT NULL,
+    PRIMARY KEY (system, radio));
 ";
 
 /// Settings shared by all systems.
@@ -210,6 +213,10 @@ impl TunerConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Talkgroup { pub number: u16, pub name: String, pub record: bool }
+
+/// A name for one radio ID (a call's source) in an alias list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RadioName { pub radio: u32, pub name: String }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditEntry { pub at: i64, pub username: String, pub action: String }
@@ -476,6 +483,34 @@ impl Db {
         Ok(())
     }
 
+    // ---------- radio names (per alias list) ----------
+
+    pub fn radio_names(&self, list: &str) -> Vec<RadioName> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT radio, name FROM radio_names WHERE system = ?1 ORDER BY radio").expect("query");
+        st.query_map([list], |r| Ok(RadioName { radio: r.get(0)?, name: r.get(1)? })).expect("query").filter_map(Result::ok).collect()
+    }
+
+    /// Adds a name or renames the radio.
+    pub fn save_radio_name(&self, list: &str, r: &RadioName) -> rusqlite::Result<()> {
+        self.conn().execute("INSERT INTO radio_names (system, radio, name) VALUES (?1, ?2, ?3)
+            ON CONFLICT(system, radio) DO UPDATE SET name = ?3", params![list, r.radio, r.name])?;
+        Ok(())
+    }
+
+    pub fn delete_radio_name(&self, list: &str, radio: u32) -> rusqlite::Result<()> {
+        self.conn().execute("DELETE FROM radio_names WHERE system = ?1 AND radio = ?2", params![list, radio])?;
+        Ok(())
+    }
+
+    /// Adds names for radios that have none (all or none); radios already named keep their names.
+    pub fn add_radio_names(&self, list: &str, rs: &[RadioName]) -> rusqlite::Result<()> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        for r in rs { tx.execute("INSERT OR IGNORE INTO radio_names (system, radio, name) VALUES (?1, ?2, ?3)", params![list, r.radio, r.name])?; }
+        tx.commit()
+    }
+
     /// Imported talkgroups not reviewed yet, by number.
     pub fn new_talkgroups(&self, system: &str) -> Vec<u16> {
         let c = self.conn();
@@ -571,6 +606,23 @@ fn migrate_to_systems(c: &mut Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn radio_names_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let rn = |radio: u32, name: &str| RadioName { radio, name: name.into() };
+        db.save_radio_name("L", &rn(733_730, "K315")).unwrap();
+        db.save_radio_name("L", &rn(733_083, "K315")).unwrap();
+        db.save_radio_name("M", &rn(733_730, "Other")).unwrap();
+        assert_eq!(db.radio_names("L"), vec![rn(733_083, "K315"), rn(733_730, "K315")]);
+        db.save_radio_name("L", &rn(733_730, "K316")).unwrap();
+        assert_eq!(db.radio_names("L")[1], rn(733_730, "K316"));
+        db.delete_radio_name("L", 733_730).unwrap();
+        assert_eq!(db.radio_names("L"), vec![rn(733_083, "K315")]);
+        assert_eq!(db.radio_names("M"), vec![rn(733_730, "Other")]);
+        db.add_radio_names("L", &[rn(733_083, "X"), rn(1, "New")]).unwrap();
+        assert_eq!(db.radio_names("L"), vec![rn(1, "New"), rn(733_083, "K315")]);
+    }
 
     fn fields(s: &System) -> Vec<&'static str> {
         s.validate().err().unwrap_or_default().iter().map(|e| e.field).collect()

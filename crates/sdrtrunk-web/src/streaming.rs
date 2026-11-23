@@ -125,11 +125,12 @@ pub fn map_lists(found: Vec<StreamConfig>, map: &HashMap<String, String>) -> Vec
 #[derive(Clone, Debug)]
 pub struct StreamCall { pub alias_list: String, pub group: u16, pub start_ms: i64, pub title: String, pub pcm: Vec<i16> }
 
-/// The Java reference's title: "TO:23 WPD West FROM:703313" (the talkgroup's name when listed; FROM:UNKNOWN without a
-/// radio id).
-pub fn title(group: u16, name: Option<&str>, source: u32) -> String {
-    let to = match name { Some(n) if !n.is_empty() => format!("TO:{group} {n}"), _ => format!("TO:{group}") };
-    if source == 0 { format!("{to} FROM:UNKNOWN") } else { format!("{to} FROM:{source}") }
+/// The Java reference's title: "TO:23 WPD West FROM:703313 K315" (the talkgroup's and the radio's names when known;
+/// FROM:UNKNOWN without a radio id).
+pub fn title(group: u16, name: Option<&str>, source: u32, radio_name: Option<&str>) -> String {
+    let named = |id: String, n: Option<&str>| match n { Some(n) if !n.is_empty() => format!("{id} {n}"), _ => id };
+    let to = named(format!("TO:{group}"), name);
+    if source == 0 { format!("{to} FROM:UNKNOWN") } else { format!("{to} {}", named(format!("FROM:{source}"), radio_name)) }
 }
 
 /// What a stream is doing: "connected", "connecting", "error" or "off", calls waiting and sent, the last call's
@@ -369,8 +370,14 @@ mod tests {
         assert_eq!(base64(b"source:hackme"), "c291cmNlOmhhY2ttZQ==");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(pct("TO:23 WPD/West"), "TO%3A23%20WPD%2FWest");
-        assert_eq!(title(23, Some("WPD West"), 703_313), "TO:23 WPD West FROM:703313");
-        assert_eq!(title(85, None, 0), "TO:85 FROM:UNKNOWN");
+        assert_eq!(title(23, Some("WPD West"), 703_313, None), "TO:23 WPD West FROM:703313");
+        assert_eq!(title(85, None, 0, None), "TO:85 FROM:UNKNOWN");
+    }
+
+    #[test]
+    fn title_with_radio_name() {
+        assert_eq!(title(23, Some("WPD West"), 703_313, Some("K315")), "TO:23 WPD West FROM:703313 K315");
+        assert_eq!(title(23, Some("WPD West"), 703_313, None), "TO:23 WPD West FROM:703313");
         assert!(StreamConfig { name: "x".into(), host: "h".into(), mount: "/m".into(), members: vec![StreamTalkgroup::new("SGCo", 1)],
             ..StreamConfig::default() }.validate().is_ok());
         let old: StreamConfig = serde_json::from_str(r#"{"name":"x","alias_list":"SGCo","talkgroups":[23,85]}"#).unwrap();
@@ -469,7 +476,7 @@ mod tests {
     }
 
     fn call(group: u16, start_ms: i64) -> StreamCall {
-        StreamCall { alias_list: "SGCo".into(), group, start_ms, title: title(group, Some("WPD West"), 703_313), pcm: vec![1000; 4_000] }
+        StreamCall { alias_list: "SGCo".into(), group, start_ms, title: title(group, Some("WPD West"), 703_313, None), pcm: vec![1000; 4_000] }
     }
 
     #[test]

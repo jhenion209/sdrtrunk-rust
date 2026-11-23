@@ -33,10 +33,10 @@ impl Tuner for ControlChannel {
 /// talkgroups are followed for their streams whether recorded or not. Shared with the web pages so edits apply to the
 /// next call without a restart.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RecordPolicy { pub record_unlisted: bool, pub talkgroups: Vec<Talkgroup>, pub streamed: Vec<u16> }
+pub struct RecordPolicy { pub record_unlisted: bool, pub talkgroups: Vec<Talkgroup>, pub streamed: Vec<u16>, pub radios: HashMap<u32, String> }
 
 impl Default for RecordPolicy {
-    fn default() -> Self { RecordPolicy { record_unlisted: true, talkgroups: Vec::new(), streamed: Vec::new() } }
+    fn default() -> Self { RecordPolicy { record_unlisted: true, talkgroups: Vec::new(), streamed: Vec::new(), radios: HashMap::new() } }
 }
 
 /// Names written into file names and tags (sdrtrunk's alias-list System, Site and channel Name).
@@ -81,6 +81,8 @@ impl Recorder {
         let p = self.policy.lock().unwrap_or_else(|p| p.into_inner());
         p.talkgroups.iter().find(|t| t.number == group).map_or((p.record_unlisted, None), |t| (t.record, Some(t.name.clone())))
     }
+
+    fn radio_name(&self, source: u32) -> Option<String> { self.policy.lock().unwrap_or_else(|p| p.into_inner()).radios.get(&source).cloned() }
 
     fn streamed(&self, group: u16) -> bool { self.policy.lock().unwrap_or_else(|p| p.into_inner()).streamed.contains(&group) }
 
@@ -198,13 +200,14 @@ impl Recorder {
     fn finish(&mut self, id: u32, seg: Option<Segment>) {
         let Some(seg) = seg else { return };
         let (record, alias) = self.policy(seg.group);
+        let radio = self.radio_name(seg.source);
         if seg.encrypted != Some(false) || seg.pcm.is_empty() { return; }
         if let Some((streams, list)) = self.streams.as_ref().filter(|_| self.streamed(seg.group)) {
             streams.submit(&StreamCall { alias_list: list.clone(), group: seg.group, start_ms: seg.start_ms,
-                title: title(seg.group, alias.as_deref(), seg.source), pcm: seg.pcm.clone() });
+                title: title(seg.group, alias.as_deref(), seg.source, radio.as_deref()), pcm: seg.pcm.clone() });
         }
         if !record { return; }
-        let (name, tags) = file_name_and_tags(&self.names, &seg, alias.as_deref(), &self.chans[&id].grant);
+        let (name, tags) = file_name_and_tags(&self.names, &seg, alias.as_deref(), radio.as_deref(), &self.chans[&id].grant);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!(".{name}.part"));
         let tag_refs: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -225,7 +228,7 @@ impl Recorder {
 fn clean(s: &str) -> String { s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' }).collect() }
 
 /// `20261113_210324_System_Site_Name__TO_23_FROM_703313.mp3` and the ID3 frames sdrtrunk writes.
-fn file_name_and_tags(n: &Names, seg: &Segment, alias: Option<&str>, g: &CallGrant) -> (String, Vec<(&'static str, String)>) {
+fn file_name_and_tags(n: &Names, seg: &Segment, alias: Option<&str>, radio: Option<&str>, g: &CallGrant) -> (String, Vec<(&'static str, String)>) {
     let t = Local.timestamp_millis_opt(seg.start_ms).single().unwrap_or_else(Local::now);
     let from = if seg.source != 0 { format!("_FROM_{}", seg.source) } else { String::new() };
     let name = format!("{}_{}_{}_{}__TO_{}{from}.mp3", t.format("%Y%m%d_%H%M%S"), clean(&n.system), clean(&n.site), clean(&n.channel), seg.group);
@@ -235,7 +238,9 @@ fn file_name_and_tags(n: &Names, seg: &Segment, alias: Option<&str>, g: &CallGra
         n.system, n.site, n.channel, g.channel.band, g.channel.number, g.hz);
     let mut tags = vec![("COMM", comment), ("TALB", n.channel.clone()), ("TCOM", format!("SDRTrunk-Rust {}", env!("CARGO_PKG_VERSION"))),
         ("TCON", "Scanner Audio".into()), ("TDAT", date), ("TIT1", n.system.clone()), ("TIT2", title)];
-    if seg.source != 0 { tags.push(("TPE1", seg.source.to_string())); }
+    // `711013"K315"` as sdrtrunk writes it; a '"' in the name would end it early for readers, so it becomes '\''.
+    let artist = match radio { Some(r) if !r.is_empty() => format!("{}\"{}\"", seg.source, r.replace('"', "'")), _ => seg.source.to_string() };
+    if seg.source != 0 { tags.push(("TPE1", artist)); }
     tags.push(("TYER", t.format("%Y").to_string()));
     (name, tags)
 }
@@ -276,10 +281,47 @@ mod tests {
         v
     }
 
+    /// The text of the one file recorded for a clear call on TG 27 from radio 711013, with these radio names.
+    fn recorded_text(tag: &str, radios: &[(u32, &str)]) -> (String, String) {
+        let d = dir(tag);
+        let tgs = Arc::new(Mutex::new(RecordPolicy { record_unlisted: true, talkgroups: vec![], streamed: vec![],
+            radios: radios.iter().map(|(r, n)| (*r, n.to_string())).collect() }));
+        let (mut r, mut t) = (Recorder::new(&d, names(), tgs), FakeTuner::default());
+        r.handle(&grant(27, 858_737_500), 1_000, &mut t);
+        r.handle(&ldu1(Some(lc(27, 711_013, 0x04))), 1_100, &mut t);
+        r.handle(&ldu2(Some(ess(0x80))), 1_280, &mut t);
+        r.handle(&ControlEvent::VoiceEnd { id: 1 }, 1_300, &mut t);
+        let f = files(&d);
+        assert_eq!(f.len(), 1);
+        let text = String::from_utf8_lossy(&std::fs::read(d.join(&f[0])).unwrap()).into_owned();
+        (f[0].clone(), text)
+    }
+
+    /// The TPE1 frame's text (ID3v2.3/2.4 text frame: 10-byte header, encoding byte, text up to a NUL or the next frame).
+    fn tpe1(text: &str) -> String {
+        let i = text.find("TPE1").expect("TPE1") + 11;
+        text[i..].chars().take_while(|c| *c != '\0' && *c != 'T').collect()
+    }
+
+    #[test]
+    fn named_radio_in_tpe1() {
+        let (name, text) = recorded_text("radio-named", &[(711_013, "K315")]);
+        assert!(name.ends_with("__TO_27_FROM_711013.mp3"), "{name}");
+        assert_eq!(tpe1(&text), "711013\"K315\"");
+        let (_, text) = recorded_text("radio-unnamed", &[(5, "Other")]);
+        assert_eq!(tpe1(&text), "711013");
+    }
+
+    #[test]
+    fn quote_in_radio_name_is_replaced() {
+        let (_, text) = recorded_text("radio-quote", &[(711_013, "A\"B")]);
+        assert_eq!(tpe1(&text), "711013\"A'B\"");
+    }
+
     #[test]
     fn records_clear_call_like_sdrtrunk() {
         let d = dir("clear");
-        let tgs = Arc::new(Mutex::new(RecordPolicy { record_unlisted: true, talkgroups: vec![Talkgroup { number: 27, name: "Jail 1".into(), record: true }], streamed: vec![] }));
+        let tgs = Arc::new(Mutex::new(RecordPolicy { record_unlisted: true, talkgroups: vec![Talkgroup { number: 27, name: "Jail 1".into(), record: true }], streamed: vec![], radios: HashMap::new() }));
         let (mut r, mut t) = (Recorder::new(&d, names(), tgs), FakeTuner::default());
         r.handle(&grant(27, 858_737_500), 1_000, &mut t);
         assert_eq!(t.open, vec![(1, 858_737_500)]);
@@ -370,7 +412,7 @@ mod tests {
     #[test]
     fn record_flag_and_idle_release() {
         let d = dir("flag");
-        let tgs = Arc::new(Mutex::new(RecordPolicy { record_unlisted: true, talkgroups: vec![Talkgroup { number: 9, name: "Off".into(), record: false }], streamed: vec![] }));
+        let tgs = Arc::new(Mutex::new(RecordPolicy { record_unlisted: true, talkgroups: vec![Talkgroup { number: 9, name: "Off".into(), record: false }], streamed: vec![], radios: HashMap::new() }));
         let (mut r, mut t) = (Recorder::new(&d, names(), tgs), FakeTuner::default());
         r.handle(&grant(9, 851_000_000), 0, &mut t);
         assert!(t.open.is_empty(), "talkgroup set not to record");
@@ -390,7 +432,7 @@ mod tests {
         use crate::streaming::{StreamConfig, StreamTalkgroup};
         let d = dir("streamed");
         let p = Arc::new(Mutex::new(RecordPolicy { record_unlisted: false,
-            talkgroups: vec![Talkgroup { number: 23, name: "WPD West".into(), record: false }], streamed: vec![23] }));
+            talkgroups: vec![Talkgroup { number: 23, name: "WPD West".into(), record: false }], streamed: vec![23], radios: HashMap::new() }));
         // A stream whose server is unreachable: calls wait in its queue.
         let streams = Arc::new(Streams::new(std::time::Duration::from_secs(60)));
         streams.apply(vec![StreamConfig { id: 1, name: "WPD West".into(), host: "127.0.0.1".into(), port: 1, mount: "/scan21".into(),
@@ -411,7 +453,7 @@ mod tests {
     #[test]
     fn unlisted_follow_the_global_switch() {
         let d = dir("unlisted");
-        let p = Arc::new(Mutex::new(RecordPolicy { record_unlisted: false, talkgroups: vec![Talkgroup { number: 51, name: "Fire".into(), record: true }], streamed: vec![] }));
+        let p = Arc::new(Mutex::new(RecordPolicy { record_unlisted: false, talkgroups: vec![Talkgroup { number: 51, name: "Fire".into(), record: true }], streamed: vec![], radios: HashMap::new() }));
         let (mut r, mut t) = (Recorder::new(&d, names(), p.clone()), FakeTuner::default());
         r.handle(&grant(27, 858_737_500), 0, &mut t);
         assert!(t.open.is_empty(), "unlisted talkgroup not followed when the switch is off");
