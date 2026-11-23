@@ -6,6 +6,7 @@ pub mod auth;
 pub mod quality;
 pub mod receiver;
 pub mod recorder;
+pub mod radio_names;
 pub mod rr_csv;
 pub mod streaming;
 pub mod tuning;

@@ -176,7 +176,7 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed) -> Markup {
 }
 
 #[derive(Serialize)]
-struct CallJson<'a> { #[serde(flatten)] call: &'a CallEvent, name: Option<String> }
+struct CallJson<'a> { #[serde(flatten)] call: &'a CallEvent, name: Option<String>, radio_name: Option<String> }
 
 #[derive(Serialize)]
 struct SystemStatusJson { id: i64, #[serde(flatten)] s: Status, uptime: String, site_text: String, helpers_text: String, #[serde(flatten)] readouts: Readouts }
@@ -188,7 +188,8 @@ pub async fn events(State(st): State<AppState>, Authed(_, token): Authed) -> Sse
     let calls = BroadcastStream::new(st.receivers.calls.subscribe()).filter_map(move |r| {
         let call = r.ok()?;
         let name = db.talkgroups(&call.alias_list).into_iter().find(|t| t.number == call.group).map(|t| t.name);
-        Event::default().event("call").json_data(CallJson { call: &call, name }).ok()
+        let radio_name = db.radio_names(&call.alias_list).into_iter().find(|r| r.radio == call.source).map(|r| r.name);
+        Event::default().event("call").json_data(CallJson { call: &call, name, radio_name }).ok()
     });
     let state = st.clone();
     let ticks = IntervalStream::new(tokio::time::interval(Duration::from_secs(1))).filter_map(move |_| {

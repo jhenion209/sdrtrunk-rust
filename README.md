@@ -27,6 +27,9 @@ Calls can also be played live to Icecast streams.
 - Call event log: one row per call (every talkgroup, encrypted calls included) in sdrtrunk's `*_call_events.log` CSV
   format, a file per system per day, kept 30 days by default (folder and days set on the Recordings page), searchable on
   the Event Log page by system, call type, encryption, emergency, talkgroups, source radio IDs and time range.
+- Radio names: names for single radio IDs per talkgroup list, written into each recording's artist tag the way sdrtrunk
+  does (`733730"K315"`; file names keep the number) and shown with the number on the dashboard, Event Log page and stream
+  titles; imported from an sdrtrunk playlist, where a re-import adds new names and asks before changing yours.
 - Health for Uptime Kuma: `GET /health` (all enabled systems) and `GET /health/<system name>` answer `200` when healthy
   and `503` with the reasons (stopped, control channel lost, decode quality, recording errors, tuner missing or
   dropping). No login: keep the web UI on the LAN.

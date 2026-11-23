@@ -8,6 +8,7 @@ use axum::extract::{Query, State};
 use chrono::{Local, NaiveDateTime};
 use maud::{html, Markup};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const PER_PAGE: usize = 200;
 const INPUT: &str = "%Y-%m-%dT%H:%M";
@@ -82,11 +83,17 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(mut q)
         }
         Err(errors) => Err(errors),
     };
-    let systems: Vec<String> = st.db.systems().into_iter().map(|x| x.system_name).collect();
-    view(&s, &q, &systems, &result)
+    let all = st.db.systems();
+    // Radio names by system name (the log's System column), each from that system's alias list.
+    let radios: Radios = all.iter().map(|x| (x.system_name.clone(),
+        st.db.radio_names(x.list_name()).into_iter().map(|r| (r.radio, r.name)).collect())).collect();
+    let systems: Vec<String> = all.into_iter().map(|x| x.system_name).collect();
+    view(&s, &q, &systems, &radios, &result)
 }
 
-fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], result: &Result<Found, Vec<FieldError>>) -> Markup {
+type Radios = HashMap<String, HashMap<u32, String>>;
+
+fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], radios: &Radios, result: &Result<Found, Vec<FieldError>>) -> Markup {
     let errors: &[FieldError] = result.as_ref().err().map(Vec::as_slice).unwrap_or(&[]);
     let events: &[String] = result.as_ref().map(|f| f.events.as_slice()).unwrap_or(&[]);
     let page = page_no(q);
@@ -133,7 +140,9 @@ fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], result:
                     td { (format!("{:.1}", e.duration_ms as f64 / 1000.0)) }
                     td { (e.system) }
                     td { @if let Some(n) = &e.name { (n) " (" (e.group) ")" } @else { (e.group) } }
-                    td { @if let Some(r) = e.from { (r) } }
+                    td { @if let Some(r) = e.from {
+                        @if let Some(n) = radios.get(&e.system).and_then(|m| m.get(&r)) { (n) " (" (r) ")" } @else { (r) }
+                    } }
                     td { (format_mhz(e.hz)) }
                     td { (e.channel) }
                     td { (e.event) }
