@@ -29,6 +29,7 @@ pub fn state_with(sdrs: Sdrs) -> AppState {
         setup_code: Arc::new(Mutex::new(Some("ABCD-EFGH".into()))),
         trusted: Arc::default(),
         web: Arc::default(),
+        live: Arc::default(),
     }
 }
 

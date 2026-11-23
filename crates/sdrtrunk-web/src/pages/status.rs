@@ -202,6 +202,7 @@ pub async fn events(State(st): State<AppState>, Authed(_, token): Authed) -> Sse
     });
     // The stream ends as soon as the session does (sign out, password change, user removed, expiry).
     let db = st.db.clone();
-    let live = calls.merge(ticks).take_while(move |_| db.session_valid(&token, now_ms()));
+    let open = st.live.open(crate::auth::token_hash(&token));
+    let live = calls.merge(ticks).take_while(move |_| { let _counted = &open; db.session_valid(&token, now_ms()) });
     Sse::new(live.map(Ok)).keep_alive(KeepAlive::default())
 }

@@ -31,6 +31,8 @@ pub struct AppState {
     pub trusted: Arc<Vec<Proxy>>,
     /// Where the web UI listens and which certificate it serves (the Connected hosts page shows it).
     pub web: Arc<WebStatus>,
+    /// Each session's open live pages.
+    pub live: Arc<crate::live::LivePages>,
 }
 
 impl AppState {
@@ -228,6 +230,7 @@ pub async fn serve(db_path: PathBuf, web: WebConfig, sdrs: Sdrs, signal: impl st
     let state = AppState {
         db: Arc::new(db), receivers: Arc::new(receivers), throttle: Arc::default(),
         setup_code: Arc::new(Mutex::new(setup_code)), trusted: Arc::new(web.trusted),
+        live: Arc::default(),
         web: Arc::new(WebStatus { https: web.https, http: web.http, source, certs: certs.clone(), renewal: Arc::default() }),
     };
     if let (Some(settings), Some(certs)) = (acme, &certs) {

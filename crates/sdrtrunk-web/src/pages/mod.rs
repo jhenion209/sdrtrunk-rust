@@ -41,7 +41,8 @@ where
         Some(Event::default().event("html").data(html))
     });
     let db = st.db.clone();
-    let live = ticks.take_while(move |_| db.session_valid(&token, now_ms()));
+    let open = st.live.open(crate::auth::token_hash(&token));
+    let live = ticks.take_while(move |_| { let _counted = &open; db.session_valid(&token, now_ms()) });
     Sse::new(live.map(Ok)).keep_alive(KeepAlive::default())
 }
 
@@ -65,6 +66,7 @@ where
         (sent.swap(seq, Ordering::Relaxed) != seq).then(|| Event::default().event(event).data(json))
     });
     let db = st.db.clone();
-    let live = frames.take_while(move |_| db.session_valid(&token, now_ms()));
+    let open = st.live.open(crate::auth::token_hash(&token));
+    let live = frames.take_while(move |_| { let _counted = &open; db.session_valid(&token, now_ms()) });
     Sse::new(live.map(Ok)).keep_alive(KeepAlive::default())
 }
