@@ -8,7 +8,6 @@ use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
 use crate::radio_names;
 use crate::rr_csv;
-use crate::streaming::guess_list;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -193,11 +192,16 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
         }
         @if st.db.may(&s.user, Function::TalkgroupsImport) {
             form method="post" action="/talkgroups/radios/import" enctype="multipart/form-data" {
-                (hidden(s, list))
+                input type="hidden" name="csrf" value=(s.csrf);
+                label { "Import into"
+                    select name="into" required {
+                        option value="" selected { "Choose a list…" }
+                        @for l in st.db.alias_lists() { option value=(l) { "Alias list: " (l) } }
+                    }
+                }
                 label { "SDRTrunk playlist (default.xml)" input type="file" name="file" accept=".xml,text/xml" required; }
-                label { "Its alias list, if the name differs from " (list) input name="source" maxlength="60"; }
-                p.muted { "New radio names are added; where a name differs from yours you choose which to keep; nothing is deleted. "
-                    "Radio ID ranges are skipped." }
+                p.muted { "Next you choose which of the playlist's alias lists to take. New radio names are added; where a "
+                    "name differs from yours you choose which to keep; nothing is deleted. Radio ID ranges are skipped." }
                 button { "Import radio names" }
             }
         }
@@ -248,39 +252,38 @@ pub async fn save_radio(State(st): State<AppState>, Authed(s, _): Authed, Form(f
     Redirect::to(&format!("{}#radios", url(&f.list, ""))).into_response()
 }
 
-/// sdrtrunk playlist upload: adds radio names this list lacks, then asks about names that differ. The playlist's
-/// alias list is the one typed in `source`, else the ones whose names lead to ours (as the stream import guesses).
+/// sdrtrunk playlist upload in two steps, nothing guessed: the form names our list (`into`) and sends the file; the
+/// answer asks which of the playlist's alias lists to take (`source`), carrying the playlist back as `xml`. Then it
+/// adds radio names our list lacks and asks about names that differ.
 pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
     if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
-    let (mut csrf, mut list, mut source, mut text) = (String::new(), String::new(), String::new(), String::new());
+    let (mut csrf, mut list, mut source, mut text) = (String::new(), String::new(), None::<String>, String::new());
     while let Ok(Some(field)) = mp.next_field().await {
         match field.name() {
             Some("csrf") => csrf = field.text().await.unwrap_or_default(),
-            Some("list") => list = field.text().await.unwrap_or_default(),
-            Some("source") => source = field.text().await.unwrap_or_default(),
-            Some("file") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            Some("into") => list = field.text().await.unwrap_or_default(),
+            Some("source") => source = Some(field.text().await.unwrap_or_default()),
+            Some("file") | Some("xml") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
             _ => {}
         }
     }
     if let Err(code) = check_csrf(&s, &csrf) { return code.into_response(); }
+    let error_page = |msg: &str| layout("Talkgroups", Some(&s.user), &s.csrf, html! {
+        p.error { (msg) } p { a href="/talkgroups#radios" { "Back to Talkgroups" } }
+    }).into_response();
+    if list.is_empty() { return error_page("Choose the list to import into."); }
     if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
-    let refuse = |msg: &str| view(&st, &s, &list, &TalkgroupForm::default(), Some(msg)).into_response();
-    let parsed = match radio_names::parse(&text) { Ok(p) => p, Err(e) => return refuse(&e) };
-    let ours_lists = st.db.alias_lists();
-    let source = source.trim();
-    let theirs: Vec<RadioName> = parsed.by_list.iter()
-        .filter(|(l, _)| if source.is_empty() { guess_list(l, &ours_lists).as_deref() == Some(list.as_str()) } else { l.as_str() == source })
-        .flat_map(|(_, rs)| rs.iter().cloned()).collect();
-    if theirs.is_empty() {
-        let found: Vec<&str> = parsed.by_list.keys().map(String::as_str).collect();
-        return refuse(&format!("No radio names for {list} in this playlist. Its alias lists with radio names: {}. \
-            Type the one to use in “Its alias list”.", if found.is_empty() { "none".into() } else { found.join(", ") }));
-    }
-    // A radio in two of the playlist's lists that both lead here: the first one counts.
-    let mut uniq: Vec<RadioName> = Vec::new();
-    for r in theirs { if !uniq.iter().any(|u| u.radio == r.radio) { uniq.push(r); } }
+    let parsed = match radio_names::parse(&text) { Ok(p) => p, Err(e) => return error_page(&e) };
+    if parsed.by_list.is_empty() { return error_page("This playlist has no radio names."); }
+    let Some(source) = source else {
+        return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, None)).into_response();
+    };
+    let Some(uniq) = parsed.by_list.get(&source).cloned() else {
+        let msg = if source.is_empty() { "Choose the playlist list to import." } else { "That list is not in this playlist." };
+        return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, Some(msg))).into_response();
+    };
     let c = radio_names::compare(&st.db.radio_names(&list), &uniq);
-    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return refuse(&format!("Could not import: {e}")); }
+    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return error_page(&format!("Could not import: {e}")); }
     changed(&st, &s, format!("imported {} into {list} from an sdrtrunk playlist", plural(c.new.len(), "radio name")));
     layout("Talkgroups", Some(&s.user), &s.csrf, html! {
         p.ok { "Imported radio names into " (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, "
@@ -310,6 +313,26 @@ pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut
 }
 
 /// Applies the choices: renames only radios set to the playlist's name; never adds or deletes.
+/// Step two of the playlist import: which of the playlist's alias lists goes into `list` (no choice made for you).
+fn choose_source(s: &Session, list: &str, parsed: &radio_names::Parsed, xml: &str, error: Option<&str>) -> Markup {
+    html! {
+        h2 { "Import radio names into " (list) }
+        (notice(error, None))
+        form method="post" action="/talkgroups/radios/import" enctype="multipart/form-data" {
+            input type="hidden" name="csrf" value=(s.csrf);
+            input type="hidden" name="into" value=(list);
+            input type="hidden" name="xml" value=(xml);
+            label { "Playlist list to import"
+                select name="source" required {
+                    option value="" selected { "Choose…" }
+                    @for (l, rs) in &parsed.by_list { option value=(l) { (l) " (" (plural(rs.len(), "radio")) ")" } }
+                }
+            }
+            button { "Continue" } " " a href={ (url(list, "")) "#radios" } { "Cancel" }
+        }
+    }
+}
+
 pub async fn import_radios_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
     if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());

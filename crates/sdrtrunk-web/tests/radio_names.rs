@@ -83,7 +83,7 @@ async fn event_log_page_shows_radio_name() {
     assert!(r.body.contains("K315 (733730)"), "{}", r.body);
 }
 
-/// A playlist naming radio 733730 "K315" and radio 1 "New" in list "P25 Sim" (guessed as ours, "P25"), and 9 in "Other".
+/// A playlist naming radio 733730 "K315" and radio 1 "New" in list "P25 Sim", and 9 in "Other".
 const PLAYLIST: &str = r#"<playlist>
   <alias name="K315" list="P25 Sim"><id type="radio" value="733730" protocol="APCO25"/>
     <id type="radioRange" min="1" max="9" protocol="APCO25"/></alias>
@@ -91,16 +91,17 @@ const PLAYLIST: &str = r#"<playlist>
   <alias name="Elsewhere" list="Other"><id type="radio" value="9" protocol="APCO25"/></alias>
 </playlist>"#;
 
-async fn upload(st: &sdrtrunk_web::app::AppState, cookie: &str, csrf: &str, source: &str, xml: &str) -> (StatusCode, String) {
+/// POSTs the import form: `fields` as multipart text fields, plus the playlist as the file upload when `file` is set.
+async fn upload(st: &sdrtrunk_web::app::AppState, cookie: &str, fields: &[(&str, &str)], file: Option<&str>) -> (StatusCode, String) {
     use axum::body::Body;
     use axum::http::{header, Request};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     let b = "XbOuNdArY";
-    let body = format!("--{b}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n\
---{b}\r\nContent-Disposition: form-data; name=\"list\"\r\n\r\n{SYS}\r\n\
---{b}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\n{source}\r\n\
---{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"default.xml\"\r\nContent-Type: text/xml\r\n\r\n{xml}\r\n--{b}--\r\n");
+    let mut body = String::new();
+    for (k, v) in fields { body += &format!("--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"); }
+    if let Some(x) = file { body += &format!("--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"default.xml\"\r\nContent-Type: text/xml\r\n\r\n{x}\r\n"); }
+    body += &format!("--{b}--\r\n");
     let req = Request::builder().method("POST").uri("/talkgroups/radios/import").header(header::COOKIE, cookie)
         .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={b}")).body(Body::from(body)).unwrap();
     let res = sdrtrunk_web::app::router(st.clone()).oneshot(req).await.unwrap();
@@ -109,12 +110,42 @@ async fn upload(st: &sdrtrunk_web::app::AppState, cookie: &str, csrf: &str, sour
 }
 
 #[tokio::test]
+async fn import_form_requires_choosing_the_list() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    let page = send(&st, "GET", "/talkgroups", Some(&cookie), &[]).await.body;
+    assert!(page.contains(r#"<option value="" selected>Choose a list…</option>"#) && page.contains(r#"name="into" required"#), "{page}");
+    let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", "")], Some(PLAYLIST)).await;
+    assert!(body.contains("Choose the list to import into."), "{body}");
+    assert!(st.db.radio_names(SYS).is_empty());
+}
+
+#[tokio::test]
+async fn upload_asks_which_playlist_list_then_imports_it() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    let (status, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS)], Some(PLAYLIST)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(r#"<option value="" selected>Choose…</option>"#) && body.contains("P25 Sim (2 radios)") && body.contains("Other (1 radio)"), "{body}");
+    assert!(st.db.radio_names(SYS).is_empty(), "nothing stored before the choice");
+    // Continue: the playlist comes back as a hidden field, not a second upload.
+    let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", ""), ("xml", PLAYLIST)], None).await;
+    assert!(body.contains("Choose the playlist list to import."), "{body}");
+    let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "Missing"), ("xml", PLAYLIST)], None).await;
+    assert!(body.contains("class=\"error\""), "{body}");
+    upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "Other"), ("xml", PLAYLIST)], None).await;
+    assert_eq!(st.db.radio_names(SYS), vec![rn(9, "Elsewhere")]);
+    let (_, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS)], Some("<nope/>")).await;
+    assert!(body.contains("not an sdrtrunk playlist"), "{body}");
+}
+
+#[tokio::test]
 async fn reimport_keeps_names_unless_chosen() {
     let st = state();
     let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
     st.db.save_radio_name(SYS, &rn(733_730, "K316")).unwrap();
     st.db.save_radio_name(SYS, &rn(42, "Only ours")).unwrap();
-    let (status, body) = upload(&st, &cookie, &csrf, "", PLAYLIST).await;
+    let (status, body) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "P25 Sim"), ("xml", PLAYLIST)], None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(st.db.radio_names(SYS), vec![rn(1, "New"), rn(42, "Only ours"), rn(733_730, "K316")], "added, nothing overwritten");
     assert!(body.contains("Names that differ") && body.contains("K315") && body.contains("1 radio range skipped"), "{body}");
@@ -131,22 +162,10 @@ async fn reimport_keeps_names_unless_chosen() {
 }
 
 #[tokio::test]
-async fn import_takes_the_named_playlist_list() {
-    let st = state();
-    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
-    upload(&st, &cookie, &csrf, "Other", PLAYLIST).await;
-    assert_eq!(st.db.radio_names(SYS), vec![rn(9, "Elsewhere")]);
-    let (_, body) = upload(&st, &cookie, &csrf, "Missing", PLAYLIST).await;
-    assert!(body.contains("class=\"error\"") && body.contains("P25 Sim"), "names the playlist's lists: {body}");
-    let (_, body) = upload(&st, &cookie, &csrf, "", "<nope/>").await;
-    assert!(body.contains("not an sdrtrunk playlist"), "{body}");
-}
-
-#[tokio::test]
 async fn import_needs_talkgroups_import() {
     let st = state();
     let (cookie, csrf) = login_with(&st, "helper", &[Function::TalkgroupsEdit]);
-    let (status, _) = upload(&st, &cookie, &csrf, "", PLAYLIST).await;
+    let (status, _) = upload(&st, &cookie, &[("csrf", &csrf), ("into", SYS), ("source", "P25 Sim"), ("xml", PLAYLIST)], None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let r = send(&st, "POST", "/talkgroups/radios/import/apply", Some(&cookie),
         &[("csrf", &csrf), ("list", SYS), ("conflict", "1"), ("pl_name_1", "X"), ("choice_1", "playlist")]).await;
