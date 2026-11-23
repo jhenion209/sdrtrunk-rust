@@ -6,10 +6,10 @@ use crate::db::RadioName;
 pub struct Parsed {
     /// Radio names per sdrtrunk alias list; lists and names in file order.
     pub by_list: Vec<(String, Vec<RadioName>)>,
-    /// Radio ID ranges (not supported).
-    pub ranges_skipped: usize,
-    /// One line per other skipped entry.
-    pub skipped: Vec<String>,
+    /// Radio ID ranges (not supported), counted per alias list.
+    pub ranges: Vec<(String, usize)>,
+    /// (alias list, why) for each other skipped entry.
+    pub skipped: Vec<(String, String)>,
 }
 
 /// P25 radio (unit) IDs are 24 bits; 0 means none.
@@ -31,17 +31,20 @@ pub fn parse(xml: &str) -> Result<Parsed, String> {
         let name = name.as_str();
         for id in alias.children().filter(|n| n.has_tag_name("id")) {
             match id.attribute("type") {
-                Some("radioRange") => { p.ranges_skipped += 1; continue; }
+                Some("radioRange") => {
+                    match p.ranges.iter_mut().find(|(l, _)| l == list) { Some((_, n)) => *n += 1, None => p.ranges.push((list.to_string(), 1)) }
+                    continue;
+                }
                 Some("radio") => {}
                 _ => continue,
             }
             let value = id.attribute("value").unwrap_or_default();
             let radio = match value.trim().parse::<u32>() {
                 Ok(r) if (1..=MAX_RADIO).contains(&r) => r,
-                _ => { p.skipped.push(format!("radio {value} in {list}: not a radio ID 1 to {MAX_RADIO}")); continue; }
+                _ => { p.skipped.push((list.to_string(), format!("radio {value} in {list}: not a radio ID 1 to {MAX_RADIO}"))); continue; }
             };
             if name.is_empty() || name.chars().count() > crate::rr_csv::NAME_MAX {
-                p.skipped.push(format!("radio {radio} in {list}: no name, or longer than {} characters", crate::rr_csv::NAME_MAX));
+                p.skipped.push((list.to_string(), format!("radio {radio} in {list}: no name, or longer than {} characters", crate::rr_csv::NAME_MAX)));
                 continue;
             }
             let at = match p.by_list.iter().position(|(l, _)| l == list) {
@@ -50,7 +53,7 @@ pub fn parse(xml: &str) -> Result<Parsed, String> {
             };
             let names = &mut p.by_list[at].1;
             if let Some(first) = names.iter().find(|r| r.radio == radio) {
-                p.skipped.push(format!("radio {radio} in {list}: listed twice, kept {}", first.name));
+                p.skipped.push((list.to_string(), format!("radio {radio} in {list}: listed twice, kept {}", first.name)));
                 continue;
             }
             names.push(RadioName { radio, name: name.to_string() });
@@ -109,7 +112,7 @@ mod tests {
         assert_eq!(p.list("SGCo P25").unwrap(), [rn(733_730, "K315"), rn(733_083, "K315")]);
         assert_eq!(p.list("KSICS").unwrap(), [rn(5, "Unit 5")]);
         assert_eq!(p.by_list.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), ["SGCo P25", "KSICS"], "file order");
-        assert_eq!(p.ranges_skipped, 1);
+        assert_eq!(p.ranges, [("SGCo P25".to_string(), 1)], "ranges counted per list");
         assert!(parse("<nope/>").is_err() && parse("not xml").is_err());
     }
 
@@ -123,9 +126,10 @@ mod tests {
     #[test]
     fn repeat_id_first_wins() {
         let p = parse(XML).unwrap();
-        assert!(p.skipped.contains(&"radio 733730 in SGCo P25: listed twice, kept K315".to_string()), "{:?}", p.skipped);
-        assert!(p.skipped.iter().any(|s| s.contains("radio 0")), "{:?}", p.skipped);
-        assert!(p.skipped.iter().any(|s| s.contains("radio 6")), "no name: {:?}", p.skipped);
+        let has = |list: &str, text: &str| p.skipped.iter().any(|(l, m)| l == list && m.contains(text));
+        assert!(has("SGCo P25", "radio 733730 in SGCo P25: listed twice, kept K315"), "{:?}", p.skipped);
+        assert!(has("KSICS", "radio 0"), "{:?}", p.skipped);
+        assert!(has("KSICS", "radio 6"), "no name: {:?}", p.skipped);
     }
 
     #[test]

@@ -20,6 +20,8 @@ async fn owner_adds_renames_removes_radio_name() {
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(st.db.radio_names(SYS), vec![rn(733_730, "K315")]);
     assert_eq!(policy(&st).lock().unwrap().radios.get(&733_730).map(String::as_str), Some("K315"), "recorder sees it without a restart");
+    assert_eq!(st.receivers.radio_name(SYS, 733_730).as_deref(), Some("K315"), "the dashboard feed reads it from memory");
+    assert_eq!(st.receivers.radio_name("Other list", 733_730), None);
     assert_eq!(st.db.audit_log(1)[0].action, "radio name 733730 in P25: K315");
     assert!(send(&st, "GET", "/talkgroups", c, &[]).await.body.contains("K315"));
     send(&st, "POST", "/talkgroups/radios", c, &[("csrf", &csrf), ("list", SYS), ("radio", "733730"), ("name", "K316")]).await;
@@ -145,6 +147,8 @@ async fn every_list_must_be_mapped_or_skipped() {
     assert!(st.db.radio_names(SYS).is_empty());
     upload(&st, &cookie, &mapping(&csrf, &[SYS, "-"]), None).await;
     assert_eq!(st.db.radio_names(SYS), vec![rn(1, "New"), rn(733_730, "K315")], "Other skipped");
+    let (_, body) = upload(&st, &cookie, &mapping(&csrf, &["-", SYS]), None).await;
+    assert!(!body.contains("radio range"), "the range is in P25 Sim, which was not imported: {body}");
     let (status, _) = upload(&st, &cookie, &mapping(&csrf, &["nope", "-"]), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown list");
 }
@@ -191,4 +195,15 @@ async fn import_needs_talkgroups_import() {
         &[("csrf", &csrf), ("conflict", "0"), ("list_0", SYS), ("radio_0", "1"), ("pl_name_0", "X"), ("choice_0", "playlist")]).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     assert!(st.db.radio_names(SYS).is_empty());
+}
+
+#[tokio::test]
+async fn a_large_playlist_uploads() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    // Over axum's 2 MB default body limit, like a playlist with thousands of aliases and streams.
+    let big = PLAYLIST.replace("</playlist>", &format!("<!-- {} --></playlist>", "x".repeat(3_000_000)));
+    let (status, body) = upload(&st, &cookie, &[("csrf", &csrf)], Some(&big)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("P25 Sim") && !body.contains("not an sdrtrunk playlist"), "{}", &body[..body.len().min(500)]);
 }

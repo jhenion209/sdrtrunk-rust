@@ -297,10 +297,12 @@ mod tests {
         (f[0].clone(), text)
     }
 
-    /// The TPE1 frame's text (ID3v2.3/2.4 text frame: 10-byte header, encoding byte, text up to a NUL or the next frame).
+    /// The TPE1 frame's text: an ID3v2.4 frame is "TPE1", a 4-byte syncsafe size, 2 flag bytes, then the body (an
+    /// encoding byte and the text). The tag header and frame headers are ASCII, so string and byte offsets agree.
     fn tpe1(text: &str) -> String {
-        let i = text.find("TPE1").expect("TPE1") + 11;
-        text[i..].chars().take_while(|c| *c != '\0' && *c != 'T').collect()
+        let (b, i) = (text.as_bytes(), text.find("TPE1").expect("TPE1"));
+        let size = b[i + 4..i + 8].iter().fold(0usize, |n, &x| (n << 7) | x as usize);
+        text[i + 11..i + 10 + size].to_string()
     }
 
     #[test]
@@ -310,6 +312,12 @@ mod tests {
         assert_eq!(tpe1(&text), "711013\"K315\"");
         let (_, text) = recorded_text("radio-unnamed", &[(5, "Other")]);
         assert_eq!(tpe1(&text), "711013");
+    }
+
+    #[test]
+    fn tpe1_reads_names_with_capital_t() {
+        let (_, text) = recorded_text("radio-t", &[(711_013, "Tac Team")]);
+        assert_eq!(tpe1(&text), "711013\"Tac Team\"");
     }
 
     #[test]

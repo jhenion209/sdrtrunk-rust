@@ -498,7 +498,7 @@ pub struct Receivers {
     setups: Mutex<BTreeMap<String, Arc<SetupRun>>>,
     /// The Icecast streams; every system hands them the calls they carry.
     pub streams: Arc<Streams>,
-    /// When `rescan` restarted each system after it failed (the last `health::FLAP_WINDOW_MS`).
+    /// When each system was restarted after it failed holding a tuner (the last `health::FLAP_WINDOW_MS`).
     failed: Mutex<std::collections::HashMap<i64, std::collections::VecDeque<i64>>>,
 }
 
@@ -628,7 +628,11 @@ impl Receivers {
         for sys in &again {
             if let Some(r) = run.remove(sys) {
                 let st = r.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                if st.state == "error" { down.push((*sys, st.down_since_ms.unwrap_or(st.error_ms))); }
+                if st.state == "error" {
+                    down.push((*sys, st.down_since_ms.unwrap_or(st.error_ms)));
+                    // It held a tuner and failed: a drop. One whose last restart found no tuner did not drop again.
+                    if r.main.is_some() { self.note_drop(*sys); }
+                }
                 r.stop();
             }
         }
@@ -681,20 +685,8 @@ impl Receivers {
             p.seen = now;
             added
         };
-        // A failed system that held a tuner dropped it; one whose restart found no tuner did not drop again.
-        let failed: Vec<(i64, bool)> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
-            .filter(|(_, r)| r.state() == "error").map(|(&id, r)| (id, r.main.is_some())).collect();
-        if !failed.is_empty() {
-            let now = now_ms();
-            let mut f = self.failed.lock().unwrap_or_else(|p| p.into_inner());
-            for id in failed.into_iter().filter(|(_, held)| *held).map(|(id, _)| id) {
-                let times = f.entry(id).or_default();
-                times.push_back(now);
-                while times.front().is_some_and(|&t| now - t > crate::health::FLAP_WINDOW_MS) { times.pop_front(); }
-            }
-            drop(f);
-            self.restart(db, &[]);
-        }
+        // `restart` retries failed systems and counts their drops.
+        if self.running.lock().unwrap_or_else(|p| p.into_inner()).values().any(|r| r.state() == "error") { self.restart(db, &[]); }
         for id in added { self.apply_setup(db, &id); }
     }
 
@@ -731,13 +723,28 @@ impl Receivers {
         }
     }
 
+    /// Radio `radio`'s name in alias list `list`, from a running system's policy (no database read; per call).
+    pub fn radio_name(&self, list: &str, radio: u32) -> Option<String> {
+        self.running.lock().unwrap_or_else(|p| p.into_inner()).values().filter(|r| r.system.list_name() == list)
+            .find_map(|r| r.policy.lock().unwrap_or_else(|p| p.into_inner()).radios.get(&radio).cloned())
+    }
+
     /// The running system using tuner `id`, if any.
     pub fn on_tuner(&self, id: &str) -> Option<Arc<Receiver>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner()).values()
             .find(|r| r.status.lock().unwrap_or_else(|p| p.into_inner()).tuner.as_deref() == Some(id)).cloned()
     }
 
-    /// How often `rescan` restarted system `id` after it failed, since `since_ms` (up to `health::FLAP_WINDOW_MS` back).
+    /// Notes that system `id` lost the tuner it held (for `failures`).
+    fn note_drop(&self, id: i64) {
+        let now = now_ms();
+        let mut f = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        let times = f.entry(id).or_default();
+        times.push_back(now);
+        while times.front().is_some_and(|&t| now - t > crate::health::FLAP_WINDOW_MS) { times.pop_front(); }
+    }
+
+    /// How often system `id` was restarted after it failed holding a tuner, since `since_ms` (up to `health::FLAP_WINDOW_MS` back).
     pub fn failures(&self, id: i64, since_ms: i64) -> usize {
         self.failed.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map_or(0, |t| t.iter().filter(|&&t| t >= since_ms).count())
     }
@@ -1570,6 +1577,19 @@ mod tests {
         assert_eq!(rx.failures(id, now_ms() + 1), 0, "only failures since the given time");
         assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
         assert_eq!(rx.status(id).unwrap().down_since_ms, Some(*first_error.lock().unwrap()), "down since the first error");
+    }
+
+    #[test]
+    fn retries_by_apply_count_drops_too() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.save_system(&sys("SGCo", "")).unwrap();
+        let rx = Receivers::new(Sdrs { list: Arc::new(|| vec![A.to_string()]), open: Arc::new(|_, _, _| Err("gone".into())) });
+        rx.restart_all(&db);
+        for n in 1..=2 {
+            assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+            rx.apply(&db, id);
+            assert_eq!(rx.failures(id, 0), n, "a failed system that held a tuner, retried by a save, dropped it");
+        }
     }
 
     struct Boom;
