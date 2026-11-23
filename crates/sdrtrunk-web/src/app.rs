@@ -69,7 +69,7 @@ fn peer(parts: &Parts) -> Option<std::net::IpAddr> {
     parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())
 }
 
-fn cookie_token(headers: &HeaderMap) -> Option<String> {
+pub fn cookie_token(headers: &HeaderMap) -> Option<String> {
     headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .find_map(|c| c.trim().strip_prefix(COOKIE).and_then(|r| r.strip_prefix('=')).map(str::to_string))
@@ -180,6 +180,8 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/password", post(pages::users::reset_password))
         .route("/users/{id}/delete", post(pages::users::remove))
         .route("/users/{id}/allowed", post(pages::users::set_allowed))
+        .route("/hosts", get(pages::hosts::page))
+        .route("/hosts/{row}/end", post(pages::hosts::end))
         .route("/account", get(pages::account::page).post(pages::account::submit))
         .route("/login", get(pages::login::page).post(pages::login::submit))
         .route("/health", get(pages::health::all))

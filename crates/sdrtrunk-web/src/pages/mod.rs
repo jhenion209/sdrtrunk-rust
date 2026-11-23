@@ -2,6 +2,7 @@
 pub mod account;
 pub mod event_log;
 pub mod health;
+pub mod hosts;
 pub mod layout;
 pub mod users;
 pub mod login;
