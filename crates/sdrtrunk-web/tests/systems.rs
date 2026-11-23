@@ -101,6 +101,18 @@ async fn bad_input_not_saved() {
 }
 
 #[tokio::test]
+async fn two_systems_never_share_an_event_log_file() {
+    let (st, _, _) = counting();
+    st.db.save_system(&System { system_name: "SG Co".into(), ..System::default() }).unwrap();
+    let (cookie, csrf) = login_as(&st, "admin", Role::Admin);
+    // "SG_Co" and "SG Co" both make SG_Co in the file name.
+    let r = send(&st, "POST", "/systems/new", Some(&cookie), &form(&csrf, &[("system_name", "SG_Co")])).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("same call event log file as SG Co"), "{}", r.body);
+    assert!(!st.db.systems().iter().any(|s| s.system_name == "SG_Co"));
+}
+
+#[tokio::test]
 async fn recordings_folder_restarts_every_system() {
     let (st, opens, _) = counting();
     st.db.save_system(&System { system_name: "KSICS".into(), ..System::default() }).unwrap();
@@ -113,7 +125,8 @@ async fn recordings_folder_restarts_every_system() {
     assert_eq!(st.db.settings().recording_dir, "/srv/recordings");
     assert_eq!((st.db.settings().event_log_dir.as_str(), st.db.settings().event_log_days), ("/srv/event_logs", 45));
     assert!(wait_opens(&opens, before + 2).await, "both systems restarted");
-    assert_eq!(st.db.audit_log(1)[0].action, "changed recordings directory");
+    assert_eq!(st.db.audit_log(1)[0].action,
+        "changed recordings folder to /srv/recordings; event log folder to /srv/event_logs; event log days to 45");
     let r = send(&st, "POST", "/recordings", Some(&cookie), &[("csrf", &csrf), ("recording_dir", "relative")]).await;
     assert!(r.body.contains("full path"));
     assert_eq!(st.db.settings().recording_dir, "/srv/recordings");

@@ -43,7 +43,8 @@ fn filter(q: &EventLogQuery, keep_days: u32, now: NaiveDateTime) -> Result<Filte
     // To covers its whole minute (the input has no seconds).
     let to = if q.to.is_empty() { now } else { time(&q.to, now, "to", &mut errors) + chrono::Duration::seconds(59) };
     if to < from { errors.push(err("to", "To must be after From.")); }
-    else if (to.date() - from.date()).num_days() >= keep_days as i64 {
+    // Prune keeps today and the `keep_days` days before it.
+    else if (to.date() - from.date()).num_days() > keep_days as i64 {
         errors.push(err("from", &format!("Logs are kept for {keep_days} day{}.", if keep_days == 1 { "" } else { "s" })));
     }
     let groups = parse_ids::<u16>(&q.groups).unwrap_or_else(|e| { errors.push(err("groups", &e)); Vec::new() });
@@ -159,4 +160,18 @@ fn view(s: &crate::auth::Session, q: &EventLogQuery, systems: &[String], radios:
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_range_reaches_as_far_back_as_prune_keeps() {
+        // Prune keeps today and the `keep_days` days before it.
+        let now = NaiveDateTime::parse_from_str("2026-11-30T12:00", INPUT).unwrap();
+        let q = |from: &str| EventLogQuery { from: from.into(), ..EventLogQuery::default() };
+        assert!(filter(&q("2026-10-31T00:00"), 30, now).is_ok(), "30 days back is kept");
+        assert!(filter(&q("2026-10-30T00:00"), 30, now).is_err(), "31 days back is not");
+    }
 }

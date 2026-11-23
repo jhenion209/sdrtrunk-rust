@@ -196,6 +196,12 @@ pub async fn edit_page(State(st): State<AppState>, Authed(s, _): Authed, Path(id
 
 fn store(st: &AppState, s: &Session, id: Option<i64>, f: &SystemForm) -> Response {
     let sys = match f.to_system(id.unwrap_or(0)) { Ok(sys) => sys, Err(errors) => return form_view(st, s, id, f, &errors).into_response() };
+    // Each system's call event log is named after it (letters, digits, '.', '_' and '-' kept): no two may share one.
+    let file = crate::event_log::safe_name(&sys.system_name);
+    if let Some(other) = st.db.systems().into_iter().find(|o| o.id != sys.id && crate::event_log::safe_name(&o.system_name) == file) {
+        let message = format!("This name makes the same call event log file as {}: choose another.", other.system_name);
+        return form_view(st, s, id, f, &[FieldError { field: "names", message }]).into_response();
+    }
     let saved = match st.db.save_system(&sys) {
         Ok(saved) => saved,
         Err(e) => return form_view(st, s, id, f, &[FieldError { field: "form", message: format!("Could not save: {e}") }]).into_response(),
