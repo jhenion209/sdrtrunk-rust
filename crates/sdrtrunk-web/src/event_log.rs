@@ -207,18 +207,25 @@ impl Drop for EventLog {
 /// Deletes `<yyyyMMdd>_<system>_call_events.log` files (any system) dated before `today - keep_days`; returns how many.
 /// Other files, and names whose date is not a real date, are left alone.
 pub fn prune(dir: &Path, today: chrono::NaiveDate, keep_days: u32) -> std::io::Result<usize> {
+    prune_with(dir, today, keep_days, |p| std::fs::remove_file(p))
+}
+
+fn prune_with(dir: &Path, today: chrono::NaiveDate, keep_days: u32, remove: impl Fn(&Path) -> std::io::Result<()>) -> std::io::Result<usize> {
     let cutoff = today - chrono::Days::new(keep_days as u64);
-    let mut deleted = 0;
+    let (mut deleted, mut first_error) = (0, None);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let Ok(name) = entry.file_name().into_string() else { continue };
         let Some(date) = log_date(&name) else { continue };
         if date < cutoff && entry.file_type()?.is_file() {
-            std::fs::remove_file(entry.path())?;
-            deleted += 1;
+            // One it cannot delete does not keep the others: the first problem is reported once all are tried.
+            match remove(&entry.path()) {
+                Ok(()) => deleted += 1,
+                Err(e) => { first_error.get_or_insert(e); }
+            }
         }
     }
-    Ok(deleted)
+    match first_error { Some(e) => Err(e), None => Ok(deleted) }
 }
 
 /// The date of a daily event log file name, None for any other name.
@@ -279,11 +286,16 @@ pub struct Found {
 pub const MAX_PAGE: usize = 49;
 
 /// A row ranked newest first for the bounded heap in `search`.
-struct Ranked(Entry);
+/// A row and the time it sorts by: its start, moved on an hour for each time the clock fell back earlier in its file.
+struct Ranked(Entry, chrono::NaiveDateTime);
 impl PartialEq for Ranked { fn eq(&self, o: &Self) -> bool { self.cmp(o).is_eq() } }
 impl Eq for Ranked {}
 impl PartialOrd for Ranked { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
-impl Ord for Ranked { fn cmp(&self, o: &Self) -> std::cmp::Ordering { (self.0.start, self.0.id).cmp(&(o.0.start, o.0.id)) } }
+impl Ord for Ranked { fn cmp(&self, o: &Self) -> std::cmp::Ordering { (self.1, self.0.id).cmp(&(o.1, o.0.id)) } }
+
+/// Rows are written as calls end, so a file's times only step back by a call's length; a step back of more than this
+/// is the clock falling back an hour (the files hold local time without its offset, as sdrtrunk's do).
+const FALL_BACK_STEP: chrono::TimeDelta = chrono::TimeDelta::minutes(45);
 
 /// Reads the files of the days `f.from`..=`f.to` and returns page `page` (0-based) of the matching calls; pages past
 /// `MAX_PAGE` are empty (the totals still count every match). A missing folder is an empty result.
@@ -311,9 +323,13 @@ pub fn search(dir: &Path, f: &Filter, page: usize, per_page: usize) -> std::io::
         if want_system.as_ref().is_some_and(|w| *w != system) { continue; }
         // Lossy: a row torn by a full disk must not hide the rest of the day.
         let bytes = std::fs::read(entry.path())?;
+        let (mut latest, mut shift) = (None::<chrono::NaiveDateTime>, chrono::TimeDelta::zero());
         for line in String::from_utf8_lossy(&bytes).lines() {
             if line.is_empty() || line == HEADER { continue; }
             let Some(e) = parse_row(&system, line) else { found.skipped += 1; continue };
+            if latest.is_some_and(|l| e.start + shift < l - FALL_BACK_STEP) { shift += chrono::TimeDelta::hours(1); }
+            let sorts_at = e.start + shift;
+            latest = latest.max(Some(sorts_at));
             if e.start < f.from || e.start > f.to { continue; }
             events.insert(e.event.clone());
             let keep = f.event.as_ref().is_none_or(|v| *v == e.event)
@@ -328,7 +344,7 @@ pub fn search(dir: &Path, f: &Filter, page: usize, per_page: usize) -> std::io::
             if let Some(r) = e.from { radios.insert(r); }
             found.total += 1;
             if cap > 0 {
-                newest.push(std::cmp::Reverse(Ranked(e)));
+                newest.push(std::cmp::Reverse(Ranked(e, sorts_at)));
                 if newest.len() > cap { newest.pop(); }
             }
         }
@@ -382,6 +398,8 @@ fn quote(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
 /// One CSV line in sdrtrunk's call event format, `\n` included.
 fn row(c: &OpenCall, name: Option<&str>, id: u64) -> String {
+    // A line break (or any control character) in a name would split the row.
+    let name = name.map(|n| n.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect::<String>());
     let to = match name { Some(n) if !n.is_empty() => format!("[{n}] ({})", c.group), _ => c.group.to_string() };
     let mut details = String::from("PHASE 1 GROUP CALL");
     if c.encrypted { details.push_str(" ENCRYPTED"); }
@@ -648,6 +666,41 @@ mod tests {
         drop(l);
         let text = reader.join().unwrap();
         assert_eq!(rows(&text), 3, "{text}");
+    }
+
+    #[test]
+    fn a_line_break_in_a_talkgroup_name_stays_in_its_row() {
+        let line = row(&call(ms(2026, 11, 20, 10, 0, 0), ms(2026, 11, 20, 10, 0, 1), 27, 911, false, false), Some("Jail\n1\r"), 7);
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.contains("[Jail 1 ] (27)"), "{line:?}");
+    }
+
+    #[test]
+    fn prune_goes_on_past_a_file_it_cannot_delete() {
+        let d = dir("prune-stuck");
+        touch(&d, &["20200101_A_call_events.log", "20200102_B_call_events.log", "20200103_C_call_events.log"]);
+        // The first file it tries cannot be deleted, whichever the folder lists first.
+        let stuck = std::cell::RefCell::new(None::<PathBuf>);
+        let r = prune_with(&d, day(2026, 11, 20), 30, |p| {
+            if stuck.borrow().is_none() { *stuck.borrow_mut() = Some(p.to_path_buf()); return Err(std::io::Error::other("busy")); }
+            std::fs::remove_file(p)
+        });
+        assert!(r.is_err(), "the one it could not delete is reported");
+        let stuck = stuck.into_inner().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(present(&d), [stuck], "the others are deleted");
+    }
+
+    #[test]
+    fn rows_after_the_clock_falls_back_sort_after_those_before() {
+        let d = dir("fall-back");
+        std::fs::create_dir_all(&d).unwrap();
+        // Written in this order on 2026-11-01: 01:50 and 01:55, then the clock falls back an hour: 01:05, 01:10.
+        let line = |t: &str, id: u32| format!("\"2026:11:01:{t}\",\"1000\",\"APCO-25\",\"Group Call\",\"911\",\"27\",\"0-4054\",\"859.737500\",\"\",\"PHASE 1 GROUP CALL\",\"{id}\"\n");
+        let text: String = [("01:50:00", 1), ("01:55:00", 2), ("01:05:00", 3), ("01:10:00", 4)].iter().map(|(t, i)| line(t, *i)).collect();
+        std::fs::write(d.join("20261101_SGCo_call_events.log"), format!("{HEADER}\n{text}")).unwrap();
+        let f = Filter { from: dt(2026, 11, 1, 0, 0), to: dt(2026, 11, 1, 23, 59), ..Filter::default() };
+        let ids: Vec<u64> = search(&d, &f, 0, 10).unwrap().rows.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [4, 3, 2, 1], "newest first, in the order they happened");
     }
 
     #[test]

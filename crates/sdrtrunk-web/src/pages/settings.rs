@@ -78,12 +78,19 @@ pub async fn recordings_submit(State(st): State<AppState>, Authed(s, _): Authed,
     let new = Settings { recording_dir: f.recording_dir.trim().to_string(), event_log_dir: f.event_log_dir.trim().to_string(),
         event_log_days: f.event_log_days.trim().parse().unwrap_or(0) };
     if let Err(errors) = new.validate() { return recordings_view(&s, &f, &errors, false, true).into_response(); }
+    let old = st.db.settings();
     if let Err(e) = st.db.save_settings(&new) {
         return recordings_view(&s, &f, &[FieldError { field: "form", message: format!("Could not save: {e}") }], false, true).into_response();
     }
     // ponytail: restarts join every decoder thread (up to ~200 ms each) on this request; fine for a settings form.
     st.receivers.restart_all(&st.db);
-    st.db.audit(now_ms(), &s.user.username, "changed recordings directory");
+    let mut changed = Vec::new();
+    if new.recording_dir != old.recording_dir { changed.push(format!("recordings folder to {}", new.recording_dir)); }
+    if new.event_log_dir != old.event_log_dir {
+        changed.push(if new.event_log_dir.is_empty() { "event log off".into() } else { format!("event log folder to {}", new.event_log_dir) });
+    }
+    if new.event_log_days != old.event_log_days { changed.push(format!("event log days to {}", new.event_log_days)); }
+    if !changed.is_empty() { st.db.audit(now_ms(), &s.user.username, &format!("changed {}", changed.join("; "))); }
     Redirect::to("/recordings?saved=1").into_response()
 }
 
