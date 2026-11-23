@@ -130,6 +130,8 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{id}/allowed", post(pages::users::set_allowed))
         .route("/account", get(pages::account::page).post(pages::account::submit))
         .route("/login", get(pages::login::page).post(pages::login::submit))
+        .route("/health", get(pages::health::all))
+        .route("/health/{name}", get(pages::health::one))
         .route("/logout", post(pages::login::logout))
         .route("/setup", get(pages::setup::page).post(pages::setup::submit))
         .route("/app.css", get(|| async { ([(header::CONTENT_TYPE, "text/css")], include_str!("../assets/app.css")) }))

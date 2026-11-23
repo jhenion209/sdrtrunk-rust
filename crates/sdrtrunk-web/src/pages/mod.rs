@@ -1,6 +1,7 @@
 //! Page handlers. Each page is plain server-rendered HTML.
 pub mod account;
 pub mod event_log;
+pub mod health;
 pub mod layout;
 pub mod users;
 pub mod login;

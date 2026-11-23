@@ -37,6 +37,11 @@ pub struct Status {
     pub tsbk_per_s: f64,
     pub dropped: u64,
     pub started_ms: i64,
+    /// Last second a valid control channel message arrived (`started_ms` until the first), and when the last error began.
+    pub last_control_ms: i64,
+    pub error_ms: i64,
+    /// When the system first failed, carried over the restarts that retry it; None once it runs.
+    pub down_since_ms: Option<i64>,
     /// Tuner correction in use (moves with Automatic PPM) and the measured frequency error of the control channel.
     pub ppm: f64,
     pub auto_ppm: bool,
@@ -405,7 +410,7 @@ impl Receiver {
         let main = pick.as_ref().ok().cloned();
         let shared = Shared {
             status: Arc::new(Mutex::new(Status {
-                state: "starting".into(), control_hz: system.control_hz.first().copied(), started_ms: now_ms(), ..Status::default()
+                state: "starting".into(), control_hz: system.control_hz.first().copied(), started_ms: now_ms(), last_control_ms: now_ms(), ..Status::default()
             })),
             calls,
             policy: Arc::new(Mutex::new(policy)),
@@ -437,7 +442,7 @@ pub struct SetupRun { pub status: Arc<Mutex<Status>>, pub spectrum: Arc<Mutex<Sp
 
 impl SetupRun {
     fn start(id: String, cfg: TunerConfig, sdrs: Sdrs, claimed: Claimed) -> SetupRun {
-        let status = Arc::new(Mutex::new(Status { state: "starting".into(), started_ms: now_ms(), ..Status::default() }));
+        let status = Arc::new(Mutex::new(Status { state: "starting".into(), started_ms: now_ms(), last_control_ms: now_ms(), ..Status::default() }));
         let spectrum: Arc<Mutex<SpectrumView>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (st, sp, flag) = (status.clone(), spectrum.clone(), stop.clone());
@@ -493,6 +498,8 @@ pub struct Receivers {
     setups: Mutex<BTreeMap<String, Arc<SetupRun>>>,
     /// The Icecast streams; every system hands them the calls they carry.
     pub streams: Arc<Streams>,
+    /// When `rescan` restarted each system after it failed (the last `health::FLAP_WINDOW_MS`).
+    failed: Mutex<std::collections::HashMap<i64, std::collections::VecDeque<i64>>>,
 }
 
 fn policy_for(db: &Db, system: &str) -> RecordPolicy {
@@ -510,6 +517,7 @@ impl Receivers {
         Receivers {
             pool: Arc::new(Mutex::new(Pool { seen, ..Pool::default() })), last_free: Mutex::new(None), sdrs, claimed: Arc::default(), calls: broadcast::channel(256).0, running: Mutex::new(BTreeMap::new()),
             setups: Mutex::new(BTreeMap::new()), streams: Arc::new(Streams::new(std::time::Duration::from_secs(30))),
+            failed: Mutex::default(),
         }
     }
 
@@ -614,8 +622,19 @@ impl Receivers {
         let mut run = self.running.lock().unwrap_or_else(|p| p.into_inner());
         let mut again: Vec<i64> = ids.to_vec();
         again.extend(run.iter().filter(|(sys, r)| !ids.contains(sys) && r.state() == "error").map(|(&sys, _)| sys));
-        for sys in &again { if let Some(r) = run.remove(sys) { r.stop(); } }
+        // A failed system stays down since its first failure across the restarts that retry it (see `health`).
+        let mut down: Vec<(i64, i64)> = Vec::new();
+        for sys in &again {
+            if let Some(r) = run.remove(sys) {
+                let st = r.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if st.state == "error" { down.push((*sys, st.down_since_ms.unwrap_or(st.error_ms))); }
+                r.stop();
+            }
+        }
         self.start_many(db, all.iter().filter(|s| s.enabled && again.contains(&s.id)), &mut run);
+        for (sys, since) in down {
+            if let Some(r) = run.get(&sys) { update(&r.status, |st| st.down_since_ms = Some(since)); }
+        }
     }
 
     /// After tuner `id`'s settings changed: stops its Setup run, releases it if a system holds it as a helper (that
@@ -661,7 +680,20 @@ impl Receivers {
             p.seen = now;
             added
         };
-        if self.running.lock().unwrap_or_else(|p| p.into_inner()).values().any(|r| r.state() == "error") { self.restart(db, &[]); }
+        // A failed system that held a tuner dropped it; one whose restart found no tuner did not drop again.
+        let failed: Vec<(i64, bool)> = self.running.lock().unwrap_or_else(|p| p.into_inner()).iter()
+            .filter(|(_, r)| r.state() == "error").map(|(&id, r)| (id, r.main.is_some())).collect();
+        if !failed.is_empty() {
+            let now = now_ms();
+            let mut f = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+            for id in failed.into_iter().filter(|(_, held)| *held).map(|(id, _)| id) {
+                let times = f.entry(id).or_default();
+                times.push_back(now);
+                while times.front().is_some_and(|&t| now - t > crate::health::FLAP_WINDOW_MS) { times.pop_front(); }
+            }
+            drop(f);
+            self.restart(db, &[]);
+        }
         for id in added { self.apply_setup(db, &id); }
     }
 
@@ -702,6 +734,11 @@ impl Receivers {
     pub fn on_tuner(&self, id: &str) -> Option<Arc<Receiver>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner()).values()
             .find(|r| r.status.lock().unwrap_or_else(|p| p.into_inner()).tuner.as_deref() == Some(id)).cloned()
+    }
+
+    /// How often `rescan` restarted system `id` after it failed, since `since_ms` (up to `health::FLAP_WINDOW_MS` back).
+    pub fn failures(&self, id: i64, since_ms: i64) -> usize {
+        self.failed.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map_or(0, |t| t.iter().filter(|&&t| t >= since_ms).count())
     }
 
     pub fn get(&self, id: i64) -> Option<Arc<Receiver>> { self.running.lock().unwrap_or_else(|p| p.into_inner()).get(&id).cloned() }
@@ -756,7 +793,7 @@ fn update(status: &Mutex<Status>, f: impl FnOnce(&mut Status)) { f(&mut status.l
 
 fn fail(status: &Mutex<Status>, msg: String) {
     eprintln!("decoder: {msg}");
-    update(status, |s| { s.state = "error".into(); s.error = Some(msg); });
+    update(status, |s| { s.state = "error".into(); s.error = Some(msg); s.error_ms = now_ms(); });
 }
 
 /// Marks the status as an error if the decoder thread unwinds, so the Status page never shows a dead decoder as running.
@@ -822,7 +859,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
     let mut cc = match channel(0, corr.ppm, win.center) { Ok(c) => c, Err(e) => return fail(&status, e) };
     let mut log = EventLog::new(settings.event_log_path(), &s.system_name, policy.clone(), now_ms() as u64, settings.event_log_days);
     let mut rec = Recorder::new(Path::new(&settings.recording_dir), names, policy.clone()).streaming(streams.clone(), s.list_name().to_string());
-    update(&status, |st| st.state = "running".into());
+    update(&status, |st| { st.state = "running".into(); st.down_since_ms = None; });
     let (mut tick, mut tick_valid, mut tick_frames) = (Instant::now(), 0u64, FrameCounts::default());
     let mut last_correction_ms = now_ms();
     let mut events = Vec::new();
@@ -949,6 +986,7 @@ fn decode(s: System, settings: Settings, pool: SharedPool, sdrs: Sdrs, claimed: 
             let rate = (cc.valid_tsbk() - tick_valid) as f64 / tick.elapsed().as_secs_f64();
             update(&status, |st| {
                 st.tsbk_per_s = rate;
+                if rate > 0.0 { st.last_control_ms = now; }
                 st.dropped = src.dropped();
                 st.recorded = rec.recorded;
                 st.recording_error = rec.last_error.clone().or_else(|| log.last_error.clone());
@@ -1500,6 +1538,29 @@ mod tests {
         assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
         assert_eq!(rx.status(id).unwrap().error.as_deref(), Some("airspy_open_sn failed with libairspy code -5"));
         assert!(wait_for(Duration::from_secs(1), || rx.claimed.lock().unwrap().is_empty()), "a failed open releases the tuner");
+    }
+
+    #[test]
+    fn rescan_counts_failures() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db.save_system(&sys("SGCo", "")).unwrap();
+        let list = Arc::new(Mutex::new(vec![A.to_string()]));
+        let l = list.clone();
+        let rx = Receivers::new(Sdrs { list: Arc::new(move || l.lock().unwrap().clone()), open: Arc::new(|_, _, _| Err("gone".into())) });
+        rx.restart_all(&db);
+        let first_error = Arc::new(Mutex::new(0));
+        // Unplugged, back, unplugged again: two drops. The scan that sees it back restarts a system that never got a
+        // tuner (not a drop of its own), and the error time carries over the restarts.
+        for (i, plugged) in [vec![], vec![A.to_string()], vec![]].into_iter().enumerate() {
+            assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+            if i == 0 { *first_error.lock().unwrap() = rx.status(id).unwrap().error_ms; }
+            *list.lock().unwrap() = plugged;
+            rx.rescan(&db);
+        }
+        assert_eq!(rx.failures(id, 0), 2, "each drop counts once");
+        assert_eq!(rx.failures(id, now_ms() + 1), 0, "only failures since the given time");
+        assert!(wait_for(Duration::from_secs(1), || state(&rx, id) == "error"));
+        assert_eq!(rx.status(id).unwrap().down_since_ms, Some(*first_error.lock().unwrap()), "down since the first error");
     }
 
     struct Boom;
