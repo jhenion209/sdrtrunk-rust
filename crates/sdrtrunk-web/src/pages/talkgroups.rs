@@ -310,6 +310,10 @@ pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut
             }
         }
     }
+    // Notes and range counts only for the playlist lists imported.
+    let imported = |l: &String| maps.iter().any(|(p, m)| p == l && *m != SKIP);
+    let ranges: usize = parsed.ranges.iter().filter(|(l, _)| imported(l)).map(|(_, n)| n).sum();
+    notes.extend(parsed.skipped.iter().filter(|(l, _)| imported(l)).map(|(_, m)| m.clone()));
     let mut results = Vec::new();
     let mut conflicts: Vec<(String, RadioName, RadioName)> = Vec::new();
     for (list, named) in &into {
@@ -327,10 +331,9 @@ pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut
             p.ok { "Radio names into " (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, "
                 (c.only_local) " only in yours (kept)." }
         }
-        @if parsed.ranges_skipped > 0 { p.muted { (plural(parsed.ranges_skipped, "radio range")) " skipped (not supported)." } }
-        @if !notes.is_empty() || !parsed.skipped.is_empty() {
-            details open[!notes.is_empty()] { summary { (plural(notes.len() + parsed.skipped.len(), "note")) }
-                ul { @for m in notes.iter().chain(&parsed.skipped) { li { (m) } } } }
+        @if ranges > 0 { p.muted { (plural(ranges, "radio range")) " skipped (not supported)." } }
+        @if !notes.is_empty() {
+            details open { summary { (plural(notes.len(), "note")) } ul { @for m in &notes { li { (m) } } } }
         }
         @if conflicts.is_empty() { p { a href="/talkgroups#radios" { "Back to Talkgroups" } } } @else {
             h2 { "Names that differ" }

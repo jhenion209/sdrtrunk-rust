@@ -3,7 +3,7 @@ use crate::auth::{new_setup_code, Function, Role, Session, Throttle};
 use crate::db::Db;
 use crate::pages;
 use crate::receiver::{now_ms, Receivers, Sdrs};
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -90,6 +90,9 @@ pub fn check_csrf(session: &Session, form_csrf: &str) -> Result<(), StatusCode> 
     if !form_csrf.is_empty() && session.csrf == form_csrf { Ok(()) } else { Err(StatusCode::FORBIDDEN) }
 }
 
+/// Uploads of sdrtrunk playlists and RadioReference CSVs (axum's default is 2 MB; a large playlist is more).
+const IMPORT_MAX: usize = 32 * 1024 * 1024;
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(pages::status::page))
@@ -110,7 +113,7 @@ pub fn router(state: AppState) -> Router {
         .route("/streams", get(pages::streams::list))
         .route("/streams/events", get(pages::streams::events))
         .route("/streams/new", get(pages::streams::new_page).post(pages::streams::create))
-        .route("/streams/import", post(pages::streams::import))
+        .route("/streams/import", post(pages::streams::import).layer(DefaultBodyLimit::max(IMPORT_MAX)))
         .route("/streams/import/apply", post(pages::streams::import_apply))
         .route("/streams/{id}", get(pages::streams::edit_page).post(pages::streams::save))
         .route("/streams/{id}/delete", post(pages::streams::delete))
@@ -120,13 +123,13 @@ pub fn router(state: AppState) -> Router {
         .route("/talkgroups/{number}/delete", post(pages::talkgroups::delete))
         .route("/talkgroups/unlisted", post(pages::talkgroups::unlisted))
         .route("/talkgroups/record", post(pages::talkgroups::record_batch))
-        .route("/talkgroups/import", post(pages::talkgroups::import))
+        .route("/talkgroups/import", post(pages::talkgroups::import).layer(DefaultBodyLimit::max(IMPORT_MAX)))
         .route("/talkgroups/import/apply", post(pages::talkgroups::import_apply))
         .route("/talkgroups/reviewed", post(pages::talkgroups::reviewed_all))
         .route("/talkgroups/{number}/reviewed", post(pages::talkgroups::reviewed_one))
         .route("/talkgroups/radios", post(pages::talkgroups::save_radio))
         .route("/talkgroups/radios/{radio}/delete", post(pages::talkgroups::delete_radio))
-        .route("/talkgroups/radios/import", post(pages::talkgroups::import_radios))
+        .route("/talkgroups/radios/import", post(pages::talkgroups::import_radios).layer(DefaultBodyLimit::max(IMPORT_MAX)))
         .route("/talkgroups/radios/import/apply", post(pages::talkgroups::import_radios_apply))
         .route("/users", get(pages::users::page).post(pages::users::add))
         .route("/users/{id}/password", post(pages::users::reset_password))

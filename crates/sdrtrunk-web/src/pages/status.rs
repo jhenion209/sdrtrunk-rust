@@ -185,10 +185,11 @@ struct SystemStatusJson { id: i64, #[serde(flatten)] s: Status, uptime: String, 
 /// of stalling anything.
 pub async fn events(State(st): State<AppState>, Authed(_, token): Authed) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let db = st.db.clone();
+    let receivers = st.receivers.clone();
     let calls = BroadcastStream::new(st.receivers.calls.subscribe()).filter_map(move |r| {
         let call = r.ok()?;
         let name = db.talkgroups(&call.alias_list).into_iter().find(|t| t.number == call.group).map(|t| t.name);
-        let radio_name = db.radio_names(&call.alias_list).into_iter().find(|r| r.radio == call.source).map(|r| r.name);
+        let radio_name = receivers.radio_name(&call.alias_list, call.source);
         Event::default().event("call").json_data(CallJson { call: &call, name, radio_name }).ok()
     });
     let state = st.clone();
