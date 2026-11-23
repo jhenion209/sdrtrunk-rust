@@ -70,7 +70,7 @@
     const add = (tag, text, cls) => { const el = document.createElement(tag); el.textContent = text; if (cls) el.className = cls; li.appendChild(el); return el; };
     add("time", new Date(c.at_ms).toLocaleTimeString());
     add("strong", c.name ? `${c.name}` : `Talkgroup ${c.group}`);
-    add("span", [c.name ? `TG ${c.group}` : "", c.system, `${mhz(c.hz)} MHz`, c.source ? `radio ${c.source}` : ""].filter(Boolean).join(", "), "muted");
+    add("span", [c.name ? `TG ${c.group}` : "", c.system, `${mhz(c.hz)} MHz`, c.source ? `radio ${c.source}${c.radio_name ? ` (${c.radio_name})` : ""}` : ""].filter(Boolean).join(", "), "muted");
     for (const [on, label] of [[c.emergency, "Emergency"], [c.encrypted, "Encrypted"]]) if (on) add("span", label, "tag" + (label === "Emergency" ? " bad" : ""));
     calls.prepend(li);
     while (calls.children.length > 60) calls.lastElementChild.remove();

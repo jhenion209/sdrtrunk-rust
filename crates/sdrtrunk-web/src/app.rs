@@ -124,6 +124,8 @@ pub fn router(state: AppState) -> Router {
         .route("/talkgroups/import/apply", post(pages::talkgroups::import_apply))
         .route("/talkgroups/reviewed", post(pages::talkgroups::reviewed_all))
         .route("/talkgroups/{number}/reviewed", post(pages::talkgroups::reviewed_one))
+        .route("/talkgroups/radios", post(pages::talkgroups::save_radio))
+        .route("/talkgroups/radios/{radio}/delete", post(pages::talkgroups::delete_radio))
         .route("/users", get(pages::users::page).post(pages::users::add))
         .route("/users/{id}/password", post(pages::users::reset_password))
         .route("/users/{id}/delete", post(pages::users::remove))

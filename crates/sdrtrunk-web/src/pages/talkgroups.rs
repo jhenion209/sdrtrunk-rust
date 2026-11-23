@@ -3,7 +3,7 @@
 use crate::app::{check_csrf, require, AppState, Authed};
 use crate::auth::Function;
 use crate::auth::Session;
-use crate::db::Talkgroup;
+use crate::db::{RadioName, Talkgroup};
 use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
 use crate::rr_csv;
@@ -171,7 +171,80 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
                 } } }
             }
         }
+        (radios_section(st, s, system, can))
     })
+}
+
+/// Names for radio IDs (a call's source) in this list: written into recordings' artist tag and shown with the number.
+fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
+    let radios = st.db.radio_names(list);
+    html! {
+        h2 #radios { "Radio names" }
+        p.muted { "Recordings carry the name with the radio number (file names keep the number). Saving a number already listed renames it." }
+        @if can {
+            form method="post" action="/talkgroups/radios" {
+                (hidden(s, list))
+                label { "Radio ID" input name="radio" type="number" min="1" max=(MAX_RADIO) required; }
+                label { "Name" input name="name" maxlength=(rr_csv::NAME_MAX) required; }
+                button { "Save radio name" }
+            }
+        }
+        @if radios.is_empty() { p.muted { "None yet." } } @else {
+            table {
+                thead { tr { th { "Radio ID" } th { "Name" } th {} } }
+                tbody { @for r in &radios { tr {
+                    td { (r.radio) } td { (r.name) }
+                    td { @if can { form method="post" action={ "/talkgroups/radios/" (r.radio) "/delete" } {
+                        (hidden(s, list))
+                        button.danger { "Remove" }
+                    } } }
+                } } }
+            }
+        }
+    }
+}
+
+/// P25 radio (unit) IDs are 24 bits; 0 means none.
+const MAX_RADIO: u32 = 0xFF_FFFF;
+
+#[derive(Deserialize)]
+pub struct RadioForm {
+    #[serde(default)] csrf: String,
+    #[serde(default)] list: String,
+    #[serde(default)] radio: String,
+    #[serde(default)] name: String,
+}
+
+/// Adds or renames one radio name.
+pub async fn save_radio(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<RadioForm>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
+    if !known(&st, &f.list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let refuse = |msg: &str| view(&st, &s, &f.list, &TalkgroupForm::default(), Some(msg)).into_response();
+    let radio = match f.radio.trim().parse::<u32>() {
+        Ok(n) if (1..=MAX_RADIO).contains(&n) => n,
+        _ => return refuse(&format!("Radio IDs are 1 to {MAX_RADIO}.")),
+    };
+    let name = f.name.trim();
+    if name.is_empty() || name.chars().count() > rr_csv::NAME_MAX {
+        return refuse(&format!("Radio names are 1 to {} characters.", rr_csv::NAME_MAX));
+    }
+    if let Err(e) = st.db.save_radio_name(&f.list, &RadioName { radio, name: name.into() }) {
+        return refuse(&format!("Could not save: {e}"));
+    }
+    changed(&st, &s, format!("radio name {radio} in {}: {name}", f.list));
+    Redirect::to(&format!("{}#radios", url(&f.list, ""))).into_response()
+}
+
+pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path(radio): Path<u32>, Form(f): Form<SystemOnly>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
+    if !known(&st, &f.system) { return StatusCode::BAD_REQUEST.into_response(); }
+    if let Err(e) = st.db.delete_radio_name(&f.system, radio) {
+        return view(&st, &s, &f.system, &TalkgroupForm::default(), Some(&format!("Could not remove: {e}"))).into_response();
+    }
+    changed(&st, &s, format!("removed radio name {radio} from {}", f.system));
+    Redirect::to(&format!("{}#radios", url(&f.system, ""))).into_response()
 }
 
 #[derive(Deserialize)]
