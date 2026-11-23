@@ -196,18 +196,14 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
             }
         }
         @if st.db.may(&s.user, Function::TalkgroupsImport) {
+            h3 { "Import radio names from SDRTrunk" }
             form method="post" action="/talkgroups/radios/import" enctype="multipart/form-data" {
                 input type="hidden" name="csrf" value=(s.csrf);
-                label { "Import into"
-                    select name="into" required {
-                        option value="" selected { (CHOOSE_LIST) }
-                        @for l in st.db.alias_lists() { option value=(l) { "Alias list: " (l) } }
-                    }
-                }
                 label { "SDRTrunk playlist (default.xml)" input type="file" name="file" accept=".xml,text/xml" required; }
-                p.muted { "Next you choose which of the playlist's alias lists to take. New radio names are added; where a "
-                    "name differs from yours you choose which to keep; nothing is deleted. Radio ID ranges are skipped." }
-                button { "Import radio names" }
+                p.muted { "Next you choose, for each of the playlist's alias lists, which of your lists it goes into (or not to "
+                    "import it). New radio names are added; where a name differs from yours you choose which to keep; nothing "
+                    "is deleted. Radio ID ranges are skipped." }
+                button { "Upload playlist" }
             }
         }
         @if radios.is_empty() { p.muted { "None yet." } } @else {
@@ -257,113 +253,164 @@ pub async fn save_radio(State(st): State<AppState>, Authed(s, _): Authed, Form(f
     Redirect::to(&format!("{}#radios", url(&f.list, ""))).into_response()
 }
 
-/// sdrtrunk playlist upload in two steps, nothing guessed: the form names our list (`into`) and sends the file; the
-/// answer asks which of the playlist's alias lists to take (`source`), carrying the playlist back as `xml`. Then it
-/// adds radio names our list lacks and asks about names that differ.
+/// "Don't import" in the mapping step.
+const SKIP: &str = "-";
+
+/// sdrtrunk playlist import, nothing guessed. Step one sends the file; the answer lists every alias list in the playlist
+/// with a dropdown of our lists (and "Don't import"), each unchosen, the playlist carried back as `xml`. Step two
+/// (`src_i` = the playlist's list, `map_i` = ours or `SKIP`, all chosen) adds the names our lists lack and asks about
+/// names that differ.
 pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
     if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
-    let (mut csrf, mut list, mut source, mut text) = (String::new(), String::new(), None::<String>, String::new());
+    let (mut csrf, mut text, mut fields) = (String::new(), String::new(), Vec::<(String, String)>::new());
     while let Ok(Some(field)) = mp.next_field().await {
-        match field.name() {
-            Some("csrf") => csrf = field.text().await.unwrap_or_default(),
-            Some("into") => list = field.text().await.unwrap_or_default(),
-            Some("source") => source = Some(field.text().await.unwrap_or_default()),
-            Some("file") | Some("xml") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
-            _ => {}
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "csrf" => csrf = field.text().await.unwrap_or_default(),
+            "file" | "xml" => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            _ => fields.push((name, field.text().await.unwrap_or_default())),
         }
     }
     if let Err(code) = check_csrf(&s, &csrf) { return code.into_response(); }
-    let error_page = |msg: &str| layout("Talkgroups", Some(&s.user), &s.csrf, html! {
-        p.error { (msg) } p { a href="/talkgroups#radios" { "Back to Talkgroups" } }
-    }).into_response();
-    if list.is_empty() { return error_page(NO_LIST_CHOSEN); }
-    if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
-    let parsed = match radio_names::parse(&text) { Ok(p) => p, Err(e) => return error_page(&e) };
-    if parsed.by_list.is_empty() { return error_page("This playlist has no radio names."); }
-    let Some(source) = source else {
-        return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, None)).into_response();
+    let page = |body: Markup| layout("Talkgroups", Some(&s.user), &s.csrf, body).into_response();
+    let parsed = match radio_names::parse(&text) {
+        Ok(p) => p,
+        Err(e) => return page(html! { p.error { (e) } p { a href="/talkgroups#radios" { "Back to Talkgroups" } } }),
     };
-    let Some(uniq) = parsed.by_list.get(&source).cloned() else {
-        let msg = if source.is_empty() { "Choose the playlist's alias list to import." } else { "That list is not in this playlist." };
-        return layout("Talkgroups", Some(&s.user), &s.csrf, choose_source(&s, &list, &parsed, &text, Some(msg))).into_response();
-    };
-    let c = radio_names::compare(&st.db.radio_names(&list), &uniq);
-    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return error_page(&format!("Could not import: {e}")); }
-    changed(&st, &s, format!("imported {} into {list} from an sdrtrunk playlist", plural(c.new.len(), "radio name")));
-    layout("Talkgroups", Some(&s.user), &s.csrf, html! {
-        p.ok { "Imported radio names into " (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, "
-            (c.only_local) " only in yours (kept)." }
+    if parsed.by_list.is_empty() {
+        return page(html! { p.error { "This playlist has no radio names." } p { a href="/talkgroups#radios" { "Back to Talkgroups" } } });
+    }
+    let ours = st.db.alias_lists();
+    let get = |k: String| fields.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+    // The mapping as sent back: (playlist list, our list or SKIP or "" when unchosen).
+    let maps: Vec<(&str, &str)> = (0..).map_while(|i| Some((get(format!("src_{i}"))?, get(format!("map_{i}")).unwrap_or("")))).collect();
+    if maps.is_empty() { return page(map_lists(&s, &text, &parsed, &ours, &[], None)); }
+    if maps.iter().any(|(_, m)| !m.is_empty() && *m != SKIP && !ours.iter().any(|o| o == m)) { return StatusCode::BAD_REQUEST.into_response(); }
+    if maps.len() != parsed.by_list.len() || maps.iter().any(|(_, m)| m.is_empty()) {
+        return page(map_lists(&s, &text, &parsed, &ours, &maps, Some("Choose an alias list or Don't import for every playlist list.")));
+    }
+    // Per list of ours, its playlist names in file order; a radio named differently in two of them keeps the first.
+    let mut into: Vec<(String, Vec<(RadioName, String)>)> = Vec::new();
+    let mut notes = Vec::new();
+    for (src, names) in &parsed.by_list {
+        let Some(&(_, target)) = maps.iter().find(|(p, _)| p == src) else {
+            return page(map_lists(&s, &text, &parsed, &ours, &maps, Some("Choose an alias list or Don't import for every playlist list.")));
+        };
+        if target == SKIP { continue; }
+        let at = match into.iter().position(|(l, _)| l == target) {
+            Some(i) => i,
+            None => { into.push((target.to_string(), Vec::new())); into.len() - 1 }
+        };
+        for r in names {
+            match into[at].1.iter().find(|(k, _)| k.radio == r.radio) {
+                None => into[at].1.push((r.clone(), src.clone())),
+                Some((k, from)) if k.name != r.name => notes.push(format!("radio {} in {target}: {} in {from}, {} in {src}; kept {}",
+                    r.radio, k.name, r.name, k.name)),
+                Some(_) => {}
+            }
+        }
+    }
+    let mut results = Vec::new();
+    let mut conflicts: Vec<(String, RadioName, RadioName)> = Vec::new();
+    for (list, named) in &into {
+        let theirs: Vec<RadioName> = named.iter().map(|(r, _)| r.clone()).collect();
+        let c = radio_names::compare(&st.db.radio_names(list), &theirs);
+        if let Err(e) = st.db.add_radio_names(list, &c.new) {
+            return page(html! { p.error { "Could not import into " (list) ": " (e) } });
+        }
+        changed(&st, &s, format!("imported {} into {list} from an sdrtrunk playlist", plural(c.new.len(), "radio name")));
+        conflicts.extend(c.conflicts.iter().map(|(o, t)| (list.clone(), o.clone(), t.clone())));
+        results.push((list.clone(), c));
+    }
+    page(html! {
+        @for (list, c) in &results {
+            p.ok { "Radio names into " (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, "
+                (c.only_local) " only in yours (kept)." }
+        }
         @if parsed.ranges_skipped > 0 { p.muted { (plural(parsed.ranges_skipped, "radio range")) " skipped (not supported)." } }
-        @if !parsed.skipped.is_empty() { details { summary { (plural(parsed.skipped.len(), "entry")) " skipped" }
-            ul { @for m in &parsed.skipped { li { (m) } } } } }
-        @if c.conflicts.is_empty() { p { a href={ (url(&list, "")) "#radios" } { "Back to " (list) } } } @else {
+        @if !notes.is_empty() || !parsed.skipped.is_empty() {
+            details open[!notes.is_empty()] { summary { (plural(notes.len() + parsed.skipped.len(), "note")) }
+                ul { @for m in notes.iter().chain(&parsed.skipped) { li { (m) } } } }
+        }
+        @if conflicts.is_empty() { p { a href="/talkgroups#radios" { "Back to Talkgroups" } } } @else {
             h2 { "Names that differ" }
             p.muted { "Nothing changes unless you choose the playlist's name." }
             form method="post" action="/talkgroups/radios/import/apply" {
-                (hidden(&s, &list))
+                input type="hidden" name="csrf" value=(s.csrf);
                 table {
-                    thead { tr { th { "Radio ID" } th { "Yours" } th { "Playlist" } } }
-                    tbody { @for (mine, pl) in &c.conflicts { tr {
-                        td { (mine.radio) input type="hidden" name="conflict" value=(mine.radio);
-                             input type="hidden" name={ "pl_name_" (mine.radio) } value=(pl.name); }
-                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="local" checked; "Keep: " (mine.name) } }
-                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="playlist"; "Use playlist: " (pl.name) } }
+                    thead { tr { th { "List" } th { "Radio ID" } th { "Yours" } th { "Playlist" } } }
+                    tbody { @for (i, (list, mine, pl)) in conflicts.iter().enumerate() { tr {
+                        td { (list) input type="hidden" name="conflict" value=(i);
+                             input type="hidden" name={ "list_" (i) } value=(list);
+                             input type="hidden" name={ "radio_" (i) } value=(mine.radio);
+                             input type="hidden" name={ "pl_name_" (i) } value=(pl.name); }
+                        td { (mine.radio) }
+                        td { label.check { input type="radio" name={ "choice_" (i) } value="local" checked; "Keep: " (mine.name) } }
+                        td { label.check { input type="radio" name={ "choice_" (i) } value="playlist"; "Use playlist: " (pl.name) } }
                     } } }
                 }
                 button { "Apply" } " "
                 button.plain name="all" value="playlist" { "Use the playlist for all" }
             }
         }
-    }).into_response()
+    })
 }
 
-/// Applies the choices: renames only radios set to the playlist's name; never adds or deletes.
-/// Step two of the playlist import: which of the playlist's alias lists goes into `list` (no choice made for you).
-fn choose_source(s: &Session, list: &str, parsed: &radio_names::Parsed, xml: &str, error: Option<&str>) -> Markup {
+/// The mapping step: every alias list in the playlist (file order) with its radio count and a dropdown of our lists,
+/// "Don't import", starting on "Choose Alias List..." unless `chosen` (sent back after an error) says otherwise.
+fn map_lists(s: &Session, xml: &str, parsed: &radio_names::Parsed, ours: &[String], chosen: &[(&str, &str)], error: Option<&str>) -> Markup {
     html! {
-        h2 { "Import radio names into " (list) }
+        h2 { "Import radio names from SDRTrunk" }
         (notice(error, None))
         form method="post" action="/talkgroups/radios/import" enctype="multipart/form-data" {
             input type="hidden" name="csrf" value=(s.csrf);
-            input type="hidden" name="into" value=(list);
             input type="hidden" name="xml" value=(xml);
-            label { "Playlist list to import"
-                select name="source" required {
-                    option value="" selected { (CHOOSE_LIST) }
-                    @for (l, rs) in &parsed.by_list { option value=(l) { (l) " (" (plural(rs.len(), "radio")) ")" } }
-                }
+            table {
+                thead { tr { th { "Playlist alias list" } th { "Radio names" } th { "Import into" } } }
+                tbody { @for (i, (src, names)) in parsed.by_list.iter().enumerate() {
+                    @let pick = chosen.iter().find(|(p, _)| p == src).map_or("", |(_, m)| *m);
+                    tr {
+                        td { (src) input type="hidden" name={ "src_" (i) } value=(src); }
+                        td { (names.len()) }
+                        td { select name={ "map_" (i) } required {
+                            option value="" selected[pick.is_empty()] { (CHOOSE_LIST) }
+                            @for o in ours { option value=(o) selected[pick == o] { "Alias list: " (o) } }
+                            option value=(SKIP) selected[pick == SKIP] { "Don't import" }
+                        } }
+                    }
+                } }
             }
-            button { "Continue" } " " a href={ (url(list, "")) "#radios" } { "Cancel" }
+            button { "Import" } " " a href="/talkgroups#radios" { "Cancel" }
         }
     }
 }
 
+/// Applies the choices: renames only radios set to the playlist's name; never adds or deletes.
 pub async fn import_radios_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
     if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
     let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
-    let list = get("list").unwrap_or("");
-    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
     let all = get("all") == Some("playlist");
-    let existing = st.db.radio_names(list);
     let mut renames = Vec::new();
-    for (_, n) in f.iter().filter(|(k, _)| k == "conflict") {
-        let Ok(radio) = n.parse::<u32>() else { return StatusCode::BAD_REQUEST.into_response() };
-        let name = get(&format!("pl_name_{radio}")).unwrap_or("").trim();
-        if !existing.iter().any(|r| r.radio == radio) || name.is_empty() || name.chars().count() > rr_csv::NAME_MAX {
+    for (_, i) in f.iter().filter(|(k, _)| k == "conflict") {
+        let list = get(&format!("list_{i}")).unwrap_or("");
+        if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+        let Some(Ok(radio)) = get(&format!("radio_{i}")).map(str::parse::<u32>) else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = radio_names::clean_name(get(&format!("pl_name_{i}")).unwrap_or(""));
+        if !st.db.radio_names(list).iter().any(|r| r.radio == radio) || name.is_empty() || name.chars().count() > rr_csv::NAME_MAX {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        if all || get(&format!("choice_{radio}")) == Some("playlist") { renames.push(RadioName { radio, name: name.into() }); }
+        if all || get(&format!("choice_{i}")) == Some("playlist") { renames.push((list.to_string(), RadioName { radio, name })); }
     }
-    for r in &renames {
+    for (list, r) in &renames {
         if let Err(e) = st.db.save_radio_name(list, r) {
             return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not rename: {e}"))).into_response();
         }
     }
     if !renames.is_empty() {
-        changed(&st, &s, format!("renamed {} in {list} to the sdrtrunk playlist's", plural(renames.len(), "radio")));
+        changed(&st, &s, format!("renamed {} to the sdrtrunk playlist's names", plural(renames.len(), "radio")));
     }
-    Redirect::to(&format!("{}#radios", url(list, ""))).into_response()
+    Redirect::to("/talkgroups#radios").into_response()
 }
 
 pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path(radio): Path<u32>, Form(f): Form<SystemOnly>) -> Response {
