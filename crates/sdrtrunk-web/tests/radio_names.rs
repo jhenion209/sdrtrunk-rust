@@ -79,3 +79,74 @@ async fn event_log_page_shows_radio_name() {
     let r = send(&st, "GET", "/event-log?from=2026-11-20T00%3A00&to=2026-11-20T23%3A59", Some(&cookie), &[]).await;
     assert!(r.body.contains("K315 (733730)"), "{}", r.body);
 }
+
+/// A playlist naming radio 733730 "K315" and radio 1 "New" in list "P25 Sim" (guessed as ours, "P25"), and 9 in "Other".
+const PLAYLIST: &str = r#"<playlist>
+  <alias name="K315" list="P25 Sim"><id type="radio" value="733730" protocol="APCO25"/>
+    <id type="radioRange" min="1" max="9" protocol="APCO25"/></alias>
+  <alias name="New" list="P25 Sim"><id type="radio" value="1" protocol="APCO25"/></alias>
+  <alias name="Elsewhere" list="Other"><id type="radio" value="9" protocol="APCO25"/></alias>
+</playlist>"#;
+
+async fn upload(st: &sdrtrunk_web::app::AppState, cookie: &str, csrf: &str, source: &str, xml: &str) -> (StatusCode, String) {
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let b = "XbOuNdArY";
+    let body = format!("--{b}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"list\"\r\n\r\n{SYS}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\n{source}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"default.xml\"\r\nContent-Type: text/xml\r\n\r\n{xml}\r\n--{b}--\r\n");
+    let req = Request::builder().method("POST").uri("/talkgroups/radios/import").header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={b}")).body(Body::from(body)).unwrap();
+    let res = sdrtrunk_web::app::router(st.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned())
+}
+
+#[tokio::test]
+async fn reimport_keeps_names_unless_chosen() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    st.db.save_radio_name(SYS, &rn(733_730, "K316")).unwrap();
+    st.db.save_radio_name(SYS, &rn(42, "Only ours")).unwrap();
+    let (status, body) = upload(&st, &cookie, &csrf, "", PLAYLIST).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(st.db.radio_names(SYS), vec![rn(1, "New"), rn(42, "Only ours"), rn(733_730, "K316")], "added, nothing overwritten");
+    assert!(body.contains("Names that differ") && body.contains("K315") && body.contains("1 radio range skipped"), "{body}");
+    assert!(body.contains(r#"name="choice_733730" value="local" checked"#), "Keep is the default: {body}");
+    assert_eq!(policy(&st).lock().unwrap().radios.get(&1).map(String::as_str), Some("New"));
+    let c = Some(cookie.as_str());
+    let apply = |choice: &'static str| [("csrf", csrf.as_str()), ("list", SYS), ("conflict", "733730"), ("pl_name_733730", "K315"), ("choice_733730", choice)];
+    let r = send(&st, "POST", "/talkgroups/radios/import/apply", c, &apply("local")).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(st.db.radio_names(SYS)[2], rn(733_730, "K316"));
+    send(&st, "POST", "/talkgroups/radios/import/apply", c, &apply("playlist")).await;
+    assert_eq!(st.db.radio_names(SYS)[2], rn(733_730, "K315"));
+    assert_eq!(policy(&st).lock().unwrap().radios.get(&733_730).map(String::as_str), Some("K315"));
+}
+
+#[tokio::test]
+async fn import_takes_the_named_playlist_list() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "owner", Role::Owner);
+    upload(&st, &cookie, &csrf, "Other", PLAYLIST).await;
+    assert_eq!(st.db.radio_names(SYS), vec![rn(9, "Elsewhere")]);
+    let (_, body) = upload(&st, &cookie, &csrf, "Missing", PLAYLIST).await;
+    assert!(body.contains("class=\"error\"") && body.contains("P25 Sim"), "names the playlist's lists: {body}");
+    let (_, body) = upload(&st, &cookie, &csrf, "", "<nope/>").await;
+    assert!(body.contains("not an sdrtrunk playlist"), "{body}");
+}
+
+#[tokio::test]
+async fn import_needs_talkgroups_import() {
+    let st = state();
+    let (cookie, csrf) = login_with(&st, "helper", &[Function::TalkgroupsEdit]);
+    let (status, _) = upload(&st, &cookie, &csrf, "", PLAYLIST).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let r = send(&st, "POST", "/talkgroups/radios/import/apply", Some(&cookie),
+        &[("csrf", &csrf), ("list", SYS), ("conflict", "1"), ("pl_name_1", "X"), ("choice_1", "playlist")]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(st.db.radio_names(SYS).is_empty());
+}

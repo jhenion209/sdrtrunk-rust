@@ -6,7 +6,9 @@ use crate::auth::Session;
 use crate::db::{RadioName, Talkgroup};
 use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
+use crate::radio_names;
 use crate::rr_csv;
+use crate::streaming::guess_list;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -189,6 +191,16 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
                 button { "Save radio name" }
             }
         }
+        @if st.db.may(&s.user, Function::TalkgroupsImport) {
+            form method="post" action="/talkgroups/radios/import" enctype="multipart/form-data" {
+                (hidden(s, list))
+                label { "SDRTrunk playlist (default.xml)" input type="file" name="file" accept=".xml,text/xml" required; }
+                label { "Its alias list, if the name differs from " (list) input name="source" maxlength="60"; }
+                p.muted { "New radio names are added; where a name differs from yours you choose which to keep; nothing is deleted. "
+                    "Radio ID ranges are skipped." }
+                button { "Import radio names" }
+            }
+        }
         @if radios.is_empty() { p.muted { "None yet." } } @else {
             table {
                 thead { tr { th { "Radio ID" } th { "Name" } th {} } }
@@ -204,8 +216,7 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
     }
 }
 
-/// P25 radio (unit) IDs are 24 bits; 0 means none.
-const MAX_RADIO: u32 = 0xFF_FFFF;
+use crate::radio_names::MAX_RADIO;
 
 #[derive(Deserialize)]
 pub struct RadioForm {
@@ -234,6 +245,96 @@ pub async fn save_radio(State(st): State<AppState>, Authed(s, _): Authed, Form(f
     }
     changed(&st, &s, format!("radio name {radio} in {}: {name}", f.list));
     Redirect::to(&format!("{}#radios", url(&f.list, ""))).into_response()
+}
+
+/// sdrtrunk playlist upload: adds radio names this list lacks, then asks about names that differ. The playlist's
+/// alias list is the one typed in `source`, else the ones whose names lead to ours (as the stream import guesses).
+pub async fn import_radios(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let (mut csrf, mut list, mut source, mut text) = (String::new(), String::new(), String::new(), String::new());
+    while let Ok(Some(field)) = mp.next_field().await {
+        match field.name() {
+            Some("csrf") => csrf = field.text().await.unwrap_or_default(),
+            Some("list") => list = field.text().await.unwrap_or_default(),
+            Some("source") => source = field.text().await.unwrap_or_default(),
+            Some("file") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            _ => {}
+        }
+    }
+    if let Err(code) = check_csrf(&s, &csrf) { return code.into_response(); }
+    if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let refuse = |msg: &str| view(&st, &s, &list, &TalkgroupForm::default(), Some(msg)).into_response();
+    let parsed = match radio_names::parse(&text) { Ok(p) => p, Err(e) => return refuse(&e) };
+    let ours_lists = st.db.alias_lists();
+    let source = source.trim();
+    let theirs: Vec<RadioName> = parsed.by_list.iter()
+        .filter(|(l, _)| if source.is_empty() { guess_list(l, &ours_lists).as_deref() == Some(list.as_str()) } else { l.as_str() == source })
+        .flat_map(|(_, rs)| rs.iter().cloned()).collect();
+    if theirs.is_empty() {
+        let found: Vec<&str> = parsed.by_list.keys().map(String::as_str).collect();
+        return refuse(&format!("No radio names for {list} in this playlist. Its alias lists with radio names: {}. \
+            Type the one to use in “Its alias list”.", if found.is_empty() { "none".into() } else { found.join(", ") }));
+    }
+    // A radio in two of the playlist's lists that both lead here: the first one counts.
+    let mut uniq: Vec<RadioName> = Vec::new();
+    for r in theirs { if !uniq.iter().any(|u| u.radio == r.radio) { uniq.push(r); } }
+    let c = radio_names::compare(&st.db.radio_names(&list), &uniq);
+    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return refuse(&format!("Could not import: {e}")); }
+    changed(&st, &s, format!("imported {} into {list} from an sdrtrunk playlist", plural(c.new.len(), "radio name")));
+    layout("Talkgroups", Some(&s.user), &s.csrf, html! {
+        p.ok { "Imported radio names into " (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, "
+            (c.only_local) " only in yours (kept)." }
+        @if parsed.ranges_skipped > 0 { p.muted { (plural(parsed.ranges_skipped, "radio range")) " skipped (not supported)." } }
+        @if !parsed.skipped.is_empty() { details { summary { (plural(parsed.skipped.len(), "entry")) " skipped" }
+            ul { @for m in &parsed.skipped { li { (m) } } } } }
+        @if c.conflicts.is_empty() { p { a href={ (url(&list, "")) "#radios" } { "Back to " (list) } } } @else {
+            h2 { "Names that differ" }
+            p.muted { "Nothing changes unless you choose the playlist's name." }
+            form method="post" action="/talkgroups/radios/import/apply" {
+                (hidden(&s, &list))
+                table {
+                    thead { tr { th { "Radio ID" } th { "Yours" } th { "Playlist" } } }
+                    tbody { @for (mine, pl) in &c.conflicts { tr {
+                        td { (mine.radio) input type="hidden" name="conflict" value=(mine.radio);
+                             input type="hidden" name={ "pl_name_" (mine.radio) } value=(pl.name); }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="local" checked; "Keep: " (mine.name) } }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="playlist"; "Use playlist: " (pl.name) } }
+                    } } }
+                }
+                button { "Apply" } " "
+                button.plain name="all" value="playlist" { "Use the playlist for all" }
+            }
+        }
+    }).into_response()
+}
+
+/// Applies the choices: renames only radios set to the playlist's name; never adds or deletes.
+pub async fn import_radios_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let all = get("all") == Some("playlist");
+    let existing = st.db.radio_names(list);
+    let mut renames = Vec::new();
+    for (_, n) in f.iter().filter(|(k, _)| k == "conflict") {
+        let Ok(radio) = n.parse::<u32>() else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = get(&format!("pl_name_{radio}")).unwrap_or("").trim();
+        if !existing.iter().any(|r| r.radio == radio) || name.is_empty() || name.chars().count() > rr_csv::NAME_MAX {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        if all || get(&format!("choice_{radio}")) == Some("playlist") { renames.push(RadioName { radio, name: name.into() }); }
+    }
+    for r in &renames {
+        if let Err(e) = st.db.save_radio_name(list, r) {
+            return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not rename: {e}"))).into_response();
+        }
+    }
+    if !renames.is_empty() {
+        changed(&st, &s, format!("renamed {} in {list} to the sdrtrunk playlist's", plural(renames.len(), "radio")));
+    }
+    Redirect::to(&format!("{}#radios", url(list, ""))).into_response()
 }
 
 pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path(radio): Path<u32>, Form(f): Form<SystemOnly>) -> Response {
