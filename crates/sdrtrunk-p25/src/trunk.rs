@@ -9,8 +9,8 @@ pub struct CallGrant { pub group: u16, pub source: u32, pub channel: Channel, pu
 
 pub struct TrunkTracker {
     plans: BandPlans,
-    /// group -> (frequency, last time a grant for it was seen)
-    active: HashMap<u16, (u64, i64)>,
+    /// group -> (frequency, last time a grant for it was seen, last radio an explicit grant named)
+    active: HashMap<u16, (u64, i64, u32)>,
     /// A call is new again after this long without a grant (ms).
     pub hold_ms: i64,
 }
@@ -20,7 +20,8 @@ impl Default for TrunkTracker {
 }
 
 impl TrunkTracker {
-    /// Feed one valid TSBK. Returns a grant when it starts a new call, or moves a known group to another channel.
+    /// Feed one valid TSBK. Returns a grant when it starts a new call, moves a known group to another channel, or names
+    /// another radio talking on a known call (a new transmission).
     /// Grants whose band plan is not known yet are dropped (the plan repeats every few seconds).
     pub fn handle(&mut self, now_ms: i64, msg: &Tsbk) -> Vec<CallGrant> {
         let mut raw: Vec<(u16, Channel, u32, u8)> = Vec::new();
@@ -34,8 +35,10 @@ impl TrunkTracker {
         let mut out = Vec::new();
         for (group, channel, source, opts) in raw {
             let Some(hz) = self.plans.downlink_hz(channel) else { continue };
-            let seen = self.active.insert(group, (hz, now_ms));
-            let fresh = seen.map_or(true, |(f, t)| f != hz || now_ms - t > self.hold_ms);
+            let prev = self.active.get(&group).copied();
+            let talker = if source != 0 { source } else { prev.map_or(0, |p| p.2) };
+            self.active.insert(group, (hz, now_ms, talker));
+            let fresh = prev.is_none_or(|(f, t, s)| f != hz || now_ms - t > self.hold_ms || (source != 0 && source != s));
             if fresh { out.push(CallGrant { group, source, channel, hz, encrypted: is_encrypted(opts), emergency: is_emergency(opts) }); }
         }
         out
@@ -57,5 +60,19 @@ mod tests {
         assert_eq!(g, vec![CallGrant { group: 85, source: 7, channel: Channel { band: 1, number: 8 }, hz: 851_100_000, encrypted: true, emergency: false }]);
         assert!(t.handle(500, &grant).is_empty(), "repeat inside hold window");
         assert_eq!(t.handle(10_000, &grant).len(), 1, "new call after silence");
+    }
+
+    #[test]
+    fn new_talker_on_same_call_is_reported() {
+        let mut t = TrunkTracker::default();
+        t.handle(0, &Tsbk::IdentifierUpdate(BandPlan { id: 1, base: 851_000_000, spacing: 12_500, tx_offset: 0, slots: 1 }));
+        let ch = Channel { band: 1, number: 8 };
+        let grant = |source| Tsbk::GroupVoiceGrant { service_options: 0, channel: ch, group: 27, source };
+        assert_eq!(t.handle(10, &grant(911)).len(), 1);
+        assert!(t.handle(500, &grant(911)).is_empty(), "same talker repeats");
+        assert!(t.handle(900, &Tsbk::GroupVoiceGrantUpdate { grants: vec![(ch, 27)] }).is_empty(), "updates name no talker");
+        let g = t.handle(1500, &grant(711_506));
+        assert_eq!(g.iter().map(|g| g.source).collect::<Vec<_>>(), vec![711_506], "another radio keys up on the same call");
+        assert!(t.handle(1900, &grant(711_506)).is_empty(), "and its repeats are quiet again");
     }
 }
