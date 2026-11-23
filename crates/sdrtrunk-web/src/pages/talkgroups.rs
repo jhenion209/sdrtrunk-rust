@@ -236,7 +236,8 @@ pub async fn save_radio(State(st): State<AppState>, Authed(s, _): Authed, Form(f
         Ok(n) if (1..=MAX_RADIO).contains(&n) => n,
         _ => return refuse(&format!("Radio IDs are 1 to {MAX_RADIO}.")),
     };
-    let name = f.name.trim();
+    let name = radio_names::clean_name(&f.name);
+    let name = name.as_str();
     if name.is_empty() || name.chars().count() > rr_csv::NAME_MAX {
         return refuse(&format!("Radio names are 1 to {} characters.", rr_csv::NAME_MAX));
     }

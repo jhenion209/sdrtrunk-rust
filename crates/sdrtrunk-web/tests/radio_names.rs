@@ -44,6 +44,9 @@ async fn radio_name_rejects_bad_input() {
         assert!(r.body.contains("class=\"error\""), "{radio} {name}: {}", r.body);
     }
     assert!(st.db.radio_names(SYS).is_empty());
+    send(&st, "POST", "/talkgroups/radios", c, &[("csrf", &csrf), ("list", SYS), ("radio", "5"), ("name", "Car\n12\0")]).await;
+    assert_eq!(st.db.radio_names(SYS), vec![rn(5, "Car 12")], "control characters become spaces");
+    st.db.delete_radio_name(SYS, 5).unwrap();
     let r = send(&st, "POST", "/talkgroups/radios", c, &[("csrf", &csrf), ("list", "nope"), ("radio", "5"), ("name", "A")]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "unknown list");
     let r = send(&st, "POST", "/talkgroups/radios", c, &[("csrf", "x"), ("list", SYS), ("radio", "5"), ("name", "A")]).await;

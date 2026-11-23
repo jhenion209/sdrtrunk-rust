@@ -16,13 +16,20 @@ pub struct Parsed {
 /// P25 radio (unit) IDs are 24 bits; 0 means none.
 pub const MAX_RADIO: u32 = 0xFF_FFFF;
 
+/// A name as stored: control characters (line breaks, tabs, NUL) become spaces, so the artist tag stays one line that
+/// readers such as ScannerPulse can split into number and name; then trimmed.
+pub fn clean_name(name: &str) -> String {
+    name.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
+}
+
 pub fn parse(xml: &str) -> Result<Parsed, String> {
     let doc = roxmltree::Document::parse(xml).map_err(|e| format!("not an sdrtrunk playlist: {e}"))?;
     if !doc.root_element().has_tag_name("playlist") { return Err("not an sdrtrunk playlist (no <playlist>)".into()); }
     let mut p = Parsed::default();
     for alias in doc.descendants().filter(|n| n.has_tag_name("alias")) {
         let list = alias.attribute("list").unwrap_or_default();
-        let name = alias.attribute("name").unwrap_or_default().trim();
+        let name = clean_name(alias.attribute("name").unwrap_or_default());
+        let name = name.as_str();
         for id in alias.children().filter(|n| n.has_tag_name("id")) {
             match id.attribute("type") {
                 Some("radioRange") => { p.ranges_skipped += 1; continue; }
@@ -96,6 +103,13 @@ mod tests {
         assert_eq!(p.by_list["KSICS"], vec![rn(5, "Unit 5")]);
         assert_eq!(p.ranges_skipped, 1);
         assert!(parse("<nope/>").is_err() && parse("not xml").is_err());
+    }
+
+    #[test]
+    fn control_characters_in_names_become_spaces() {
+        let p = parse(r#"<playlist><alias name="Car&#10;12&#9;A" list="L"><id type="radio" value="7"/></alias></playlist>"#).unwrap();
+        assert_eq!(p.by_list["L"], vec![rn(7, "Car 12 A")]);
+        assert_eq!(clean_name(" a\u{0}b\r\n "), "a b");
     }
 
     #[test]
