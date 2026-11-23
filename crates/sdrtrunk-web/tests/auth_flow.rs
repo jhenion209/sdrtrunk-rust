@@ -51,7 +51,7 @@ async fn login_logout() {
     let cookie = set.split(';').next().unwrap().to_string();
     let page = send(&st, "GET", "/", Some(&cookie), &[]).await;
     assert_eq!(page.status, StatusCode::OK);
-    let csrf = st.db.session(cookie.trim_start_matches("sdrtrunk_rust_session="), sdrtrunk_web::receiver::now_ms()).unwrap().csrf;
+    let csrf = st.db.session(cookie.trim_start_matches("sdrtrunk_rust_session="), sdrtrunk_web::receiver::now_ms(), "").unwrap().csrf;
     let r = send(&st, "POST", "/logout", Some(&cookie), &[("csrf", &csrf)]).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(send(&st, "GET", "/", Some(&cookie), &[]).await.status, StatusCode::SEE_OTHER);
@@ -143,4 +143,14 @@ async fn login_throttled() {
     let r = send(&st, "POST", "/login", None, &[("username", "owner"), ("password", PW)]).await;
     assert!(r.cookie.is_none());
     assert!(r.body.contains("Too many failed sign-ins"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn sign_in_keeps_address_and_browser() {
+    let st = state();
+    st.db.create_user("owner", PW, Role::Owner, 0).unwrap();
+    send_req(&st, sign_in().extension(peer("192.168.1.20")).header("user-agent", "Mozilla/5.0 Firefox/140.0")
+        .body(sign_in_body()).unwrap()).await;
+    let rows = st.db.sessions(sdrtrunk_web::receiver::now_ms());
+    assert_eq!((rows[0].ip.as_str(), rows[0].agent.as_str()), ("192.168.1.20", "Mozilla/5.0 Firefox/140.0"));
 }

@@ -82,7 +82,8 @@ impl FromRequestParts<AppState> for Authed {
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Response> {
         let login = || Redirect::to("/login").into_response();
         let token = cookie_token(&parts.headers).ok_or_else(login)?;
-        st.db.session(&token, now_ms()).map(|s| Authed(s, token)).ok_or_else(login)
+        let Ok(ClientAddr(ip)) = ClientAddr::from_request_parts(parts, st).await;
+        st.db.session(&token, now_ms(), &ip).map(|s| Authed(s, token)).ok_or_else(login)
     }
 }
 
@@ -94,6 +95,16 @@ impl FromRequestParts<AppState> for OwnerOnly {
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, Response> {
         let Authed(s, _) = Authed::from_request_parts(parts, st).await?;
         if s.user.role == Role::Owner { Ok(OwnerOnly(s)) } else { Err((StatusCode::FORBIDDEN, "Only the owner can do this.").into_response()) }
+    }
+}
+
+/// The browser's `User-Agent` ("" when it sends none), kept with a new session.
+pub struct Agent(pub String);
+
+impl<S: Send + Sync> FromRequestParts<S> for Agent {
+    type Rejection = std::convert::Infallible;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Agent(parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string()))
     }
 }
 

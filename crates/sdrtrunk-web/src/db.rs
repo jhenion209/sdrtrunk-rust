@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, u
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, role TEXT NOT NULL,
     pw_hash TEXT NOT NULL, external_id TEXT, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL,
-    created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+    created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL, ip TEXT, agent TEXT);
 -- Control channel signal and decode quality, one row per system per minute (`quality::Summary` as JSON).
 CREATE TABLE IF NOT EXISTS quality (system INTEGER NOT NULL, at_ms INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (system, at_ms));
 -- Icecast streams (`streaming::StreamConfig` as JSON, password included: the database file is readable only by the
@@ -242,6 +242,7 @@ impl Db {
     fn init(mut c: Connection) -> rusqlite::Result<Db> {
         c.execute_batch(SCHEMA)?;
         migrate_permissions(&mut c)?;
+        migrate_session_columns(&c)?;
         migrate_to_systems(&mut c)?;
         c.execute_batch(TALKGROUP_TABLES)?;
         // Lists that existed before the alias_lists table: every list with talkgroups or a switch, and every system's.
@@ -560,6 +561,15 @@ fn tuner_from_json(j: &str) -> Option<TunerConfig> {
     Some(if disabled { TunerConfig { mode: TunerMode::Disabled, ..t } } else { t })
 }
 
+/// Sessions from before the Connected hosts page have no address or browser columns; adds them (empty).
+fn migrate_session_columns(c: &Connection) -> rusqlite::Result<()> {
+    let has = |col: &str| c.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?1").and_then(|mut s| s.exists([col]));
+    for col in ["ip", "agent"] {
+        if !has(col)? { c.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} TEXT"))?; }
+    }
+    Ok(())
+}
+
 /// Creates `user_allowed`. Only when it is new (an upgrade), admins that already exist are allowed every function, so
 /// the upgrade changes nothing; admins added later start with none. `SCHEMA` must never create this table, or existing
 /// admins would silently lose the one-time grant.
@@ -605,6 +615,25 @@ fn migrate_to_systems(c: &mut Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_sessions_table_gains_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, role TEXT NOT NULL,
+                    pw_hash TEXT NOT NULL, external_id TEXT, created_at INTEGER NOT NULL);
+                CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, csrf TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+                INSERT INTO users VALUES (1, 'owner', 'owner', 'x', NULL, 0);
+                INSERT INTO sessions VALUES ('h', 1, 'c', 0, 0);").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let rows = db.sessions(1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].ip.as_str(), rows[0].agent.as_str()), ("unknown", ""));
+    }
+
     use super::*;
 
     #[test]

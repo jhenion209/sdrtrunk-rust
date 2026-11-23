@@ -1,5 +1,5 @@
 //! Sign in and sign out.
-use crate::app::{check_csrf, AppState, Authed, ClientAddr, Secure};
+use crate::app::{check_csrf, Agent, AppState, Authed, ClientAddr, Secure};
 use crate::pages::layout::{layout, notice};
 use crate::receiver::now_ms;
 use axum::extract::State;
@@ -25,7 +25,7 @@ pub async fn page() -> Markup { form(None) }
 #[derive(Deserialize)]
 pub struct LoginForm { username: String, password: String }
 
-pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Secure(secure): Secure, Form(f): Form<LoginForm>) -> Response {
+pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Secure(secure): Secure, Agent(agent): Agent, Form(f): Form<LoginForm>) -> Response {
     let now = now_ms();
     // A name no account can have is a failed attempt for the address only; never store arbitrary input as a key.
     let ku = if crate::auth::valid_username(&f.username) { format!("user:{}", f.username) } else { String::new() };
@@ -36,7 +36,7 @@ pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Secu
     match st.db.verify_login(&f.username, &f.password) {
         Ok(user) => {
             st.throttle.succeeded(keys);
-            let token = st.db.create_session(user.id, now);
+            let token = st.db.create_session(user.id, now, &ip, &agent);
             st.db.audit(now, &user.username, "login");
             ([(SET_COOKIE, st.session_cookie(&token, secure))], Redirect::to("/")).into_response()
         }

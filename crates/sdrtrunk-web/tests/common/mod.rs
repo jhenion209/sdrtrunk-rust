@@ -70,8 +70,8 @@ pub fn login_as(st: &AppState, username: &str, role: Role) -> (String, String) {
         if role == Role::Admin { st.db.set_allowed(u.id, &Function::ALL).unwrap(); }
         u
     });
-    let token = st.db.create_session(user.id, sdrtrunk_web::receiver::now_ms());
-    let csrf = st.db.session(&token, sdrtrunk_web::receiver::now_ms()).unwrap().csrf;
+    let token = st.db.create_session(user.id, sdrtrunk_web::receiver::now_ms(), "local", "");
+    let csrf = st.db.session(&token, sdrtrunk_web::receiver::now_ms(), "").unwrap().csrf;
     (format!("sdrtrunk_rust_session={token}"), csrf)
 }
 
