@@ -76,7 +76,7 @@ scripts and raw samples to repeat it.
 
 Linux with a current stable Rust toolchain (`rustup`), a C compiler, and the Airspy library:
 
-    sudo apt install build-essential libairspy0 librtlsdr2   # librtlsdr0 on older Debian
+    sudo apt install build-essential libairspy0 librtlsdr0   # or librtlsdr2, where the distribution has that one
     cargo build --release -p sdrtrunk-cli
 
 The program is `target/release/sdrtrunk-rust`. The RTL-SDR library is loaded at run time, so it is only needed when an
