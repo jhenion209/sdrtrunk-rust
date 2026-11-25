@@ -63,6 +63,25 @@ pub struct User { pub id: i64, pub username: String, pub role: Role }
 #[derive(Clone, Debug)]
 pub struct Session { pub user: User, pub csrf: String }
 
+/// A signed-in session as the Connected hosts page lists it.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    /// SQLite rowid: how the page names a session (never the token hash).
+    pub row: i64,
+    pub token_hash: String,
+    pub username: String,
+    pub role: Role,
+    /// The latest address it was used from ("unknown" for sessions from before addresses were kept).
+    pub ip: String,
+    /// The browser's `User-Agent` at sign-in (at most `AGENT_MAX` characters).
+    pub agent: String,
+    pub created_at: i64,
+    pub last_seen: i64,
+}
+
+/// The longest `User-Agent` kept.
+pub const AGENT_MAX: usize = 300;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthError { WeakPassword, InvalidUsername, DuplicateUser, NotFound, OwnerProtected, BadCredentials, Throttled }
 
@@ -102,7 +121,7 @@ fn random_hex(bytes: usize) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn token_hash(token: &str) -> String { Sha256::digest(token.as_bytes()).iter().map(|x| format!("{x:02x}")).collect() }
+pub fn token_hash(token: &str) -> String { Sha256::digest(token.as_bytes()).iter().map(|x| format!("{x:02x}")).collect() }
 
 pub fn valid_username(u: &str) -> bool {
     (1..=32).contains(&u.len()) && u.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
@@ -211,16 +230,18 @@ impl Db {
         }
     }
 
-    /// Returns the raw token for the cookie; only its SHA-256 is stored.
-    pub fn create_session(&self, user_id: i64, now: i64) -> String {
+    /// Returns the raw token for the cookie; only its SHA-256 is stored, with the visitor's address and browser.
+    pub fn create_session(&self, user_id: i64, now: i64, ip: &str, agent: &str) -> String {
         let token = random_hex(32);
+        let agent: String = agent.chars().take(AGENT_MAX).collect();
         self.conn().execute(
-            "INSERT INTO sessions (token_hash, user_id, csrf, created_at, last_seen) VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![token_hash(&token), user_id, random_hex(16), now]).expect("insert session");
+            "INSERT INTO sessions (token_hash, user_id, csrf, created_at, last_seen, ip, agent) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
+            params![token_hash(&token), user_id, random_hex(16), now, ip, agent]).expect("insert session");
         token
     }
 
-    pub fn session(&self, token: &str, now: i64) -> Option<Session> {
+    /// The session for `token`, counted as activity at `now` from `ip` (kept as its latest address unless empty).
+    pub fn session(&self, token: &str, now: i64, ip: &str) -> Option<Session> {
         let th = token_hash(token);
         let c = self.conn();
         let row: (i64, String, i64, i64, String, String) = c.query_row(
@@ -232,7 +253,8 @@ impl Db {
             c.execute("DELETE FROM sessions WHERE token_hash = ?1", [&th]).ok();
             return None;
         }
-        c.execute("UPDATE sessions SET last_seen = ?1 WHERE token_hash = ?2", params![now, th]).ok();
+        c.execute("UPDATE sessions SET last_seen = ?1, ip = COALESCE(NULLIF(?3, ''), ip) WHERE token_hash = ?2",
+                  params![now, th, ip]).ok();
         Some(Session { user: User { id: user_id, username, role: Role::parse(&role) }, csrf })
     }
 
@@ -243,6 +265,30 @@ impl Db {
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
             .optional().ok().flatten()
             .is_some_and(|(created, last)| now - last <= IDLE_MS && now - created <= MAX_MS)
+    }
+
+    /// Every session still within its limits, the most recently active first.
+    pub fn sessions(&self, now: i64) -> Vec<SessionRow> {
+        self.select_sessions("WHERE ?1 - s.last_seen <= ?2 AND ?1 - s.created_at <= ?3 ORDER BY s.last_seen DESC, s.rowid DESC",
+                             params![now, IDLE_MS, MAX_MS])
+    }
+
+    /// Ends the session at `row`; what it was, or None when there is none.
+    pub fn end_session_by_row(&self, row: i64) -> Option<SessionRow> {
+        let found = self.select_sessions("WHERE s.rowid = ?1", params![row]).pop()?;
+        self.conn().execute("DELETE FROM sessions WHERE rowid = ?1", [row]).ok();
+        Some(found)
+    }
+
+    fn select_sessions(&self, rest: &str, args: impl rusqlite::Params) -> Vec<SessionRow> {
+        let c = self.conn();
+        let sql = format!("SELECT s.rowid, s.token_hash, u.username, u.role, COALESCE(s.ip, 'unknown'), COALESCE(s.agent, ''),
+                                  s.created_at, s.last_seen FROM sessions s JOIN users u ON u.id = s.user_id {rest}");
+        let Ok(mut st) = c.prepare(&sql) else { return Vec::new() };
+        st.query_map(args, |r| Ok(SessionRow {
+            row: r.get(0)?, token_hash: r.get(1)?, username: r.get(2)?, role: Role::parse(&r.get::<_, String>(3)?),
+            ip: r.get(4)?, agent: r.get(5)?, created_at: r.get(6)?, last_seen: r.get(7)?,
+        })).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
     }
 
     pub fn end_session(&self, token: &str) {
@@ -371,12 +417,12 @@ mod tests {
     #[test]
     fn reset_password_gives_a_working_one() {
         let (db, u) = db_with_owner();
-        let token = db.create_session(u.id, 0);
+        let token = db.create_session(u.id, 0, "", "");
         let new = db.reset_password("owner").unwrap();
         assert!(new.chars().count() >= MIN_PASSWORD, "{new}");
         assert_eq!(db.verify_login("owner", &new).unwrap().id, u.id);
         assert!(matches!(db.verify_login("owner", PW), Err(AuthError::BadCredentials)), "old password no longer works");
-        assert!(db.session(&token, 0).is_none(), "signed out everywhere");
+        assert!(db.session(&token, 0, "").is_none(), "signed out everywhere");
         assert!(matches!(db.reset_password("nobody"), Err(AuthError::NotFound)));
         assert_ne!(db.reset_password("owner").unwrap(), new, "random each time");
     }
@@ -403,54 +449,54 @@ mod tests {
         let (db, u) = db_with_owner();
         assert!(matches!(db.remove_user(u.id), Err(AuthError::OwnerProtected)));
         let a = db.create_user("admin", PW, Role::Admin, 0).unwrap();
-        let t = db.create_session(a.id, 0);
+        let t = db.create_session(a.id, 0, "", "");
         db.remove_user(a.id).unwrap();
-        assert!(db.session(&t, 1).is_none());
+        assert!(db.session(&t, 1, "").is_none());
         assert!(matches!(db.remove_user(999), Err(AuthError::NotFound)));
     }
 
     #[test]
     fn session_idle_expiry() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
-        let s = db.session(&t, IDLE_MS - 1).unwrap();
+        let t = db.create_session(u.id, 0, "", "");
+        let s = db.session(&t, IDLE_MS - 1, "").unwrap();
         assert_eq!(s.user.username, "owner");
         assert!(!s.csrf.is_empty());
-        assert!(db.session(&t, 2 * IDLE_MS + 1).is_none());
+        assert!(db.session(&t, 2 * IDLE_MS + 1, "").is_none());
     }
 
     #[test]
     fn session_absolute_expiry() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
+        let t = db.create_session(u.id, 0, "", "");
         let mut now = 0;
-        while now + H < MAX_MS { now += H; assert!(db.session(&t, now).is_some(), "at {now}"); }
-        assert!(db.session(&t, MAX_MS + 1).is_none());
+        while now + H < MAX_MS { now += H; assert!(db.session(&t, now, "").is_some(), "at {now}"); }
+        assert!(db.session(&t, MAX_MS + 1, "").is_none());
     }
 
     #[test]
     fn password_change_revokes_sessions() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
+        let t = db.create_session(u.id, 0, "", "");
         assert!(matches!(db.set_password(u.id, "short"), Err(AuthError::WeakPassword)));
-        assert!(db.session(&t, 1).is_some());
+        assert!(db.session(&t, 1, "").is_some());
         db.set_password(u.id, "another long password").unwrap();
-        assert!(db.session(&t, 2).is_none());
+        assert!(db.session(&t, 2, "").is_none());
         assert!(db.verify_login("owner", "another long password").is_ok());
     }
 
     #[test]
     fn end_session_logs_out() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
+        let t = db.create_session(u.id, 0, "", "");
         db.end_session(&t);
-        assert!(db.session(&t, 1).is_none());
+        assert!(db.session(&t, 1, "").is_none());
     }
 
     #[test]
     fn token_not_stored_raw() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
+        let t = db.create_session(u.id, 0, "", "");
         assert!(t.len() >= 43, "256-bit token");
         let stored: String = db.conn().query_row("SELECT token_hash FROM sessions", [], |r| r.get(0)).unwrap();
         assert_ne!(stored, t);
@@ -482,7 +528,7 @@ mod tests {
     #[test]
     fn session_valid_does_not_extend() {
         let (db, u) = db_with_owner();
-        let t = db.create_session(u.id, 0);
+        let t = db.create_session(u.id, 0, "", "");
         assert!(db.session_valid(&t, IDLE_MS - 1));
         assert!(!db.session_valid(&t, IDLE_MS + 1), "checking must not count as activity");
         db.end_session(&t);
@@ -494,5 +540,65 @@ mod tests {
         let c = new_setup_code();
         assert_eq!(c.len(), 9);
         assert_ne!(c, new_setup_code());
+    }
+
+    #[test]
+    fn session_keeps_address_and_browser() {
+        let (db, u) = db_with_owner();
+        db.create_session(u.id, 5, "192.168.1.20", "Mozilla/5.0 Firefox/140.0");
+        let rows = db.sessions(6);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((r.username.as_str(), r.role, r.ip.as_str(), r.agent.as_str()), ("owner", Role::Owner, "192.168.1.20", "Mozilla/5.0 Firefox/140.0"));
+        assert_eq!((r.created_at, r.last_seen), (5, 5));
+    }
+
+    #[test]
+    fn address_follows_the_latest_request() {
+        let (db, u) = db_with_owner();
+        let t = db.create_session(u.id, 0, "192.168.1.20", "");
+        db.session(&t, 1, "10.0.0.9").unwrap();
+        assert_eq!(db.sessions(2)[0].ip, "10.0.0.9");
+        db.session(&t, 2, "").unwrap();
+        assert_eq!(db.sessions(3)[0].ip, "10.0.0.9", "an unknown address keeps the last one");
+    }
+
+    #[test]
+    fn long_agent_is_cut_to_300() {
+        let (db, u) = db_with_owner();
+        db.create_session(u.id, 0, "", &"é".repeat(400));
+        assert_eq!(db.sessions(1)[0].agent.chars().count(), 300);
+    }
+
+    #[test]
+    fn expired_sessions_are_not_listed() {
+        let (db, u) = db_with_owner();
+        db.create_session(u.id, 0, "a", "");
+        db.create_session(u.id, IDLE_MS, "b", "");
+        let rows = db.sessions(IDLE_MS + 10);
+        assert_eq!(rows.iter().map(|r| r.ip.as_str()).collect::<Vec<_>>(), ["b"], "idle past its limit");
+    }
+
+    #[test]
+    fn sessions_are_listed_newest_activity_first() {
+        let (db, u) = db_with_owner();
+        let a = db.create_session(u.id, 0, "a", "");
+        db.create_session(u.id, 1, "b", "");
+        db.session(&a, 2, "").unwrap();
+        assert_eq!(db.sessions(3).iter().map(|r| r.ip.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn end_by_row_removes_only_that_session() {
+        let (db, u) = db_with_owner();
+        let a = db.create_session(u.id, 0, "a", "");
+        let b = db.create_session(u.id, 0, "b", "");
+        let row = db.sessions(1).into_iter().find(|r| r.ip == "a").unwrap();
+        assert_eq!(row.token_hash, token_hash(&a));
+        let ended = db.end_session_by_row(row.row).unwrap();
+        assert_eq!(ended.ip, "a");
+        assert!(db.session(&a, 1, "").is_none());
+        assert!(db.session(&b, 1, "").is_some());
+        assert!(db.end_session_by_row(row.row).is_none(), "already gone");
     }
 }

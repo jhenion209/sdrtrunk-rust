@@ -21,7 +21,16 @@ tokio-stream = { version = "0.1", features = ["sync", "time"] }
 futures-core = "0.3"
 sdrtrunk-audio = { path = "../sdrtrunk-audio" }
 sdrtrunk-dsp = { path = "../sdrtrunk-dsp" }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+# HTTPS (ported from ScannerPulse): the server, its certificates, Let's Encrypt, Cloudflare DNS proofs.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+x509-parser = "0.18"
+# This machine's host name and addresses, for the certificate it makes itself.
+libc = "0.2"
 serde_urlencoded = "0.7"
 # Reads sdrtrunk playlists (default.xml) for the stream import; small, no dependencies of its own.
 roxmltree = "0.20"
@@ -29,4 +38,5 @@ roxmltree = "0.20"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }

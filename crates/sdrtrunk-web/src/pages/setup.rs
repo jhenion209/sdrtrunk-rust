@@ -1,5 +1,5 @@
 //! First run: create the owner account with the one-time code printed in the receiver log.
-use crate::app::{AppState, ClientAddr};
+use crate::app::{Agent, AppState, ClientAddr, Secure};
 use crate::auth::Role;
 use crate::pages::layout::{layout, notice};
 use crate::receiver::now_ms;
@@ -33,7 +33,7 @@ pub async fn page(State(st): State<AppState>) -> Response {
 #[derive(Deserialize)]
 pub struct SetupForm { code: String, username: String, password: String, password2: String }
 
-pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Form(f): Form<SetupForm>) -> Response {
+pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Secure(secure): Secure, Agent(agent): Agent, Form(f): Form<SetupForm>) -> Response {
     if st.db.user_count() > 0 { return StatusCode::NOT_FOUND.into_response(); }
     let now = now_ms();
     let key = format!("setup:{ip}");
@@ -53,6 +53,6 @@ pub async fn submit(State(st): State<AppState>, ClientAddr(ip): ClientAddr, Form
     };
     *st.setup_code.lock().unwrap_or_else(|p| p.into_inner()) = None;
     st.db.audit(now, &user.username, "created owner account");
-    let token = st.db.create_session(user.id, now);
-    ([(SET_COOKIE, st.session_cookie(&token))], Redirect::to("/")).into_response()
+    let token = st.db.create_session(user.id, now, &ip, &agent);
+    ([(SET_COOKIE, st.session_cookie(&token, secure))], Redirect::to("/")).into_response()
 }

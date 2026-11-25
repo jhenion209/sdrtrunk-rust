@@ -104,3 +104,28 @@ async fn events_need_login() {
     let r = send(&st, "GET", "/events", None, &[]).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
 }
+
+/// Closing a browser tab ends the dashboard's live stream; the session's live page count drops back.
+#[tokio::test]
+async fn closing_the_dashboard_lowers_the_count() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let st = state();
+    let (cookie, _) = login_as(&st, "admin", Role::Admin);
+    let hash = sdrtrunk_web::auth::token_hash(cookie.trim_start_matches("sdrtrunk_rust_session="));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(sdrtrunk_web::app::serve_until(listener, router(st.clone()), std::future::pending(), Duration::from_millis(300)));
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(format!("GET /events HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\n\r\n").as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = sock.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("text/event-stream"));
+    assert_eq!(st.live.count(&hash), 1);
+    drop(sock);
+    let mut waited = Duration::ZERO;
+    while st.live.count(&hash) != 0 && waited < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    }
+    assert_eq!(st.live.count(&hash), 0, "still counted {waited:?} after the tab closed");
+}
