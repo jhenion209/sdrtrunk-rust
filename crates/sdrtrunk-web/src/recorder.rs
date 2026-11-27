@@ -218,7 +218,8 @@ impl Recorder {
             .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(|e| e.to_string()))
             .and_then(|_| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()));
         match result {
-            Ok(()) => self.recorded += 1,
+            // A written call is the success that clears the last problem (the health page shows it until then).
+            Ok(()) => (self.recorded, self.last_error) = (self.recorded + 1, None),
             Err(e) => self.error(format!("cannot write {}: {e}", path.display())),
         }
     }
@@ -252,9 +253,14 @@ mod tests {
     use sdrtrunk_p25::tsbk_msg::Channel;
 
     #[derive(Default)]
-    struct FakeTuner { next: u32, open: Vec<(u32, i64)>, closed: Vec<u32> }
+    struct FakeTuner { next: u32, open: Vec<(u32, i64)>, closed: Vec<u32>, refuse: bool }
     impl Tuner for FakeTuner {
-        fn open(&mut self, hz: i64) -> Result<u32, String> { self.next += 1; self.open.push((self.next, hz)); Ok(self.next) }
+        fn open(&mut self, hz: i64) -> Result<u32, String> {
+            if self.refuse { return Err("no free SDR".into()); }
+            self.next += 1;
+            self.open.push((self.next, hz));
+            Ok(self.next)
+        }
         fn close(&mut self, id: u32) { self.closed.push(id); }
     }
 
@@ -346,6 +352,21 @@ mod tests {
         assert!(text.contains("27\"Jail 1\"") && text.contains("Frequency:858737500;") && text.contains("Channel:0-4016;"), "{}", &text[..300]);
         assert!(text.contains("System:Sedgwick County;Site:Simulcast;Name:T-Control;Decoder:P25 Phase 1;"));
         assert!(t.closed.is_empty(), "channel kept for a rekey");
+    }
+
+    #[test]
+    fn next_written_call_clears_the_error() {
+        let d = dir("clears");
+        let tgs = Arc::new(Mutex::new(RecordPolicy::default()));
+        let (mut r, mut t) = (Recorder::new(&d, names(), tgs), FakeTuner { refuse: true, ..FakeTuner::default() });
+        r.handle(&grant(51, 856_962_500), 1_000, &mut t);
+        assert!(r.last_error.as_deref().is_some_and(|e| e.starts_with("cannot follow TG 51")), "{:?}", r.last_error);
+        t.refuse = false;
+        r.handle(&grant(27, 858_737_500), 2_000, &mut t);
+        r.handle(&ldu1(Some(lc(27, 711_013, 0x04))), 2_100, &mut t);
+        r.handle(&ldu2(Some(ess(0x80))), 2_280, &mut t);
+        r.handle(&ControlEvent::VoiceEnd { id: 1 }, 2_300, &mut t);
+        assert_eq!((r.recorded, r.last_error.clone()), (1, None));
     }
 
     #[test]
