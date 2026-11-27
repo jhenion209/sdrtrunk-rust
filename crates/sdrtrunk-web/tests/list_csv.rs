@@ -24,6 +24,19 @@ async fn upload_into(st: &AppState, cookie: &str, csrf: &str, csv: &str, into: &
     (status, loc, String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned())
 }
 
+/// Posts a radio name CSV to the list on screen's import.
+async fn upload_radios(st: &AppState, cookie: &str, csrf: &str, list: &str, csv: &str) -> (StatusCode, String) {
+    let b = "XbOuNdArY";
+    let body = format!("--{b}\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"list\"\r\n\r\n{list}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"radios.csv\"\r\nContent-Type: text/csv\r\n\r\n{csv}\r\n--{b}--\r\n");
+    let req = Request::builder().method("POST").uri("/talkgroups/radios/import-csv").header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={b}")).body(Body::from(body)).unwrap();
+    let res = router(st.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    (status, String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned())
+}
+
 #[tokio::test]
 async fn export_both_sections() {
     let st = state();
@@ -75,4 +88,21 @@ async fn exported_file_imports_unchanged_into_another_list() {
     let (status, loc, _) = upload_into(&st, &cookie, &csrf, &csv, NEW_LIST, "Copy").await;
     assert_eq!(status, StatusCode::SEE_OTHER, "no conflicts, straight back to the list: {loc:?}");
     assert_eq!(st.db.talkgroups("Copy"), st.db.talkgroups(SYS));
+}
+
+#[tokio::test]
+async fn radio_names_from_csv() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "admin", Role::Admin);
+    st.db.save_radio_name(SYS, &RadioName { radio: 7, name: "Old".into() }).unwrap();
+    let (status, body) = upload_radios(&st, &cookie, &csrf, SYS, "radio,name\n7,New\n8,Eight\n").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Use file"));
+    assert_eq!(st.db.radio_names(SYS), vec![RadioName { radio: 7, name: "Old".into() }, RadioName { radio: 8, name: "Eight".into() }]);
+    let r = send(&st, "POST", "/talkgroups/radios/import-csv/apply", Some(&cookie), &[("csrf", &csrf), ("list", SYS), ("all", "file"),
+        ("conflict", "7"), ("file_name_7", "New")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(st.db.radio_names(SYS)[0].name, "New");
+    let (status, _) = upload_radios(&st, &cookie, &csrf, "nope", "radio,name\n1,A\n").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

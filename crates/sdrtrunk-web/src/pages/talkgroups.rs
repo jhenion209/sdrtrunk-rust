@@ -213,6 +213,14 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
                     "is deleted. Radio ID ranges are skipped." }
                 button { "Upload playlist" }
             }
+            h3 { "Import radio names from a CSV" }
+            form method="post" action="/talkgroups/radios/import-csv" enctype="multipart/form-data" {
+                (hidden(s, list))
+                label { "Radio name CSV (as Export CSV above writes it)" input type="file" name="file" accept=".csv,text/csv" required; }
+                p.muted { "Into this list (" (list) "). New radio names are added; where a name differs from yours you choose which "
+                    "to keep; nothing is deleted." }
+                button { "Upload CSV" }
+            }
         }
         @if radios.is_empty() { p.muted { "None yet." } } @else {
             table {
@@ -422,6 +430,81 @@ pub async fn import_radios_apply(State(st): State<AppState>, Authed(s, _): Authe
         changed(&st, &s, format!("renamed {} to the sdrtrunk playlist's names", plural(renames.len(), "radio")));
     }
     Redirect::to("/talkgroups#radios").into_response()
+}
+
+/// Radio name CSV upload into the list on screen: adds the names the list lacks, then asks about names that differ.
+pub async fn import_radios_csv(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let (mut csrf, mut list, mut text) = (String::new(), String::new(), String::new());
+    while let Ok(Some(field)) = mp.next_field().await {
+        match field.name() {
+            Some("csrf") => csrf = field.text().await.unwrap_or_default(),
+            Some("list") => list = field.text().await.unwrap_or_default(),
+            Some("file") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            _ => {}
+        }
+    }
+    if let Err(code) = check_csrf(&s, &csrf) { return code.into_response(); }
+    if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let back = |msg: &str| view(&st, &s, &list, &TalkgroupForm::default(), Some(msg)).into_response();
+    let (rows, skipped) = match list_csv::parse_radios(&text) {
+        Ok(r) => r,
+        Err(e) => return back(&e),
+    };
+    if rows.is_empty() { return back("The file has no radio names."); }
+    let c = radio_names::compare(&st.db.radio_names(&list), &rows);
+    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return back(&format!("Could not import: {e}")); }
+    changed(&st, &s, format!("imported {} into {list} from a CSV", plural(c.new.len(), "radio name")));
+    let home = format!("{}#radios", url(&list, ""));
+    if c.conflicts.is_empty() && skipped.is_empty() { return Redirect::to(&home).into_response(); }
+    layout("Radio name CSV import", Some(&s.user), &s.csrf, html! {
+        p.ok { (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, " (c.only_local) " only in this list (kept)." }
+        @if !skipped.is_empty() { details { summary { (plural(skipped.len(), "row")) " skipped" } ul { @for m in &skipped { li { (m) } } } } }
+        @if c.conflicts.is_empty() { p { a href=(home) { "Back to radio names" } } } @else {
+            h2 { "Names that differ" }
+            p.muted { "Nothing changes unless you choose the file's name." }
+            form method="post" action="/talkgroups/radios/import-csv/apply" {
+                (hidden(&s, &list))
+                table {
+                    thead { tr { th { "Radio ID" } th { "This list" } th { "File" } } }
+                    tbody { @for (mine, file) in &c.conflicts { tr {
+                        td { (mine.radio) input type="hidden" name="conflict" value=(mine.radio);
+                             input type="hidden" name={ "file_name_" (mine.radio) } value=(file.name); }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="local" checked; "Keep: " (mine.name) } }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="file"; "Use file: " (file.name) } }
+                    } } }
+                }
+                button { "Apply choices" } " "
+                button.plain name="all" value="file" { "Use the file for all" }
+            }
+        }
+    }).into_response()
+}
+
+/// Applies the radio name CSV review: radios set to the file (or all, with `all=file`) take its name. Every listed conflict
+/// must be a radio of the list with a valid name; never adds or deletes.
+pub async fn import_radios_csv_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let all = get("all") == Some("file");
+    let existing = st.db.radio_names(list);
+    let mut renames = Vec::new();
+    for (_, r) in f.iter().filter(|(k, _)| k == "conflict") {
+        let Ok(radio) = r.parse::<u32>() else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = list_csv::check_name(get(&format!("file_name_{radio}")).unwrap_or(""));
+        let (Ok(name), true) = (name, existing.iter().any(|e| e.radio == radio)) else { return StatusCode::BAD_REQUEST.into_response() };
+        if all || get(&format!("choice_{radio}")) == Some("file") { renames.push(RadioName { radio, name }); }
+    }
+    for r in &renames {
+        if let Err(e) = st.db.save_radio_name(list, r) {
+            return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not rename: {e}"))).into_response();
+        }
+    }
+    if !renames.is_empty() { changed(&st, &s, format!("renamed {} on {list} from a CSV", plural(renames.len(), "radio"))); }
+    Redirect::to(&format!("{}#radios", url(list, ""))).into_response()
 }
 
 pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path(radio): Path<u32>, Form(f): Form<SystemOnly>) -> Response {
