@@ -89,7 +89,8 @@ pub fn list() -> Vec<String> {
 
 impl Airspy {
     /// Opens the Airspy with this serial (`airspy_list_devices` form, see `list`) and starts streaming.
-    /// `rate_hz` must be one the device lists (Mini: 3e6 or 6e6). `linearity_gain` is libairspy's 0..=21 gain.
+    /// `rate_hz`: one of `AIRSPY_RATES` (the R2 lists 10e6 and 2.5e6, the Mini 6e6 and 3e6; libairspy decides what else a
+    /// device takes). `linearity_gain` is libairspy's 0..=21 gain.
     pub fn open(serial: u64, freq_hz: u32, rate_hz: u32, linearity_gain: u8) -> Result<Self, AirspyError> {
         // ponytail: 64 blocks (~0.7 s at 6 MS/s) of slack; samples beyond that are counted in `dropped`.
         let (tx, blocks) = sync_channel(64);

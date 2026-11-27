@@ -177,11 +177,14 @@ pub struct TunerConfig {
     pub auto_ppm: bool,
     /// Airspy combined linearity gain, 0 to 21.
     pub gain: u8,
-    /// Airspy sample rate: 3 or 6 MS/s (an RTL-SDR always runs at 2.4 MS/s).
+    /// Airspy sample rate: one of `AIRSPY_RATES` (R2 10 or 2.5 MS/s, Mini 6 or 3; an RTL-SDR always runs at 2.4 MS/s).
     pub rate_hz: u32,
     /// RTL-SDR tuner gain in dB; None = automatic.
     pub rtl_gain_db: Option<f64>,
 }
+
+/// The sample rate rule, as the Tuners page says it.
+pub const RATE_RULE: &str = "Sample rate must be 10 or 2.5 MS/s (Airspy R2), or 6 or 3 MS/s (Mini).";
 
 impl Default for TunerConfig {
     fn default() -> Self {
@@ -195,7 +198,7 @@ impl TunerConfig {
         let mut e = Vec::new();
         if !(-100.0..=100.0).contains(&self.ppm) { e.push(err("ppm", "Correction must be between -100 and 100 ppm.")); }
         if self.gain > 21 { e.push(err("gain", "Gain must be 0 to 21.")); }
-        if self.rate_hz != 3_000_000 && self.rate_hz != 6_000_000 { e.push(err("rate_hz", "Sample rate must be 3 or 6 MS/s.")); }
+        if !sdrtrunk_source::AIRSPY_RATES.iter().any(|(r, _)| *r == self.rate_hz) { e.push(err("rate_hz", RATE_RULE)); }
         if self.rtl_gain_db.is_some_and(|g| !(0.0..=60.0).contains(&g)) { e.push(err("rtl_gain_db", "RTL-SDR gain must be 0 to 60 dB, or blank for automatic.")); }
         let in_range = |f: Option<u64>| f.is_none_or(|f| (MIN_HZ..=MAX_HZ).contains(&f));
         if !in_range(self.center_hz) { e.push(err("center_hz", "The center must be between 24 and 1800 MHz.")); }
@@ -742,7 +745,8 @@ mod tests {
         let tf = |c: TunerConfig| c.validate().err().unwrap_or_default().iter().map(|e| e.field).collect::<Vec<_>>();
         assert!(t().validate().is_ok());
         assert_eq!(tf(TunerConfig { gain: 30, ..t() }), vec!["gain"]);
-        assert_eq!(tf(TunerConfig { rate_hz: 10_000_000, ..t() }), vec!["rate_hz"]);
+        assert_eq!(tf(TunerConfig { rate_hz: 5_000_000, ..t() }), vec!["rate_hz"]);
+        for r in [10_000_000, 6_000_000, 3_000_000, 2_500_000] { assert!(TunerConfig { rate_hz: r, ..t() }.validate().is_ok(), "{r}: R2 or Mini"); }
         assert_eq!(tf(TunerConfig { ppm: 500.0, ..t() }), vec!["ppm"]);
         assert_eq!(tf(TunerConfig { rtl_gain_db: Some(99.0), ..t() }), vec!["rtl_gain_db"]);
         assert_eq!(tf(TunerConfig { mode: TunerMode::Setup, ..t() }), vec!["center_hz"], "Setup mode sits at a fixed center");

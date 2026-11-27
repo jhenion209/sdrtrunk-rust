@@ -31,6 +31,10 @@ pub fn tuner_label(id: &str) -> String {
     match id.strip_prefix("rtl:") { Some(r) => format!("RTL-SDR {r}"), None => format!("Airspy {id}") }
 }
 
+/// The sample rates the Tuners page offers for an Airspy, with the model that lists each (`airspy_info`): the R2 10 and
+/// 2.5 MS/s, the Mini 6 and 3. libairspy also runs an R2 at 6 MS/s (seen 2026-11-26), so no rate is refused per model.
+pub const AIRSPY_RATES: [(u32, &str); 4] = [(10_000_000, "R2"), (6_000_000, "Mini"), (3_000_000, "Mini"), (2_500_000, "R2")];
+
 /// Airspy serial in sdrtrunk's form: "735863DC-2F67AFE3" (high and low 32 bits, upper-case hex).
 pub fn format_serial(sn: u64) -> String { format!("{:08X}-{:08X}", sn >> 32, sn & 0xFFFF_FFFF) }
 
@@ -52,6 +56,11 @@ mod tests {
         assert_eq!(parse_serial("735863DC-2F67AFE3"), Some(0x735863DC_2F67AFE3));
         assert_eq!(parse_serial("0x10a862dc34348363"), Some(0x10A862DC_34348363));
         for bad in ["", "xyz", "735863DC-2F67AFE3-00", "-"] { assert_eq!(parse_serial(bad), None, "{bad}"); }
+    }
+
+    #[test]
+    fn airspy_rates_name_their_model() {
+        assert_eq!(AIRSPY_RATES, [(10_000_000, "R2"), (6_000_000, "Mini"), (3_000_000, "Mini"), (2_500_000, "R2")]);
     }
 
     #[test]

@@ -177,7 +177,8 @@ async fn tuners_page_settings() {
     assert!(wait_opens(&opens, 1).await);
     let list = send(&st, "GET", "/tuners", c, &[]).await.body;
     assert!(list.contains(&format!("Airspy {A}")) && list.contains(&format!("Airspy {B}")) && list.contains("Live"), "{list}");
-    assert!(send(&st, "GET", &format!("/tuners/{A}"), c, &[]).await.body.contains("Sample rate"), "Airspy form");
+    let form = send(&st, "GET", &format!("/tuners/{A}"), c, &[]).await.body;
+    assert!(form.contains("Sample rate") && form.contains("10 MS/s (R2)") && form.contains("6 MS/s (Mini)"), "Airspy form");
 
     let before = opens.load(Ordering::SeqCst);
     let r = send(&st, "POST", &format!("/tuners/{A}"), c, &[("csrf", &csrf), ("mode", "live"), ("ppm", "-3.8"), ("auto_ppm", "on"),
@@ -187,6 +188,10 @@ async fn tuners_page_settings() {
     assert!(send(&st, "GET", "/tuners", c, &[]).await.body.contains("(automatic)"));
     assert_eq!(st.db.audit_log(1)[0].action, format!("changed tuner Airspy {A}"));
     assert!(wait_opens(&opens, before + 1).await, "the system that failed on it is retried");
+    let r = send(&st, "POST", &format!("/tuners/{A}"), c, &[("csrf", &csrf), ("mode", "live"), ("ppm", "-3.8"), ("auto_ppm", "on"),
+        ("gain", "12"), ("rate_hz", "10000000")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "an Airspy R2 runs at 10 MS/s");
+    assert_eq!(st.db.tuner(A).rate_hz, 10_000_000);
 
     let rtl = "rtl:00000001";
     let page = send(&st, "GET", &format!("/tuners/{rtl}"), c, &[]).await.body;

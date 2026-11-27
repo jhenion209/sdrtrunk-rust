@@ -16,7 +16,7 @@ Calls can also be played live to Icecast streams.
 
 - P25 Phase 1 control and voice channels, C4FM and LSM (simulcast, sdrtrunk's "CQPSK"). DSP, error correction and
   decoding were checked against vectors generated from the Java code.
-- Airspy and RTL-SDR tuners; several systems at once, each on its own SDR (pinned or picked automatically).
+- Airspy (R2 at 10 or 2.5 MS/s, Mini at 6 or 3) and RTL-SDR tuners; several systems at once, each on its own SDR (pinned or picked automatically).
 - Tuner window placed automatically to cover the control channel and the voice frequencies a system uses, moved when a
   call falls outside it; optional lock center and frequency limits; Setup mode to watch a tuner's spectrum.
 - Automatic frequency correction (PPM) from the control channel's measured error.

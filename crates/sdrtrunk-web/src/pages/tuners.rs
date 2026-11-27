@@ -163,7 +163,7 @@ impl TunerForm {
             };
         } else {
             match self.gain.trim().parse() { Ok(v) => c.gain = v, Err(_) => bad("gain", "Gain must be 0 to 21.") }
-            match self.rate_hz.trim().parse() { Ok(v) => c.rate_hz = v, Err(_) => bad("rate_hz", "Sample rate must be 3 or 6 MS/s.") }
+            match self.rate_hz.trim().parse() { Ok(v) => c.rate_hz = v, Err(_) => bad("rate_hz", crate::db::RATE_RULE) }
         }
         if let Err(more) = c.validate() { for e in more { if !errors.iter().any(|x| x.field == e.field) { errors.push(e); } } }
         if errors.is_empty() { Ok(c) } else { Err(errors) }
@@ -235,8 +235,9 @@ fn form_view(st: &AppState, s: &Session, id: &str, f: &TunerForm, errors: &[Fiel
                 (field_error(errors, "gain"))
                 label { "Sample rate"
                     select name="rate_hz" {
-                        option value="6000000" selected[f.rate_hz == "6000000"] { "6 MS/s" }
-                        option value="3000000" selected[f.rate_hz == "3000000"] { "3 MS/s" }
+                        @for (r, model) in sdrtrunk_source::AIRSPY_RATES {
+                            option value=(r) selected[f.rate_hz == r.to_string()] { (r as f64 / 1e6) " MS/s (" (model) ")" }
+                        }
                     }
                 }
                 (field_error(errors, "rate_hz"))
