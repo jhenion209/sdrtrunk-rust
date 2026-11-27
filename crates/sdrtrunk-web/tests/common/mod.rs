@@ -41,7 +41,7 @@ pub fn state() -> AppState {
 /// What system 1's recorder records (it reloads on every talkgroup change).
 pub fn policy(st: &AppState) -> Arc<Mutex<RecordPolicy>> { st.receivers.get(1).expect("system 1 running").policy.clone() }
 
-pub struct Resp { pub status: StatusCode, pub location: Option<String>, pub cookie: Option<String>, pub body: String }
+pub struct Resp { pub status: StatusCode, pub location: Option<String>, pub cookie: Option<String>, pub body: String, pub headers: axum::http::HeaderMap }
 
 pub async fn send(st: &AppState, method: &str, path: &str, cookie: Option<&str>, form: &[(&str, &str)]) -> Resp {
     let mut req = Request::builder().method(method).uri(path);
@@ -58,9 +58,9 @@ pub async fn send(st: &AppState, method: &str, path: &str, cookie: Option<&str>,
 pub async fn send_req(st: &AppState, req: Request<Body>) -> Resp {
     let res = router(st.clone()).oneshot(req).await.unwrap();
     let h = |n| res.headers().get(n).map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_string());
-    let (status, location, cookie) = (res.status(), h(header::LOCATION), h(header::SET_COOKIE));
+    let (status, location, cookie, headers) = (res.status(), h(header::LOCATION), h(header::SET_COOKIE), res.headers().clone());
     let body = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned();
-    Resp { status, location, cookie, body }
+    Resp { status, location, cookie, body, headers }
 }
 
 /// Creates the user if needed and returns (cookie header, csrf token).

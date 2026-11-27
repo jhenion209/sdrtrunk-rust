@@ -8,8 +8,9 @@ use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
 use crate::radio_names;
 use crate::rr_csv;
+use crate::list_csv;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Form;
 use maud::{html, Markup};
@@ -27,8 +28,11 @@ pub struct TalkgroupForm {
 
 /// `/talkgroups?list=NAME` plus `extra` ("&sort=name&dir=asc").
 fn url(list: &str, extra: &str) -> String {
-    format!("/talkgroups?{}{extra}", serde_urlencoded::to_string([("list", list)]).unwrap_or_default())
+    format!("/talkgroups?{}{extra}", list_query(list))
 }
+
+/// `list=NAME`, URL-encoded.
+fn list_query(list: &str) -> String { serde_urlencoded::to_string([("list", list)]).unwrap_or_default() }
 
 /// Changes must name an alias list that exists (page views fall back to the first list instead).
 fn known(st: &AppState, list: &str) -> bool { st.db.alias_lists().iter().any(|n| n == list) }
@@ -139,6 +143,7 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
         }
         @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(s, &names)) }
         h2 { "Listed talkgroups" }
+        p { a.button.quiet href={ "/talkgroups/export.csv?" (list_query(system)) } { "Export CSV" } }
         @if can && !fresh.is_empty() {
             form method="post" action="/talkgroups/reviewed" {
                 (hidden(s, system))
@@ -186,6 +191,7 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
     let radios = st.db.radio_names(list);
     html! {
         h2 #radios { "Radio names" }
+        p { a.button.quiet href={ "/talkgroups/radios/export.csv?" (list_query(list)) } { "Export CSV" } }
         p.muted { "Recordings carry the name with the radio number (file names keep the number). Saving a number already listed renames it." }
         @if can {
             form method="post" action="/talkgroups/radios" {
@@ -643,4 +649,25 @@ pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(numbe
     }
     changed(&st, &s, format!("talkgroup {number} on {} deleted", f.system));
     Redirect::to(&url(&f.system, "")).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ListQuery { #[serde(default)] list: String }
+
+/// `GET /talkgroups/export.csv?list=L`: the list's talkgroups as this program's CSV, for anyone signed in.
+pub async fn export_talkgroups(State(st): State<AppState>, Authed(_, _): Authed, Query(q): Query<ListQuery>) -> Response {
+    if !known(&st, &q.list) { return StatusCode::NOT_FOUND.into_response(); }
+    csv_download(&q.list, "talkgroups", list_csv::write_talkgroups(&st.db.talkgroups(&q.list)))
+}
+
+/// `GET /talkgroups/radios/export.csv?list=L`: the list's radio names as this program's CSV, for anyone signed in.
+pub async fn export_radios(State(st): State<AppState>, Authed(_, _): Authed, Query(q): Query<ListQuery>) -> Response {
+    if !known(&st, &q.list) { return StatusCode::NOT_FOUND.into_response(); }
+    csv_download(&q.list, "radio-names", list_csv::write_radios(&st.db.radio_names(&q.list)))
+}
+
+fn csv_download(list: &str, what: &str, body: String) -> Response {
+    let name = list_csv::file_name(list, what, chrono::Local::now().date_naive());
+    ([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+      (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], body).into_response()
 }

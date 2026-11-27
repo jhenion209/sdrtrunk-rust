@@ -176,6 +176,8 @@ pub fn router(state: AppState) -> Router {
         .route("/talkgroups/{number}/delete", post(pages::talkgroups::delete))
         .route("/talkgroups/unlisted", post(pages::talkgroups::unlisted))
         .route("/talkgroups/record", post(pages::talkgroups::record_batch))
+        .route("/talkgroups/export.csv", get(pages::talkgroups::export_talkgroups))
+        .route("/talkgroups/radios/export.csv", get(pages::talkgroups::export_radios))
         .route("/talkgroups/import", post(pages::talkgroups::import).layer(DefaultBodyLimit::max(IMPORT_MAX)))
         .route("/talkgroups/import/apply", post(pages::talkgroups::import_apply))
         .route("/talkgroups/reviewed", post(pages::talkgroups::reviewed_all))
