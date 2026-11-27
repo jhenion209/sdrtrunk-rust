@@ -8,8 +8,9 @@ use crate::pages::layout::{layout, notice, read_only};
 use crate::receiver::now_ms;
 use crate::radio_names;
 use crate::rr_csv;
+use crate::list_csv;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Form;
 use maud::{html, Markup};
@@ -27,8 +28,11 @@ pub struct TalkgroupForm {
 
 /// `/talkgroups?list=NAME` plus `extra` ("&sort=name&dir=asc").
 fn url(list: &str, extra: &str) -> String {
-    format!("/talkgroups?{}{extra}", serde_urlencoded::to_string([("list", list)]).unwrap_or_default())
+    format!("/talkgroups?{}{extra}", list_query(list))
 }
+
+/// `list=NAME`, URL-encoded.
+fn list_query(list: &str) -> String { serde_urlencoded::to_string([("list", list)]).unwrap_or_default() }
 
 /// Changes must name an alias list that exists (page views fall back to the first list instead).
 fn known(st: &AppState, list: &str) -> bool { st.db.alias_lists().iter().any(|n| n == list) }
@@ -38,15 +42,16 @@ const CHOOSE_LIST: &str = "Choose Alias List...";
 const NO_LIST_CHOSEN: &str = "Choose an alias list to import into.";
 
 /// Value of the "Import into" choice that creates a list.
-const NEW_LIST: &str = "+new";
+pub const NEW_LIST: &str = "+new";
 
 /// The RadioReference import form: into this list, another list, or a new one.
 fn import_form(s: &Session, lists: &[String]) -> Markup {
     html! {
-        h2 { "Import from RadioReference" }
+        h2 { "Import talkgroups" }
         form method="post" action="/talkgroups/import" enctype="multipart/form-data" {
             input type="hidden" name="csrf" value=(s.csrf);
-            label { "Talkgroup CSV downloaded from RadioReference" input type="file" name="file" accept=".csv,text/csv" required; }
+            label { "Talkgroup CSV: downloaded from RadioReference, or exported here (Export CSV below)"
+                input type="file" name="file" accept=".csv,text/csv" required; }
             label { "Import into"
                 select name="into" required {
                     option value="" selected { (CHOOSE_LIST) }
@@ -56,7 +61,8 @@ fn import_form(s: &Session, lists: &[String]) -> Markup {
             }
             label { "Name for a new alias list" input name="new_name" maxlength="60" placeholder="e.g. KSICS"; }
             p.muted { "Into an existing list: new talkgroups are added and marked NEW, and where a name differs from yours you choose "
-                "which to keep; nothing is deleted and Record calls is never changed. Into a new list: every talkgroup is added; "
+                "which to keep; nothing is deleted. A RadioReference file never changes Record calls; an exported file brings its "
+                "Record calls setting, and where it differs you choose. Into a new list: every talkgroup is added; "
                 "then pick the list for a system on the " a href="/systems" { "Systems" } " page." }
             button { "Import" }
         }
@@ -139,6 +145,7 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
         }
         @if st.db.may(&s.user, Function::TalkgroupsImport) { (import_form(s, &names)) }
         h2 { "Listed talkgroups" }
+        p { a.button.quiet href={ "/talkgroups/export.csv?" (list_query(system)) } { "Export CSV" } }
         @if can && !fresh.is_empty() {
             form method="post" action="/talkgroups/reviewed" {
                 (hidden(s, system))
@@ -150,11 +157,12 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
                 (hidden(s, system))
                 "Selected talkgroups: "
                 button name="record" value="on" { "Record selected" } " "
-                button name="record" value="off" { "Don't record selected" }
+                button name="record" value="off" { "Don't record selected" } " "
+                button.danger formaction="/talkgroups/delete" { "Delete selected" }
             } }
             table {
                 thead { tr {
-                    th { @if can { input #select-all type="checkbox" title="Select all"; } }
+                    th { @if can { input type="checkbox" data-select-all="batch" title="Select all"; } }
                     th { a href=(sort.link(system, "number")) { "Talkgroup ID" (sort.arrow("number")) } }
                     th { a href=(sort.link(system, "name")) { "Talkgroup Name" (sort.arrow("name")) } }
                     th { a href=(sort.link(system, "record")) { "Record" (sort.arrow("record")) } }
@@ -186,6 +194,7 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
     let radios = st.db.radio_names(list);
     html! {
         h2 #radios { "Radio names" }
+        p { a.button.quiet href={ "/talkgroups/radios/export.csv?" (list_query(list)) } { "Export CSV" } }
         p.muted { "Recordings carry the name with the radio number (file names keep the number). Saving a number already listed renames it." }
         @if can {
             form method="post" action="/talkgroups/radios" {
@@ -205,11 +214,27 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
                     "is deleted. Radio ID ranges are skipped." }
                 button { "Upload playlist" }
             }
+            h3 { "Import radio names from a CSV" }
+            form method="post" action="/talkgroups/radios/import-csv" enctype="multipart/form-data" {
+                (hidden(s, list))
+                label { "Radio name CSV (as Export CSV above writes it)" input type="file" name="file" accept=".csv,text/csv" required; }
+                p.muted { "Into this list (" (list) "). New radio names are added; where a name differs from yours you choose which "
+                    "to keep; nothing is deleted." }
+                button { "Upload CSV" }
+            }
         }
         @if radios.is_empty() { p.muted { "None yet." } } @else {
+            @if can { form #radio-batch method="post" action="/talkgroups/radios/delete" {
+                (hidden(s, list))
+                "Selected radio names: " button.danger { "Delete selected" }
+            } }
             table {
-                thead { tr { th { "Radio ID" } th { "Name" } th {} } }
+                thead { tr {
+                    th { @if can { input type="checkbox" data-select-all="radio-batch" title="Select all"; } }
+                    th { "Radio ID" } th { "Name" } th {}
+                } }
                 tbody { @for r in &radios { tr {
+                    td { @if can { input type="checkbox" name="r" value=(r.radio) form="radio-batch" aria-label={ "Select radio " (r.radio) }; } }
                     td { (r.radio) } td { (r.name) }
                     td { @if can { form method="post" action={ "/talkgroups/radios/" (r.radio) "/delete" } {
                         (hidden(s, list))
@@ -416,6 +441,81 @@ pub async fn import_radios_apply(State(st): State<AppState>, Authed(s, _): Authe
     Redirect::to("/talkgroups#radios").into_response()
 }
 
+/// Radio name CSV upload into the list on screen: adds the names the list lacks, then asks about names that differ.
+pub async fn import_radios_csv(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Multipart) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let (mut csrf, mut list, mut text) = (String::new(), String::new(), String::new());
+    while let Ok(Some(field)) = mp.next_field().await {
+        match field.name() {
+            Some("csrf") => csrf = field.text().await.unwrap_or_default(),
+            Some("list") => list = field.text().await.unwrap_or_default(),
+            Some("file") => text = field.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+            _ => {}
+        }
+    }
+    if let Err(code) = check_csrf(&s, &csrf) { return code.into_response(); }
+    if !known(&st, &list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let back = |msg: &str| view(&st, &s, &list, &TalkgroupForm::default(), Some(msg)).into_response();
+    let (rows, skipped) = match list_csv::parse_radios(&text) {
+        Ok(r) => r,
+        Err(e) => return back(&e),
+    };
+    if rows.is_empty() { return back("The file has no radio names."); }
+    let c = radio_names::compare(&st.db.radio_names(&list), &rows);
+    if let Err(e) = st.db.add_radio_names(&list, &c.new) { return back(&format!("Could not import: {e}")); }
+    changed(&st, &s, format!("imported {} into {list} from a CSV", plural(c.new.len(), "radio name")));
+    let home = format!("{}#radios", url(&list, ""));
+    if c.conflicts.is_empty() && skipped.is_empty() { return Redirect::to(&home).into_response(); }
+    layout("Radio name CSV import", Some(&s.user), &s.csrf, html! {
+        p.ok { (list) ": " (plural(c.new.len(), "new name")) " added, " (c.unchanged) " unchanged, " (c.only_local) " only in this list (kept)." }
+        @if !skipped.is_empty() { details { summary { (plural(skipped.len(), "row")) " skipped" } ul { @for m in &skipped { li { (m) } } } } }
+        @if c.conflicts.is_empty() { p { a href=(home) { "Back to radio names" } } } @else {
+            h2 { "Names that differ" }
+            p.muted { "Nothing changes unless you choose the file's name." }
+            form method="post" action="/talkgroups/radios/import-csv/apply" {
+                (hidden(&s, &list))
+                table {
+                    thead { tr { th { "Radio ID" } th { "This list" } th { "File" } } }
+                    tbody { @for (mine, file) in &c.conflicts { tr {
+                        td { (mine.radio) input type="hidden" name="conflict" value=(mine.radio);
+                             input type="hidden" name={ "file_name_" (mine.radio) } value=(file.name); }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="local" checked; "Keep: " (mine.name) } }
+                        td { label.check { input type="radio" name={ "choice_" (mine.radio) } value="file"; "Use file: " (file.name) } }
+                    } } }
+                }
+                button { "Apply choices" } " "
+                button.plain name="all" value="file" { "Use the file for all" }
+            }
+        }
+    }).into_response()
+}
+
+/// Applies the radio name CSV review: radios set to the file (or all, with `all=file`) take its name. Every listed conflict
+/// must be a radio of the list with a valid name; never adds or deletes.
+pub async fn import_radios_csv_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let all = get("all") == Some("file");
+    let existing = st.db.radio_names(list);
+    let mut renames = Vec::new();
+    for (_, r) in f.iter().filter(|(k, _)| k == "conflict") {
+        let Ok(radio) = r.parse::<u32>() else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = list_csv::check_name(get(&format!("file_name_{radio}")).unwrap_or(""));
+        let (Ok(name), true) = (name, existing.iter().any(|e| e.radio == radio)) else { return StatusCode::BAD_REQUEST.into_response() };
+        if all || get(&format!("choice_{radio}")) == Some("file") { renames.push(RadioName { radio, name }); }
+    }
+    for r in &renames {
+        if let Err(e) = st.db.save_radio_name(list, r) {
+            return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not rename: {e}"))).into_response();
+        }
+    }
+    if !renames.is_empty() { changed(&st, &s, format!("renamed {} on {list} from a CSV", plural(renames.len(), "radio"))); }
+    Redirect::to(&format!("{}#radios", url(list, ""))).into_response()
+}
+
 pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path(radio): Path<u32>, Form(f): Form<SystemOnly>) -> Response {
     if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
     if let Err(code) = check_csrf(&s, &f.csrf) { return code.into_response(); }
@@ -428,7 +528,9 @@ pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path
 }
 
 #[derive(Deserialize)]
-pub struct EditQuery { #[serde(rename = "list")] system: Option<String>, edit: Option<u16>, imported: Option<usize>, created: Option<u8>, sort: Option<String>, dir: Option<String> }
+pub struct EditQuery { #[serde(rename = "list")] system: Option<String>, edit: Option<u16>, imported: Option<usize>, created: Option<u8>,
+    /// `csv`: the import was this program's own talkgroup CSV, not RadioReference's.
+    from: Option<String>, sort: Option<String>, dir: Option<String> }
 
 /// `?edit=N` loads talkgroup N into the form; saving it replaces the entry. Without systems there is no list yet.
 pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Query<EditQuery>) -> Markup {
@@ -445,9 +547,10 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
     let f = q.edit.and_then(|n| st.db.talkgroups(&system).into_iter().find(|t| t.number == n)).map_or_else(TalkgroupForm::default, |t| TalkgroupForm {
         csrf: String::new(), system: system.clone(), number: t.number.to_string(), name: t.name, record: t.record.then(|| "on".into()),
     });
+    let source = if q.from.as_deref() == Some("csv") { "a talkgroup CSV" } else { "RadioReference" };
     let info = q.imported.map(|n| if q.created.is_some() {
-        format!("New alias list {system} created with {n} talkgroups from RadioReference. Choose it for a system on the Systems page.")
-    } else { format!("Imported from RadioReference: {n} new talkgroups added (marked NEW below).") });
+        format!("New alias list {system} created with {n} talkgroups from {source}. Choose it for a system on the Systems page.")
+    } else { format!("Imported from {source}: {n} new talkgroups added (marked NEW below).") });
     view_with(&st, &s, &system, &f, None, info.as_deref(), &Sort::from_query(q.sort.as_deref(), q.dir.as_deref()))
 }
 
@@ -507,6 +610,7 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
         if lists.iter().any(|l| l.eq_ignore_ascii_case(name)) { return refuse(&format!("An alias list named {name} already exists; choose it instead.")); }
         name.to_string()
     } else if known(&st, &into) { into.clone() } else { return StatusCode::BAD_REQUEST.into_response() };
+    if list_csv::is_talkgroup_file(&text) { return import_file(&st, &s, &text, &system, creating, &refuse); }
     let (rows, skipped) = match rr_csv::parse(&text) {
         Ok(r) => r,
         Err(e) => return refuse(&e),
@@ -547,6 +651,85 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
             }
         }
     }).into_response()
+}
+
+/// `import` for this program's own talkgroup CSV: adds the talkgroups the list lacks (the file's Record calls, marked
+/// NEW), then asks about those whose name or Record calls differs. Nothing else changes before that choice.
+fn import_file(st: &AppState, s: &Session, text: &str, system: &str, creating: bool, refuse: &dyn Fn(&str) -> Response) -> Response {
+    let (rows, skipped) = match list_csv::parse_talkgroups(text) {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    if rows.is_empty() { return refuse("The file has no talkgroups."); }
+    if creating {
+        if let Err(e) = st.db.create_alias_list(system) { return refuse(&format!("Could not create the list: {e}")); }
+    }
+    let c = list_csv::compare_talkgroups(&st.db.talkgroups(system), &rows);
+    if let Err(e) = st.db.import_talkgroups(system, &c.new) {
+        return view(st, s, system, &TalkgroupForm::default(), Some(&format!("Could not import: {e}"))).into_response();
+    }
+    changed(st, s, format!("imported {} into {}{system} from a talkgroup CSV, {}", plural(c.new.len(), "new talkgroup"),
+        if creating { "new alias list " } else { "" }, plural(c.conflicts.len(), "conflict")));
+    if c.conflicts.is_empty() && skipped.is_empty() {
+        return Redirect::to(&url(system, &format!("&imported={}&from=csv{}", c.new.len(), if creating { "&created=1" } else { "" }))).into_response();
+    }
+    let rec = |t: &Talkgroup| if t.record { "record" } else { "don't record" };
+    layout("Talkgroup CSV import", Some(&s.user), &s.csrf, html! {
+        p.ok { (system) ": " (plural(c.new.len(), "new talkgroup")) " added (marked NEW in the list). "
+            (c.unchanged) " unchanged, " (c.only_local) " only in this list (kept)." }
+        @if !skipped.is_empty() { details { summary { (plural(skipped.len(), "row")) " skipped" } ul { @for m in &skipped { li { (m) } } } } }
+        @if c.conflicts.is_empty() { p { a href=(url(system, "")) { "Back to talkgroups" } } } @else {
+            h2 { "Talkgroups that differ" }
+            p.muted { "Nothing changes unless you choose the file. Use file takes both its name and its Record calls setting." }
+            form method="post" action="/talkgroups/import/file/apply" {
+                (hidden(s, system))
+                table {
+                    thead { tr { th { "Number" } th { "This list" } th { "File" } } }
+                    tbody { @for (mine, file) in &c.conflicts { tr {
+                        td { (mine.number) input type="hidden" name="conflict" value=(mine.number);
+                             input type="hidden" name={ "file_name_" (mine.number) } value=(file.name);
+                             input type="hidden" name={ "file_record_" (mine.number) } value=(if file.record { "yes" } else { "no" }); }
+                        td { label.check { input type="radio" name={ "choice_" (mine.number) } value="local" checked;
+                            "Keep: " (mine.name) " (" (rec(mine)) ")" } }
+                        td { label.check { input type="radio" name={ "choice_" (mine.number) } value="file";
+                            "Use file: " (file.name) " (" (rec(file)) ")" } }
+                    } } }
+                }
+                button { "Apply choices" } " "
+                button.plain name="all" value="file" { "Use the file for all" }
+            }
+        }
+    }).into_response()
+}
+
+/// Applies the own-CSV review: talkgroups set to the file (or all, with `all=file`) take its name and Record calls.
+/// Every listed conflict must be a talkgroup of the list with valid file values; never adds or deletes.
+pub async fn import_file_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let system = get("list").unwrap_or("");
+    if !known(&st, system) { return StatusCode::BAD_REQUEST.into_response(); }
+    let all = get("all") == Some("file");
+    let existing = st.db.talkgroups(system);
+    let mut updates = Vec::new();
+    for (_, n) in f.iter().filter(|(k, _)| k == "conflict") {
+        let Ok(number) = n.parse::<u16>() else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = list_csv::check_name(get(&format!("file_name_{number}")).unwrap_or(""));
+        let record = list_csv::parse_record(get(&format!("file_record_{number}")).unwrap_or(""));
+        let (Ok(name), Some(record), true) = (name, record, existing.iter().any(|t| t.number == number)) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if all || get(&format!("choice_{number}")) == Some("file") { updates.push(Talkgroup { number, name, record }); }
+    }
+    for t in &updates {
+        let done = st.db.rename_talkgroup(system, t.number, &t.name).and_then(|_| st.db.set_record(system, &[t.number], t.record));
+        if let Err(e) = done {
+            return view(&st, &s, system, &TalkgroupForm::default(), Some(&format!("Could not update: {e}"))).into_response();
+        }
+    }
+    if !updates.is_empty() { changed(&st, &s, format!("updated {} on {system} from a talkgroup CSV", plural(updates.len(), "talkgroup"))); }
+    Redirect::to(&url(system, "")).into_response()
 }
 
 /// Applies the conflict choices: renames only talkgroups set to RadioReference's name; never adds or deletes.
@@ -643,4 +826,94 @@ pub async fn delete(State(st): State<AppState>, Authed(s, _): Authed, Path(numbe
     }
     changed(&st, &s, format!("talkgroup {number} on {} deleted", f.system));
     Redirect::to(&url(&f.system, "")).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ListQuery { #[serde(default)] list: String }
+
+/// `GET /talkgroups/export.csv?list=L`: the list's talkgroups as this program's CSV, for anyone signed in.
+pub async fn export_talkgroups(State(st): State<AppState>, Authed(_, _): Authed, Query(q): Query<ListQuery>) -> Response {
+    if !known(&st, &q.list) { return StatusCode::NOT_FOUND.into_response(); }
+    csv_download(&q.list, "talkgroups", list_csv::write_talkgroups(&st.db.talkgroups(&q.list)))
+}
+
+/// `GET /talkgroups/radios/export.csv?list=L`: the list's radio names as this program's CSV, for anyone signed in.
+pub async fn export_radios(State(st): State<AppState>, Authed(_, _): Authed, Query(q): Query<ListQuery>) -> Response {
+    if !known(&st, &q.list) { return StatusCode::NOT_FOUND.into_response(); }
+    csv_download(&q.list, "radio-names", list_csv::write_radios(&st.db.radio_names(&q.list)))
+}
+
+fn csv_download(list: &str, what: &str, body: String) -> Response {
+    let name = list_csv::file_name(list, what, chrono::Local::now().date_naive());
+    ([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+      (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], body).into_response()
+}
+
+/// Batch delete of talkgroups (`n` repeated): without `confirm=yes` it shows what will go; with it, deletes. Numbers not
+/// in the list are ignored; when none is in it, back to the list without asking.
+pub async fn delete_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Ok(numbers) = f.iter().filter(|(k, _)| k == "n").map(|(_, v)| v.parse::<u16>()).collect::<Result<Vec<_>, _>>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let going: Vec<(String, String)> = st.db.talkgroups(list).into_iter().filter(|t| numbers.contains(&t.number))
+        .map(|t| (t.number.to_string(), t.name)).collect();
+    let home = url(list, "");
+    if going.is_empty() { return Redirect::to(&home).into_response(); }
+    if get("confirm") != Some("yes") {
+        let ask = format!("Delete {} from {list}?", plural(going.len(), "talkgroup"));
+        return confirm_delete(&s, list, &ask, "/talkgroups/delete", "n", "Talkgroup ID", &going, &home);
+    }
+    match st.db.delete_talkgroups(list, &numbers) {
+        Ok(n) => changed(&st, &s, format!("deleted {} from {list}", plural(n, "talkgroup"))),
+        Err(e) => return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not delete: {e}"))).into_response(),
+    }
+    Redirect::to(&home).into_response()
+}
+
+/// Batch delete of radio names (`r` repeated), asked first as `delete_batch` does.
+pub async fn delete_radios_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Ok(radios) = f.iter().filter(|(k, _)| k == "r").map(|(_, v)| v.parse::<u32>()).collect::<Result<Vec<_>, _>>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let going: Vec<(String, String)> = st.db.radio_names(list).into_iter().filter(|r| radios.contains(&r.radio))
+        .map(|r| (r.radio.to_string(), r.name)).collect();
+    let home = format!("{}#radios", url(list, ""));
+    if going.is_empty() { return Redirect::to(&home).into_response(); }
+    if get("confirm") != Some("yes") {
+        let ask = format!("Delete {} from {list}?", plural(going.len(), "radio name"));
+        return confirm_delete(&s, list, &ask, "/talkgroups/radios/delete", "r", "Radio ID", &going, &home);
+    }
+    match st.db.delete_radio_names(list, &radios) {
+        Ok(n) => changed(&st, &s, format!("deleted {} from {list}", plural(n, "radio name"))),
+        Err(e) => return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not delete: {e}"))).into_response(),
+    }
+    Redirect::to(&home).into_response()
+}
+
+/// The confirmation page of a batch delete: `going` is (id, name) of each entry, sent again as `field` with `confirm=yes`.
+#[allow(clippy::too_many_arguments)]
+fn confirm_delete(s: &Session, list: &str, ask: &str, action: &str, field: &str, id_label: &str, going: &[(String, String)], cancel: &str) -> Response {
+    layout("Talkgroups", Some(&s.user), &s.csrf, html! {
+        h2 { (ask) }
+        table {
+            thead { tr { th { (id_label) } th { "Name" } } }
+            tbody { @for (id, name) in going { tr { td { (id) } td { (name) } } } }
+        }
+        form method="post" action=(action) {
+            (hidden(s, list))
+            @for (id, _) in going { input type="hidden" name=(field) value=(id); }
+            input type="hidden" name="confirm" value="yes";
+            button.danger { "Delete" } " " a href=(cancel) { "Cancel" }
+        }
+    }).into_response()
 }

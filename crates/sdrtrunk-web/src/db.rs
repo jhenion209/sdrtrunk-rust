@@ -470,6 +470,20 @@ impl Db {
         tx.commit()
     }
 
+    /// Deletes several talkgroups and their NEW marks (all or none); returns how many were deleted. Unknown numbers are
+    /// ignored.
+    pub fn delete_talkgroups(&self, system: &str, numbers: &[u16]) -> rusqlite::Result<usize> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let mut deleted = 0;
+        for n in numbers {
+            deleted += tx.execute("DELETE FROM talkgroups WHERE system = ?1 AND number = ?2", params![system, n])?;
+            tx.execute("DELETE FROM new_talkgroups WHERE system = ?1 AND number = ?2", params![system, n])?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Sets Record calls on several talkgroups at once (all or none); unknown numbers are ignored.
     pub fn set_record(&self, system: &str, numbers: &[u16], record: bool) -> rusqlite::Result<()> {
         let mut c = self.conn();
@@ -502,6 +516,16 @@ impl Db {
     pub fn delete_radio_name(&self, list: &str, radio: u32) -> rusqlite::Result<()> {
         self.conn().execute("DELETE FROM radio_names WHERE system = ?1 AND radio = ?2", params![list, radio])?;
         Ok(())
+    }
+
+    /// Deletes several radio names (all or none); returns how many were deleted. Unknown radios are ignored.
+    pub fn delete_radio_names(&self, list: &str, radios: &[u32]) -> rusqlite::Result<usize> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let mut deleted = 0;
+        for r in radios { deleted += tx.execute("DELETE FROM radio_names WHERE system = ?1 AND radio = ?2", params![list, r])?; }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Adds names for radios that have none (all or none); radios already named keep their names.
@@ -744,6 +768,23 @@ mod tests {
         assert!(db.record_unlisted("SGCo"), "on by default");
         db.set_record_unlisted("SGCo", false).unwrap();
         assert!(!db.record_unlisted("SGCo") && db.record_unlisted("KSICS"));
+    }
+
+    #[test]
+    fn bulk_deletes_ignore_unknown_and_other_lists() {
+        let db = Db::open_in_memory().unwrap();
+        let t = |n: u16| Talkgroup { number: n, name: format!("T{n}"), record: true };
+        db.import_talkgroups("L", &[t(1), t(2), t(3)]).unwrap();
+        db.upsert_talkgroup("M", &t(1)).unwrap();
+        assert_eq!(db.delete_talkgroups("L", &[1, 3, 99]).unwrap(), 2);
+        assert_eq!(db.talkgroups("L"), vec![t(2)]);
+        assert_eq!(db.new_talkgroups("L"), vec![2], "NEW marks go with the rows");
+        assert_eq!(db.talkgroups("M"), vec![t(1)], "other list untouched");
+        let rn = |radio: u32| RadioName { radio, name: format!("R{radio}") };
+        db.add_radio_names("L", &[rn(7), rn(8)]).unwrap();
+        db.add_radio_names("M", &[rn(7)]).unwrap();
+        assert_eq!(db.delete_radio_names("L", &[7, 9]).unwrap(), 1);
+        assert_eq!((db.radio_names("L"), db.radio_names("M")), (vec![rn(8)], vec![rn(7)]));
     }
 
     #[test]

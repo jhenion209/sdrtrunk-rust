@@ -26,6 +26,11 @@ fn routes() -> Vec<(String, Function, bool)> {
         ("/talkgroups/27/reviewed".into(), TalkgroupsEdit, false),
         ("/talkgroups/import".into(), TalkgroupsImport, true),
         ("/talkgroups/import/apply".into(), TalkgroupsImport, false),
+        ("/talkgroups/import/file/apply".into(), TalkgroupsImport, false),
+        ("/talkgroups/radios/import-csv".into(), TalkgroupsImport, true),
+        ("/talkgroups/radios/import-csv/apply".into(), TalkgroupsImport, false),
+        ("/talkgroups/delete".into(), TalkgroupsEdit, false),
+        ("/talkgroups/radios/delete".into(), TalkgroupsEdit, false),
         ("/streams/new".into(), StreamsAdd, false),
         ("/streams/1".into(), StreamsEdit, false),
         ("/streams/1/delete".into(), StreamsDelete, false),
@@ -53,7 +58,7 @@ async fn post(st: &AppState, path: &str, multipart: bool, cookie: &str, csrf: &s
 
 #[tokio::test]
 async fn every_change_route_needs_its_function() {
-    assert_eq!(routes().len(), 18);
+    assert_eq!(routes().len(), 23);
     for (path, f, multipart) in routes() {
         let st = state();
         let (cookie, csrf) = login_with(&st, "jordan", &[]);
