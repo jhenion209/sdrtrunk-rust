@@ -42,15 +42,16 @@ const CHOOSE_LIST: &str = "Choose Alias List...";
 const NO_LIST_CHOSEN: &str = "Choose an alias list to import into.";
 
 /// Value of the "Import into" choice that creates a list.
-const NEW_LIST: &str = "+new";
+pub const NEW_LIST: &str = "+new";
 
 /// The RadioReference import form: into this list, another list, or a new one.
 fn import_form(s: &Session, lists: &[String]) -> Markup {
     html! {
-        h2 { "Import from RadioReference" }
+        h2 { "Import talkgroups" }
         form method="post" action="/talkgroups/import" enctype="multipart/form-data" {
             input type="hidden" name="csrf" value=(s.csrf);
-            label { "Talkgroup CSV downloaded from RadioReference" input type="file" name="file" accept=".csv,text/csv" required; }
+            label { "Talkgroup CSV: downloaded from RadioReference, or exported here (Export CSV below)"
+                input type="file" name="file" accept=".csv,text/csv" required; }
             label { "Import into"
                 select name="into" required {
                     option value="" selected { (CHOOSE_LIST) }
@@ -60,7 +61,8 @@ fn import_form(s: &Session, lists: &[String]) -> Markup {
             }
             label { "Name for a new alias list" input name="new_name" maxlength="60" placeholder="e.g. KSICS"; }
             p.muted { "Into an existing list: new talkgroups are added and marked NEW, and where a name differs from yours you choose "
-                "which to keep; nothing is deleted and Record calls is never changed. Into a new list: every talkgroup is added; "
+                "which to keep; nothing is deleted. A RadioReference file never changes Record calls; an exported file brings its "
+                "Record calls setting, and where it differs you choose. Into a new list: every talkgroup is added; "
                 "then pick the list for a system on the " a href="/systems" { "Systems" } " page." }
             button { "Import" }
         }
@@ -434,7 +436,9 @@ pub async fn delete_radio(State(st): State<AppState>, Authed(s, _): Authed, Path
 }
 
 #[derive(Deserialize)]
-pub struct EditQuery { #[serde(rename = "list")] system: Option<String>, edit: Option<u16>, imported: Option<usize>, created: Option<u8>, sort: Option<String>, dir: Option<String> }
+pub struct EditQuery { #[serde(rename = "list")] system: Option<String>, edit: Option<u16>, imported: Option<usize>, created: Option<u8>,
+    /// `csv`: the import was this program's own talkgroup CSV, not RadioReference's.
+    from: Option<String>, sort: Option<String>, dir: Option<String> }
 
 /// `?edit=N` loads talkgroup N into the form; saving it replaces the entry. Without systems there is no list yet.
 pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Query<EditQuery>) -> Markup {
@@ -451,9 +455,10 @@ pub async fn page(State(st): State<AppState>, Authed(s, _): Authed, Query(q): Qu
     let f = q.edit.and_then(|n| st.db.talkgroups(&system).into_iter().find(|t| t.number == n)).map_or_else(TalkgroupForm::default, |t| TalkgroupForm {
         csrf: String::new(), system: system.clone(), number: t.number.to_string(), name: t.name, record: t.record.then(|| "on".into()),
     });
+    let source = if q.from.as_deref() == Some("csv") { "a talkgroup CSV" } else { "RadioReference" };
     let info = q.imported.map(|n| if q.created.is_some() {
-        format!("New alias list {system} created with {n} talkgroups from RadioReference. Choose it for a system on the Systems page.")
-    } else { format!("Imported from RadioReference: {n} new talkgroups added (marked NEW below).") });
+        format!("New alias list {system} created with {n} talkgroups from {source}. Choose it for a system on the Systems page.")
+    } else { format!("Imported from {source}: {n} new talkgroups added (marked NEW below).") });
     view_with(&st, &s, &system, &f, None, info.as_deref(), &Sort::from_query(q.sort.as_deref(), q.dir.as_deref()))
 }
 
@@ -513,6 +518,7 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
         if lists.iter().any(|l| l.eq_ignore_ascii_case(name)) { return refuse(&format!("An alias list named {name} already exists; choose it instead.")); }
         name.to_string()
     } else if known(&st, &into) { into.clone() } else { return StatusCode::BAD_REQUEST.into_response() };
+    if list_csv::is_talkgroup_file(&text) { return import_file(&st, &s, &text, &system, creating, &refuse); }
     let (rows, skipped) = match rr_csv::parse(&text) {
         Ok(r) => r,
         Err(e) => return refuse(&e),
@@ -553,6 +559,85 @@ pub async fn import(State(st): State<AppState>, Authed(s, _): Authed, mut mp: Mu
             }
         }
     }).into_response()
+}
+
+/// `import` for this program's own talkgroup CSV: adds the talkgroups the list lacks (the file's Record calls, marked
+/// NEW), then asks about those whose name or Record calls differs. Nothing else changes before that choice.
+fn import_file(st: &AppState, s: &Session, text: &str, system: &str, creating: bool, refuse: &dyn Fn(&str) -> Response) -> Response {
+    let (rows, skipped) = match list_csv::parse_talkgroups(text) {
+        Ok(r) => r,
+        Err(e) => return refuse(&e),
+    };
+    if rows.is_empty() { return refuse("The file has no talkgroups."); }
+    if creating {
+        if let Err(e) = st.db.create_alias_list(system) { return refuse(&format!("Could not create the list: {e}")); }
+    }
+    let c = list_csv::compare_talkgroups(&st.db.talkgroups(system), &rows);
+    if let Err(e) = st.db.import_talkgroups(system, &c.new) {
+        return view(st, s, system, &TalkgroupForm::default(), Some(&format!("Could not import: {e}"))).into_response();
+    }
+    changed(st, s, format!("imported {} into {}{system} from a talkgroup CSV, {}", plural(c.new.len(), "new talkgroup"),
+        if creating { "new alias list " } else { "" }, plural(c.conflicts.len(), "conflict")));
+    if c.conflicts.is_empty() && skipped.is_empty() {
+        return Redirect::to(&url(system, &format!("&imported={}&from=csv{}", c.new.len(), if creating { "&created=1" } else { "" }))).into_response();
+    }
+    let rec = |t: &Talkgroup| if t.record { "record" } else { "don't record" };
+    layout("Talkgroup CSV import", Some(&s.user), &s.csrf, html! {
+        p.ok { (system) ": " (plural(c.new.len(), "new talkgroup")) " added (marked NEW in the list). "
+            (c.unchanged) " unchanged, " (c.only_local) " only in this list (kept)." }
+        @if !skipped.is_empty() { details { summary { (plural(skipped.len(), "row")) " skipped" } ul { @for m in &skipped { li { (m) } } } } }
+        @if c.conflicts.is_empty() { p { a href=(url(system, "")) { "Back to talkgroups" } } } @else {
+            h2 { "Talkgroups that differ" }
+            p.muted { "Nothing changes unless you choose the file. Use file takes both its name and its Record calls setting." }
+            form method="post" action="/talkgroups/import/file/apply" {
+                (hidden(s, system))
+                table {
+                    thead { tr { th { "Number" } th { "This list" } th { "File" } } }
+                    tbody { @for (mine, file) in &c.conflicts { tr {
+                        td { (mine.number) input type="hidden" name="conflict" value=(mine.number);
+                             input type="hidden" name={ "file_name_" (mine.number) } value=(file.name);
+                             input type="hidden" name={ "file_record_" (mine.number) } value=(if file.record { "yes" } else { "no" }); }
+                        td { label.check { input type="radio" name={ "choice_" (mine.number) } value="local" checked;
+                            "Keep: " (mine.name) " (" (rec(mine)) ")" } }
+                        td { label.check { input type="radio" name={ "choice_" (mine.number) } value="file";
+                            "Use file: " (file.name) " (" (rec(file)) ")" } }
+                    } } }
+                }
+                button { "Apply choices" } " "
+                button.plain name="all" value="file" { "Use the file for all" }
+            }
+        }
+    }).into_response()
+}
+
+/// Applies the own-CSV review: talkgroups set to the file (or all, with `all=file`) take its name and Record calls.
+/// Every listed conflict must be a talkgroup of the list with valid file values; never adds or deletes.
+pub async fn import_file_apply(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsImport) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let system = get("list").unwrap_or("");
+    if !known(&st, system) { return StatusCode::BAD_REQUEST.into_response(); }
+    let all = get("all") == Some("file");
+    let existing = st.db.talkgroups(system);
+    let mut updates = Vec::new();
+    for (_, n) in f.iter().filter(|(k, _)| k == "conflict") {
+        let Ok(number) = n.parse::<u16>() else { return StatusCode::BAD_REQUEST.into_response() };
+        let name = list_csv::check_name(get(&format!("file_name_{number}")).unwrap_or(""));
+        let record = list_csv::parse_record(get(&format!("file_record_{number}")).unwrap_or(""));
+        let (Ok(name), Some(record), true) = (name, record, existing.iter().any(|t| t.number == number)) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if all || get(&format!("choice_{number}")) == Some("file") { updates.push(Talkgroup { number, name, record }); }
+    }
+    for t in &updates {
+        let done = st.db.rename_talkgroup(system, t.number, &t.name).and_then(|_| st.db.set_record(system, &[t.number], t.record));
+        if let Err(e) = done {
+            return view(&st, &s, system, &TalkgroupForm::default(), Some(&format!("Could not update: {e}"))).into_response();
+        }
+    }
+    if !updates.is_empty() { changed(&st, &s, format!("updated {} on {system} from a talkgroup CSV", plural(updates.len(), "talkgroup"))); }
+    Redirect::to(&url(system, "")).into_response()
 }
 
 /// Applies the conflict choices: renames only talkgroups set to RadioReference's name; never adds or deletes.

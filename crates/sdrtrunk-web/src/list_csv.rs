@@ -45,7 +45,7 @@ fn rows<'a>(text: &'a str, want: &'a [&str]) -> Option<impl Iterator<Item = Vec<
 pub fn is_talkgroup_file(text: &str) -> bool { rows(text, &TALKGROUP_HEADER).is_some() }
 
 /// A name as a manual save takes it: cleaned, 1 to `NAME_MAX` characters.
-fn check_name(raw: &str) -> Result<String, String> {
+pub fn check_name(raw: &str) -> Result<String, String> {
     let name = clean_name(raw);
     match name.chars().count() {
         0 => Err("no name".into()),
@@ -54,7 +54,8 @@ fn check_name(raw: &str) -> Result<String, String> {
     }
 }
 
-fn record(s: &str) -> Option<bool> {
+/// A `record` field: `yes`, `true`, `1` or `no`, `false`, `0`, any case.
+pub fn parse_record(s: &str) -> Option<bool> {
     match s.to_ascii_lowercase().as_str() { "yes" | "true" | "1" => Some(true), "no" | "false" | "0" => Some(false), _ => None }
 }
 
@@ -74,7 +75,7 @@ pub fn parse_talkgroups(text: &str) -> Result<(Vec<Talkgroup>, Vec<String>), Str
             Ok(n) => n,
             Err(why) => { skipped.push(format!("skipped talkgroup {number}: {why}")); continue; }
         };
-        let Some(record) = record(cell(2)) else {
+        let Some(record) = parse_record(cell(2)) else {
             skipped.push(format!("skipped talkgroup {number}: record \"{}\" is not yes or no", cell(2)));
             continue;
         };
