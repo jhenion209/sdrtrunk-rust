@@ -157,11 +157,12 @@ fn view_with(st: &AppState, s: &Session, system: &str, f: &TalkgroupForm, error:
                 (hidden(s, system))
                 "Selected talkgroups: "
                 button name="record" value="on" { "Record selected" } " "
-                button name="record" value="off" { "Don't record selected" }
+                button name="record" value="off" { "Don't record selected" } " "
+                button.danger formaction="/talkgroups/delete" { "Delete selected" }
             } }
             table {
                 thead { tr {
-                    th { @if can { input #select-all type="checkbox" title="Select all"; } }
+                    th { @if can { input type="checkbox" data-select-all="batch" title="Select all"; } }
                     th { a href=(sort.link(system, "number")) { "Talkgroup ID" (sort.arrow("number")) } }
                     th { a href=(sort.link(system, "name")) { "Talkgroup Name" (sort.arrow("name")) } }
                     th { a href=(sort.link(system, "record")) { "Record" (sort.arrow("record")) } }
@@ -223,9 +224,17 @@ fn radios_section(st: &AppState, s: &Session, list: &str, can: bool) -> Markup {
             }
         }
         @if radios.is_empty() { p.muted { "None yet." } } @else {
+            @if can { form #radio-batch method="post" action="/talkgroups/radios/delete" {
+                (hidden(s, list))
+                "Selected radio names: " button.danger { "Delete selected" }
+            } }
             table {
-                thead { tr { th { "Radio ID" } th { "Name" } th {} } }
+                thead { tr {
+                    th { @if can { input type="checkbox" data-select-all="radio-batch" title="Select all"; } }
+                    th { "Radio ID" } th { "Name" } th {}
+                } }
                 tbody { @for r in &radios { tr {
+                    td { @if can { input type="checkbox" name="r" value=(r.radio) form="radio-batch" aria-label={ "Select radio " (r.radio) }; } }
                     td { (r.radio) } td { (r.name) }
                     td { @if can { form method="post" action={ "/talkgroups/radios/" (r.radio) "/delete" } {
                         (hidden(s, list))
@@ -838,4 +847,73 @@ fn csv_download(list: &str, what: &str, body: String) -> Response {
     let name = list_csv::file_name(list, what, chrono::Local::now().date_naive());
     ([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
       (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], body).into_response()
+}
+
+/// Batch delete of talkgroups (`n` repeated): without `confirm=yes` it shows what will go; with it, deletes. Numbers not
+/// in the list are ignored; when none is in it, back to the list without asking.
+pub async fn delete_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Ok(numbers) = f.iter().filter(|(k, _)| k == "n").map(|(_, v)| v.parse::<u16>()).collect::<Result<Vec<_>, _>>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let going: Vec<(String, String)> = st.db.talkgroups(list).into_iter().filter(|t| numbers.contains(&t.number))
+        .map(|t| (t.number.to_string(), t.name)).collect();
+    let home = url(list, "");
+    if going.is_empty() { return Redirect::to(&home).into_response(); }
+    if get("confirm") != Some("yes") {
+        let ask = format!("Delete {} from {list}?", plural(going.len(), "talkgroup"));
+        return confirm_delete(&s, list, &ask, "/talkgroups/delete", "n", "Talkgroup ID", &going, &home);
+    }
+    match st.db.delete_talkgroups(list, &numbers) {
+        Ok(n) => changed(&st, &s, format!("deleted {} from {list}", plural(n, "talkgroup"))),
+        Err(e) => return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not delete: {e}"))).into_response(),
+    }
+    Redirect::to(&home).into_response()
+}
+
+/// Batch delete of radio names (`r` repeated), asked first as `delete_batch` does.
+pub async fn delete_radios_batch(State(st): State<AppState>, Authed(s, _): Authed, Form(f): Form<Vec<(String, String)>>) -> Response {
+    if let Some(r) = require(&st, &s, Function::TalkgroupsEdit) { return r; }
+    let get = |k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if let Err(code) = check_csrf(&s, get("csrf").unwrap_or("")) { return code.into_response(); }
+    let list = get("list").unwrap_or("");
+    if !known(&st, list) { return StatusCode::BAD_REQUEST.into_response(); }
+    let Ok(radios) = f.iter().filter(|(k, _)| k == "r").map(|(_, v)| v.parse::<u32>()).collect::<Result<Vec<_>, _>>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let going: Vec<(String, String)> = st.db.radio_names(list).into_iter().filter(|r| radios.contains(&r.radio))
+        .map(|r| (r.radio.to_string(), r.name)).collect();
+    let home = format!("{}#radios", url(list, ""));
+    if going.is_empty() { return Redirect::to(&home).into_response(); }
+    if get("confirm") != Some("yes") {
+        let ask = format!("Delete {} from {list}?", plural(going.len(), "radio name"));
+        return confirm_delete(&s, list, &ask, "/talkgroups/radios/delete", "r", "Radio ID", &going, &home);
+    }
+    match st.db.delete_radio_names(list, &radios) {
+        Ok(n) => changed(&st, &s, format!("deleted {} from {list}", plural(n, "radio name"))),
+        Err(e) => return view(&st, &s, list, &TalkgroupForm::default(), Some(&format!("Could not delete: {e}"))).into_response(),
+    }
+    Redirect::to(&home).into_response()
+}
+
+/// The confirmation page of a batch delete: `going` is (id, name) of each entry, sent again as `field` with `confirm=yes`.
+#[allow(clippy::too_many_arguments)]
+fn confirm_delete(s: &Session, list: &str, ask: &str, action: &str, field: &str, id_label: &str, going: &[(String, String)], cancel: &str) -> Response {
+    layout("Talkgroups", Some(&s.user), &s.csrf, html! {
+        h2 { (ask) }
+        table {
+            thead { tr { th { (id_label) } th { "Name" } } }
+            tbody { @for (id, name) in going { tr { td { (id) } td { (name) } } } }
+        }
+        form method="post" action=(action) {
+            (hidden(s, list))
+            @for (id, _) in going { input type="hidden" name=(field) value=(id); }
+            input type="hidden" name="confirm" value="yes";
+            button.danger { "Delete" } " " a href=(cancel) { "Cancel" }
+        }
+    }).into_response()
 }

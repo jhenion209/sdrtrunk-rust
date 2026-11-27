@@ -1,10 +1,13 @@
-// Talkgroups page: the header checkbox selects or clears every row for the batch Record buttons.
+// Talkgroups page: a header checkbox `data-select-all="F"` selects or clears every row checkbox of form F (the talkgroup
+// batch, the radio name batch).
 (function () {
-  const all = document.getElementById("select-all");
-  if (!all) return;
-  all.addEventListener("change", () => {
-    for (const box of document.querySelectorAll('input[type=checkbox][form="batch"]')) box.checked = all.checked;
-  });
+  for (const all of document.querySelectorAll("input[data-select-all]")) {
+    all.addEventListener("change", () => {
+      for (const box of document.querySelectorAll("input[type=checkbox][form]")) {
+        if (box.getAttribute("form") === all.dataset.selectAll) box.checked = all.checked;
+      }
+    });
+  }
 })();
 
 // Sidebar: mark the section this page belongs to.

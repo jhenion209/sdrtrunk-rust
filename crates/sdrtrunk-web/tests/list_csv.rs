@@ -106,3 +106,26 @@ async fn radio_names_from_csv() {
     let (status, _) = upload_radios(&st, &cookie, &csrf, "nope", "radio,name\n1,A\n").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn bulk_delete_asks_first() {
+    let st = state();
+    let (cookie, csrf) = login_as(&st, "admin", Role::Admin);
+    for n in [1, 2, 3] { st.db.upsert_talkgroup(SYS, &Talkgroup { number: n, name: format!("T{n}"), record: true }).unwrap(); }
+    let ask = send(&st, "POST", "/talkgroups/delete", Some(&cookie), &[("csrf", &csrf), ("list", SYS), ("n", "1"), ("n", "3"), ("n", "99")]).await;
+    assert_eq!(ask.status, StatusCode::OK);
+    assert!(ask.body.contains("Delete 2 talkgroups from P25?") && ask.body.contains("confirm"));
+    assert_eq!(st.db.talkgroups(SYS).len(), 3, "nothing deleted before confirming");
+    let r = send(&st, "POST", "/talkgroups/delete", Some(&cookie), &[("csrf", &csrf), ("list", SYS), ("n", "1"), ("n", "3"), ("n", "99"), ("confirm", "yes")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(st.db.talkgroups(SYS).iter().map(|t| t.number).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(st.db.audit_log(1)[0].action, "deleted 2 talkgroups from P25");
+    assert_eq!(send(&st, "POST", "/talkgroups/delete", Some(&cookie), &[("csrf", &csrf), ("list", "nope"), ("n", "2"), ("confirm", "yes")]).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(send(&st, "POST", "/talkgroups/delete", Some(&cookie), &[("csrf", "bad"), ("list", SYS), ("n", "2"), ("confirm", "yes")]).await.status, StatusCode::FORBIDDEN);
+
+    for r in [7u32, 8] { st.db.save_radio_name(SYS, &RadioName { radio: r, name: format!("R{r}") }).unwrap(); }
+    let r = send(&st, "POST", "/talkgroups/radios/delete", Some(&cookie), &[("csrf", &csrf), ("list", SYS), ("r", "7"), ("confirm", "yes")]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(st.db.radio_names(SYS).len(), 1);
+    assert_eq!(st.db.audit_log(1)[0].action, "deleted 1 radio name from P25");
+}
