@@ -13,6 +13,13 @@ const HALF_PI: f32 = (PI / 2.0) as f32;
 const MAX_PLL: f32 = (PI / 3.0) as f32; // +/- 800 Hz
 const OBJECTIVE_MAGNITUDE: f32 = 1.0;
 const PLL_GAIN: f32 = 0.1;
+/// Signal presence: mean of the symbols' fourth power (each ideal symbol is -1 there, at any carrier offset; noise
+/// averages toward 0), over about 64 symbols. Not in the Java this ports: newer sdrtrunk holds its carrier estimate
+/// the same way (`DQPSKDifferentialDemodulator`), so a traffic channel's next transmission starts where the last locked.
+const PRESENCE_GAIN: f32 = 1.0 / 64.0;
+/// Presence below this is noise: the PLL goes back to where it was at the last frame sync and holds there. Noise averages about 0.08 here and passes 0.3 about once in 10^5
+/// symbols; a signal whose symbols carry 0.35 radians of phase noise (too much to decode reliably) still averages 0.37.
+const PRESENCE_MIN: f32 = 0.3;
 /// `P25P1MessageFramer.SYNC_DETECTION_THRESHOLD`.
 const SYNC_DETECTION_THRESHOLD: f32 = 60.0;
 
@@ -27,6 +34,11 @@ pub struct LsmDemodulator<S: SymbolSink> {
     buffer_pointer: usize,
     buffer_reserve: usize,
     pll: f32,
+    /// Running mean of the symbols' fourth power (see `PRESENCE_GAIN`); starts as a signal, so a steady signal
+    /// demodulates exactly as the Java does.
+    presence: (f32, f32),
+    /// The PLL at the last frame sync (0 before one).
+    synced_pll: f32,
     sample_gain: f32,
     previous_middle: (f32, f32),
     previous_current: (f32, f32),
@@ -47,6 +59,8 @@ impl<S: SymbolSink> LsmDemodulator<S> {
             buffer_pointer: 0,
             buffer_reserve: reserve,
             pll: 0.0,
+            presence: (-1.0, 0.0),
+            synced_pll: 0.0,
             sample_gain: 1.0,
             previous_middle: (0.0, 0.0),
             previous_current: (0.0, 0.0),
@@ -57,7 +71,7 @@ impl<S: SymbolSink> LsmDemodulator<S> {
     pub fn sink_mut(&mut self) -> &mut S { &mut self.sink }
 
     /// Resets the carrier PLL after a tuner frequency or PPM change.
-    pub fn reset_pll(&mut self) { self.pll = 0.0; }
+    pub fn reset_pll(&mut self) { (self.pll, self.synced_pll) = (0.0, 0.0); }
 
     /// Carrier PLL: phase correction per symbol (radians).
     pub fn pll(&self) -> f32 { self.pll }
@@ -79,6 +93,8 @@ impl<S: SymbolSink> LsmDemodulator<S> {
         let sps = self.samples_per_symbol;
         let half = self.samples_per_half_symbol;
         let mut pll = self.pll;
+        let mut presence = self.presence;
+        let mut synced_pll = self.synced_pll;
         let mut gain = self.sample_gain;
         let (mut prev_sym_i, mut prev_sym_q) = self.previous_symbol;
         let (mut prev_mid_i, mut prev_mid_q) = self.previous_middle;
@@ -134,17 +150,26 @@ impl<S: SymbolSink> LsmDemodulator<S> {
             i_sym = t;
 
             let soft = (q_sym as f64).atan2(i_sym as f64) as f32;
+            let fourth = 4.0 * soft as f64;
+            presence.0 += (fourth.cos() as f32 - presence.0) * PRESENCE_GAIN;
+            presence.1 += (fourth.sin() as f32 - presence.1) * PRESENCE_GAIN;
+            let signal = presence.0 * presence.0 + presence.1 * presence.1 > PRESENCE_MIN * PRESENCE_MIN;
 
             // Gardner timing error detection.
             let ted = ((prev_sym_i - i_sym) * i_mid_d) + ((prev_sym_q - q_sym) * q_mid_d);
             sample_point += constrain_f64(ted as f64, max_timing_adjustment) * ted_gain;
 
-            // PLL (not adjusted when the soft symbol is exactly zero).
+            // PLL (not adjusted when the soft symbol is exactly zero, nor on noise: between a traffic channel's
+            // transmissions it would wander to MAX_PLL, and a transmission starting past PI/4 locks a quadrant off).
             let hard = if soft != 0.0 {
                 let hard = to_dibit(soft);
-                let phase_error = constrain_f32(soft - hard.ideal_phase(), 0.3);
-                pll -= phase_error * PLL_GAIN;
-                pll = constrain_f32(pll, MAX_PLL);
+                if signal {
+                    let phase_error = constrain_f32(soft - hard.ideal_phase(), 0.3);
+                    pll -= phase_error * PLL_GAIN;
+                    pll = constrain_f32(pll, MAX_PLL);
+                } else {
+                    pll = synced_pll;
+                }
                 hard
             } else {
                 Dibit::D00Plus1
@@ -152,6 +177,7 @@ impl<S: SymbolSink> LsmDemodulator<S> {
 
             self.sink.process(soft, hard);
             if self.sync.process(soft) > SYNC_DETECTION_THRESHOLD {
+                synced_pll = pll;
                 self.sink.sync_detected();
             }
 
@@ -164,6 +190,8 @@ impl<S: SymbolSink> LsmDemodulator<S> {
         self.buffer_pointer = buffer_pointer;
         self.sample_point = sample_point;
         self.pll = pll;
+        self.presence = presence;
+        self.synced_pll = synced_pll;
         self.sample_gain = gain;
         self.previous_symbol = (prev_sym_i, prev_sym_q);
         self.previous_middle = (prev_mid_i, prev_mid_q);
